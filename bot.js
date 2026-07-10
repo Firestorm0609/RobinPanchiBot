@@ -344,7 +344,9 @@ bot.action('menu_balance', async (ctx) => {
 bot.action(/^refresh_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
   await ctx.answerCbQuery('Refreshed');
   const { text, markup } = await renderTokenCard(ctx.from.id, ctx.match[1]);
-  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...markup });
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...markup }).catch((err) => {
+    if (!err.description?.includes('message is not modified')) throw err;
+  });
 });
 
 // ---------- Buy ----------
