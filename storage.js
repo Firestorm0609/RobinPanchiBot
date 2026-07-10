@@ -289,7 +289,10 @@ export function getOrCreateReferralCode(uid) {
   uid = String(uid);
   const s = getSettings(uid);
   if (s.referralCode) return s.referralCode;
-  const code = genReferralCode(uid);
+  let code;
+  do {
+    code = genReferralCode(uid);
+  } while (findUidByReferralCode(code)); // guard against the rare collision
   updateSettings(uid, { referralCode: code });
   return code;
 }
