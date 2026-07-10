@@ -53,6 +53,11 @@ function fmtEth(n) {
   return Number(n).toFixed(4);
 }
 
+function explorerTxUrl(hash) {
+  const base = (process.env.EXPLORER_BASE_URL || '').replace(/\/$/, '');
+  return base ? `${base}/tx/${hash}` : null;
+}
+
 async function balanceLines(address) {
   const bal = await provider.getBalance(address);
   const ethAmount = Number(ethers.formatEther(bal));
@@ -227,11 +232,18 @@ async function executeBuy(ctx, uid, tokenAddress, ethAmount) {
 
     const txResponse = await getSwapTx(signer, quote);
     markPendingTradeSubmitted(pendingTradeId, txResponse.hash);
-    await ctx.reply(`Tx sent: ${txResponse.hash}\nWaiting for confirmation...`);
+    const txLink = explorerTxUrl(txResponse.hash);
+    await ctx.reply(
+      txLink ? `Tx sent: [view on explorer](${txLink})\nWaiting for confirmation...` : `Tx sent: ${txResponse.hash}\nWaiting for confirmation...`,
+      { parse_mode: 'Markdown' }
+    );
     const receipt = await txResponse.wait();
     markPendingTradeDone(pendingTradeId, 'confirmed');
     recordTrade(uid, w.id, tokenAddress, 'buy', Number(quote.buyAmountFormatted), ethAmount);
-    await ctx.reply(`✅ Confirmed in block ${receipt.blockNumber}`);
+    await ctx.reply(
+      txLink ? `✅ Confirmed — [view transaction](${txLink})` : `✅ Confirmed in block ${receipt.blockNumber}`,
+      { parse_mode: 'Markdown' }
+    );
     const { text, markup } = await renderTokenCard(uid, tokenAddress);
     await ctx.reply(text, { parse_mode: 'Markdown', ...markup });
   } catch (err) {
@@ -280,11 +292,18 @@ async function executeSell(ctx, uid, tokenAddress, pct) {
 
     const txResponse = await getSwapTx(signer, quote);
     markPendingTradeSubmitted(pendingTradeId, txResponse.hash);
-    await ctx.reply(`Tx sent: ${txResponse.hash}\nWaiting for confirmation...`);
+    const txLink = explorerTxUrl(txResponse.hash);
+    await ctx.reply(
+      txLink ? `Tx sent: [view on explorer](${txLink})\nWaiting for confirmation...` : `Tx sent: ${txResponse.hash}\nWaiting for confirmation...`,
+      { parse_mode: 'Markdown' }
+    );
     const receipt = await txResponse.wait();
     markPendingTradeDone(pendingTradeId, 'confirmed');
     recordTrade(uid, w.id, tokenAddress, 'sell', tokenAmount, Number(quote.buyAmountFormatted));
-    await ctx.reply(`✅ Confirmed in block ${receipt.blockNumber}`);
+    await ctx.reply(
+      txLink ? `✅ Confirmed — [view transaction](${txLink})` : `✅ Confirmed in block ${receipt.blockNumber}`,
+      { parse_mode: 'Markdown' }
+    );
     const { text, markup } = await renderTokenCard(uid, tokenAddress);
     await ctx.reply(text, { parse_mode: 'Markdown', ...markup });
   } catch (err) {
