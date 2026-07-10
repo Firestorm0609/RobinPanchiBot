@@ -5,6 +5,8 @@ import { getQuote, getSwapTx } from './swap.js';
 import { ensureAllowance, getDecimals } from './erc20.js';
 import { createWallet, importWallet, shortAddr } from './wallet.js';
 import { getEthUsdPrice, getTokenMarketData, fmtUsd } from './price.js';
+import { sendAdminAlert } from './alerts.js';
+import { isRateLimited } from './ratelimit.js';
 import {
   getUser,
   addWallet,
@@ -18,6 +20,10 @@ import {
   getAllPositions,
   getSettings,
   updateSettings,
+  createPendingTrade,
+  markPendingTradeSubmitted,
+  markPendingTradeDone,
+  getStuckPendingTrades,
 } from './storage.js';
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
@@ -26,6 +32,7 @@ const provider = new ethers.JsonRpcProvider(process.env.RPC_URL, Number(process.
 const pending = new Map(); // uid -> { type, ...context }
 const tradesInFlight = new Set(); // uid -> locked while a trade is executing (double-tap guard)
 const CA_REGEX = /^0x[a-fA-F0-9]{40}$/;
+const QUOTE_STALE_MS = 15_000; // re-quote if this much time passes before sending the tx
 
 // ---------- Formatting ----------
 
@@ -44,6 +51,12 @@ async function balanceLines(address) {
     // price feed hiccup, still show ETH
   }
   return `${fmtEth(ethAmount)} ETH${usdLine}`;
+}
+
+/** Re-fetches the quote if too much time has passed since it was first obtained. */
+async function getFreshQuote(quoteParams, quote, fetchedAt) {
+  if (Date.now() - fetchedAt < QUOTE_STALE_MS) return quote;
+  return getQuote(quoteParams);
 }
 
 // ---------- Menus ----------
@@ -170,22 +183,34 @@ async function executeBuy(ctx, uid, tokenAddress, ethAmount) {
   }
   tradesInFlight.add(uid);
 
+  let pendingTradeId;
   try {
     await ctx.reply(`Buying ${ethAmount} ETH worth... fetching quote.`);
     const sellAmount = ethers.parseEther(ethAmount.toString()).toString();
     const { slippageBps } = getSettings(uid);
-    const quote = await getQuote({ sellToken: 'ETH', buyToken: tokenAddress, sellAmount, taker: w.address, slippageBps });
+    const quoteParams = { sellToken: 'ETH', buyToken: tokenAddress, sellAmount, taker: w.address, slippageBps };
+
+    pendingTradeId = createPendingTrade({ uid, walletId: w.id, tokenAddress, side: 'buy', amount: ethAmount });
+
+    let quote = await getQuote(quoteParams);
+    const fetchedAt = Date.now();
     const signer = new ethers.Wallet(w.privateKey, provider);
+    quote = await getFreshQuote(quoteParams, quote, fetchedAt);
+
     const txResponse = await getSwapTx(signer, quote);
+    markPendingTradeSubmitted(pendingTradeId, txResponse.hash);
     await ctx.reply(`Tx sent: ${txResponse.hash}\nWaiting for confirmation...`);
     const receipt = await txResponse.wait();
+    markPendingTradeDone(pendingTradeId, 'confirmed');
     recordTrade(uid, w.id, tokenAddress, 'buy', Number(quote.buyAmountFormatted), ethAmount);
     await ctx.reply(`✅ Confirmed in block ${receipt.blockNumber}`);
     const { text, markup } = await renderTokenCard(uid, tokenAddress);
     await ctx.reply(text, { parse_mode: 'Markdown', ...markup });
   } catch (err) {
     console.error(err);
+    if (pendingTradeId) markPendingTradeDone(pendingTradeId, 'failed');
     await ctx.reply(`❌ Trade failed: ${err.message}`, mainMenu());
+    await sendAdminAlert(ctx.telegram, `Buy failed for user ${uid} on ${tokenAddress}: ${err.message}`);
   } finally {
     tradesInFlight.delete(uid);
   }
@@ -203,6 +228,7 @@ async function executeSell(ctx, uid, tokenAddress, pct) {
   tradesInFlight.add(uid);
 
   const tokenAmount = pos.tokenAmount * (pct / 100);
+  let pendingTradeId;
   try {
     await ctx.reply(`Selling ${pct}%... fetching quote.`);
 
@@ -213,20 +239,31 @@ async function executeSell(ctx, uid, tokenAddress, pct) {
     const { slippageBps } = getSettings(uid);
     const signer = new ethers.Wallet(w.privateKey, provider);
 
+    pendingTradeId = createPendingTrade({ uid, walletId: w.id, tokenAddress, side: 'sell', amount: tokenAmount });
+
     const approvalReceipt = await ensureAllowance(signer, tokenAddress, BigInt(sellAmount));
     if (approvalReceipt) await ctx.reply('Approved token for trading (one-time step). Continuing...');
 
-    const quote = await getQuote({ sellToken: tokenAddress, buyToken: 'ETH', sellAmount, taker: w.address, slippageBps });
+    const quoteParams = { sellToken: tokenAddress, buyToken: 'ETH', sellAmount, taker: w.address, slippageBps };
+    let quote = await getQuote(quoteParams);
+    const fetchedAt = Date.now();
+    // Approval above can take a while to confirm — re-quote if price may have moved since.
+    quote = await getFreshQuote(quoteParams, quote, fetchedAt);
+
     const txResponse = await getSwapTx(signer, quote);
+    markPendingTradeSubmitted(pendingTradeId, txResponse.hash);
     await ctx.reply(`Tx sent: ${txResponse.hash}\nWaiting for confirmation...`);
     const receipt = await txResponse.wait();
+    markPendingTradeDone(pendingTradeId, 'confirmed');
     recordTrade(uid, w.id, tokenAddress, 'sell', tokenAmount, Number(quote.buyAmountFormatted));
     await ctx.reply(`✅ Confirmed in block ${receipt.blockNumber}`);
     const { text, markup } = await renderTokenCard(uid, tokenAddress);
     await ctx.reply(text, { parse_mode: 'Markdown', ...markup });
   } catch (err) {
     console.error(err);
+    if (pendingTradeId) markPendingTradeDone(pendingTradeId, 'failed');
     await ctx.reply(`❌ Trade failed: ${err.message}`, mainMenu());
+    await sendAdminAlert(ctx.telegram, `Sell failed for user ${uid} on ${tokenAddress}: ${err.message}`);
   } finally {
     tradesInFlight.delete(uid);
   }
@@ -432,6 +469,7 @@ bot.action(/^refresh_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
 
 bot.action(/^buy_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
   await ctx.answerCbQuery();
+  if (isRateLimited(ctx.from.id)) return ctx.reply('⏳ Slow down a bit — too many actions in the last minute.');
   const [, tokenAddress, ethAmountStr] = ctx.match;
   const uid = ctx.from.id;
   const { confirmTrades, maxBuyEth } = getSettings(uid);
@@ -453,6 +491,7 @@ bot.action(/^buy_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
 
 bot.action(/^sell_(0x[a-fA-F0-9]{40})_(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
+  if (isRateLimited(ctx.from.id)) return ctx.reply('⏳ Slow down a bit — too many actions in the last minute.');
   const [, tokenAddress, pctStr] = ctx.match;
   const uid = ctx.from.id;
   const { confirmTrades } = getSettings(uid);
@@ -468,11 +507,13 @@ bot.action(/^sell_(0x[a-fA-F0-9]{40})_(\d+)$/, async (ctx) => {
 
 bot.action(/^confirm_buy_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
   await ctx.answerCbQuery();
+  if (isRateLimited(ctx.from.id)) return ctx.reply('⏳ Slow down a bit — too many actions in the last minute.');
   await executeBuy(ctx, ctx.from.id, ctx.match[1], Number(ctx.match[2]));
 });
 
 bot.action(/^confirm_sell_(0x[a-fA-F0-9]{40})_(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
+  if (isRateLimited(ctx.from.id)) return ctx.reply('⏳ Slow down a bit — too many actions in the last minute.');
   await executeSell(ctx, ctx.from.id, ctx.match[1], Number(ctx.match[2]));
 });
 
@@ -490,6 +531,7 @@ bot.on('text', async (ctx) => {
 
   // CA paste is allowed any time, not just when explicitly prompted
   if (CA_REGEX.test(text)) {
+    if (isRateLimited(uid)) return ctx.reply('⏳ Slow down a bit — too many lookups in the last minute.');
     pending.delete(uid);
     const { text: cardText, markup } = await renderTokenCard(uid, text);
     await ctx.reply(cardText, { parse_mode: 'Markdown', ...markup });
@@ -610,7 +652,22 @@ bot.on('text', async (ctx) => {
   }
 });
 
-bot.launch();
+// ---------- Startup: crash recovery check ----------
+
+async function checkStuckTrades() {
+  const stuck = getStuckPendingTrades();
+  if (stuck.length === 0) return;
+  const lines = stuck.map((t) =>
+    `• ${t.side} ${t.amount} on ${t.token_address} (user ${t.uid}, status: ${t.status}${t.tx_hash ? `, tx: ${t.tx_hash}` : ''})`
+  );
+  await sendAdminAlert(
+    bot.telegram,
+    `Bot restarted with ${stuck.length} unresolved trade(s) from before the crash — verify these manually:\n${lines.join('\n')}`
+  );
+  console.warn(`${stuck.length} pending trade(s) unresolved from before restart. See admin alert / pending_trades table.`);
+}
+
+bot.launch().then(checkStuckTrades);
 console.log('Panchi trading bot running.');
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
