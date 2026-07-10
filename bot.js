@@ -114,7 +114,7 @@ const HELP_TEXT =
   '*Why does my PnL look off?*\n' +
   'PnL is based on your running average cost basis and the live price, so it can shift with volatility between refreshes. Gas costs are not factored into the displayed cost basis — check the transaction on your block explorer for the exact net amount.\n\n' +
   '*Bridging ETH*\n' +
-  'Use 🌉 Bridge to move ETH between Ethereum mainnet and Robinhood Chain. Bridges can take a few minutes to settle on the destination side — the bot will DM you once it lands.\n\n' +
+  'Use 🌉 Bridge to move ETH between Ethereum mainnet and Robinhood Chain. You can enter either an ETH amount (e.g. `0.05`) or a USD amount (e.g. `$100`) — we\'ll convert it for you. Bridges can take a few minutes to settle on the destination side — the bot will DM you once it lands.\n\n' +
   '*Still stuck?*\n' +
   'Contact support: panchi.eth@gmail.com';
 
@@ -180,6 +180,38 @@ async function balanceLines(address) {
 async function getFreshQuote(quoteParams, quote, fetchedAt) {
   if (Date.now() - fetchedAt < QUOTE_STALE_MS) return quote;
   return getQuote(quoteParams);
+}
+
+/**
+ * Parses a user-entered bridge amount, accepting either a plain ETH figure
+ * (e.g. "0.05") or a USD figure prefixed with "$" (e.g. "$100"). Returns
+ * { amountEth, usdInput } or throws with a user-facing message on bad input.
+ * usdInput is the raw USD number if the user entered USD, otherwise null —
+ * useful for showing "≈ $100 worth" back to the user for confirmation.
+ */
+async function parseBridgeAmountInput(text) {
+  const trimmed = text.trim();
+  const isUsd = trimmed.startsWith('$');
+
+  if (isUsd) {
+    const usd = parseFloat(trimmed.slice(1).replace(/,/g, ''));
+    if (isNaN(usd) || usd <= 0) {
+      throw new Error('Send a valid positive USD amount, e.g. `$100`');
+    }
+    let ethUsd;
+    try {
+      ethUsd = await getEthUsdPrice();
+    } catch {
+      throw new Error('Price feed is down right now — send an ETH amount instead, e.g. `0.05`');
+    }
+    return { amountEth: usd / ethUsd, usdInput: usd };
+  }
+
+  const amt = parseFloat(trimmed);
+  if (isNaN(amt) || amt <= 0) {
+    throw new Error('Send a valid positive ETH amount (e.g. `0.05`) or USD amount (e.g. `$100`)');
+  }
+  return { amountEth: amt, usdInput: null };
 }
 
 // ---------- Menus ----------
@@ -790,7 +822,7 @@ bot.action('menu_bridge', async (ctx) => {
   const w = getActiveWallet(ctx.from.id);
   if (!w) return ctx.editMessageText('No active wallet. Add one first.', walletsMenu(ctx.from.id));
   await ctx.editMessageText(
-    `🌉 *Bridge ETH*\n\nMove ETH between Ethereum mainnet and Robinhood Chain.\nActive wallet: *${w.name}* (\`${shortAddr(w.address)}\`)`,
+    `🌉 *Bridge ETH*\n\nMove ETH between Ethereum mainnet and Robinhood Chain.\nActive wallet: *${w.name}* (\`${shortAddr(w.address)}\`)\n\nYou'll be able to enter the amount in ETH or USD.`,
     { parse_mode: 'Markdown', ...bridgeMenu() }
   );
 });
@@ -799,7 +831,10 @@ bot.action(/^bridge_dir_(eth_to_robinhood|robinhood_to_eth)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const direction = ctx.match[1] === 'eth_to_robinhood' ? BRIDGE_DIRECTION.ETH_TO_ROBINHOOD : BRIDGE_DIRECTION.ROBINHOOD_TO_ETH;
   pending.set(ctx.from.id, { type: 'bridge_amount', direction });
-  await ctx.editMessageText(`Send the ETH amount to bridge (${directionLabel(direction)}), e.g. \`0.05\`:`, { parse_mode: 'Markdown' });
+  await ctx.editMessageText(
+    `Send the amount to bridge (${directionLabel(direction)}) — ETH like \`0.05\`, or USD like \`$100\`:`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
 bot.action('bridge_history', async (ctx) => {
@@ -1080,8 +1115,14 @@ bot.on('text', async (ctx) => {
     }
 
     if (state.type === 'bridge_amount') {
-      const amt = parseFloat(text);
-      if (isNaN(amt) || amt <= 0) return ctx.reply('Send a valid positive ETH amount, e.g. `0.05`');
+      // Accepts either a plain ETH figure ("0.05") or a USD figure ("$100"),
+      // converting USD -> ETH via the live ETH/USD price feed.
+      let amt, usdInput;
+      try {
+        ({ amountEth: amt, usdInput } = await parseBridgeAmountInput(text));
+      } catch (err) {
+        return ctx.reply(err.message, { parse_mode: 'Markdown' });
+      }
 
       // Guard bridge amount against the configured cap, same as buy amounts —
       // previously this check only existed on the buy path, so a bridge could
@@ -1089,7 +1130,7 @@ bot.on('text', async (ctx) => {
       const { maxBridgeEth } = getSettings(uid);
       if (amt > maxBridgeEth) {
         pending.delete(uid);
-        return ctx.reply(`❌ ${amt} ETH exceeds your max bridge size (${maxBridgeEth} ETH). Adjust it in Settings if this was intentional.`, mainMenu());
+        return ctx.reply(`❌ ${amt.toFixed(6)} ETH exceeds your max bridge size (${maxBridgeEth} ETH). Adjust it in Settings if this was intentional.`, mainMenu());
       }
 
       pending.delete(uid);
@@ -1103,9 +1144,13 @@ bot.on('text', async (ctx) => {
         return ctx.reply(`❌ Couldn't get a bridge quote: ${err.message}`, mainMenu());
       }
 
+      const sendLine = usdInput !== null
+        ? `Send: ≈ ${amt.toFixed(6)} ETH (${fmtUsd(usdInput)})`
+        : `Send: ${amt} ETH`;
+
       await ctx.reply(
         `🌉 *${directionLabel(state.direction)}*\n\n` +
-        `Send: ${amt} ETH\n` +
+        `${sendLine}\n` +
         `Receive (est.): ${Number(quote.toAmountFormatted).toFixed(4)} ETH\n` +
         `Fees (est.): ${fmtUsd(quote.feesUsd)}\n` +
         `Via: ${quote.tool || 'best available route'}\n` +
