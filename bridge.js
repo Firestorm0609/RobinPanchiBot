@@ -21,12 +21,32 @@ function chainsForDirection(direction) {
 }
 
 /**
+ * Converts a user-supplied ETH amount (number or string) into a plain decimal
+ * string safe for ethers.parseEther. Number#toString() can produce
+ * exponential notation for very small values (e.g. 0.0000005 -> "5e-7"),
+ * which parseEther cannot parse and will throw on. toFixed(18) avoids that,
+ * then we trim trailing zeros/dot so parseEther doesn't choke on excess
+ * precision either.
+ */
+function toPlainEthString(amountEth) {
+  const n = typeof amountEth === 'number' ? amountEth : Number(amountEth);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error(`Invalid ETH amount: ${amountEth}`);
+  }
+  let s = n.toFixed(18);
+  if (s.includes('.')) {
+    s = s.replace(/0+$/, '').replace(/\.$/, '');
+  }
+  return s;
+}
+
+/**
  * Fetch a firm bridge quote for moving native ETH between Ethereum and Robinhood Chain.
  * amountEth is a decimal string/number, e.g. 0.05
  */
 export async function getBridgeQuote({ direction, amountEth, fromAddress, toAddress }) {
   const { fromChain, toChain } = chainsForDirection(direction);
-  const fromAmount = ethers.parseEther(amountEth.toString()).toString();
+  const fromAmount = ethers.parseEther(toPlainEthString(amountEth)).toString();
 
   const params = {
     fromChain,
