@@ -5,6 +5,14 @@ import { getQuote, buildSwapTx, sendSwapWithGasBump } from './swap.js';
 import { ensureAllowance, getDecimals } from './erc20.js';
 import { createWallet, importWallet, shortAddr } from './wallet.js';
 import { getEthUsdPrice, getTokenMarketData, fmtUsd } from './price.js';
+import {
+  getBridgeQuote,
+  sendBridgeTx,
+  checkBridgeStatusOnce,
+  BRIDGE_DIRECTION,
+  chainIdsForDirection,
+  ETH_CHAIN_ID,
+} from './bridge.js';
 import { sendAdminAlert } from './alerts.js';
 import { isRateLimited } from './ratelimit.js';
 import {
@@ -32,6 +40,11 @@ import {
   recordReferral,
   getTicketCount,
   hasBeenReferred,
+  createPendingBridge,
+  markPendingBridgeSubmitted,
+  markPendingBridgeDone,
+  getInFlightBridges,
+  getBridgeHistory,
 } from './storage.js';
 
 const TERMS_TEXT =
@@ -63,6 +76,8 @@ const HELP_TEXT =
   '• *Timed out* — the network was congested; the bot automatically resubmits with higher gas, but if it still fails, try again in a moment\n\n' +
   '*Why does my PnL look off?*\n' +
   'PnL is based on your running average cost basis and the live price, so it can shift with volatility between refreshes. Gas costs are not factored into the displayed cost basis — check the transaction on your block explorer for the exact net amount.\n\n' +
+  '*Bridging ETH*\n' +
+  'Use 🌉 Bridge to move ETH between Ethereum mainnet and Robinhood Chain. Bridges can take a few minutes to settle on the destination side — the bot will DM you once it lands.\n\n' +
   '*Still stuck?*\n' +
   'Contact support: panchi.eth@gmail.com';
 
@@ -76,8 +91,10 @@ bot.telegram.getMe()
 
 const pending = new Map(); // uid -> { type, ...context }
 const tradesInFlight = new Set(); // uid -> locked while a trade is executing (double-tap guard)
+const bridgesInFlight = new Set(); // uid -> locked while a bridge tx is being submitted
 const CA_REGEX = /^0x[a-fA-F0-9]{40}$/;
 const QUOTE_STALE_MS = 15_000; // re-quote if this much time passes before sending the tx
+const BRIDGE_POLL_INTERVAL_MS = 30_000;
 
 // ---------- Formatting ----------
 
@@ -88,6 +105,12 @@ function fmtEth(n) {
 function explorerTxUrl(hash) {
   const base = (process.env.EXPLORER_BASE_URL || '').replace(/\/$/, '');
   return base ? `${base}/tx/${hash}` : null;
+}
+
+// Mainnet ETH txs need etherscan; Robinhood Chain txs use the configured explorer.
+function explorerTxUrlForChain(hash, chainId) {
+  if (chainId === ETH_CHAIN_ID) return `https://etherscan.io/tx/${hash}`;
+  return explorerTxUrl(hash);
 }
 
 function referralLink(code) {
@@ -126,8 +149,8 @@ function mainMenu() {
     [Markup.button.callback('🔍 Trade Token', 'menu_trade')],
     [Markup.button.callback('📊 Positions', 'menu_positions')],
     [Markup.button.callback('💼 Wallets', 'menu_wallets'), Markup.button.callback('💰 Balance', 'menu_balance')],
-    [Markup.button.callback('🎟 Rewards', 'menu_rewards'), Markup.button.callback('❓ Help', 'menu_help')],
-    [Markup.button.callback('⚙️ Settings', 'menu_settings')],
+    [Markup.button.callback('🌉 Bridge', 'menu_bridge'), Markup.button.callback('🎟 Rewards', 'menu_rewards')],
+    [Markup.button.callback('❓ Help', 'menu_help'), Markup.button.callback('⚙️ Settings', 'menu_settings')],
     [Markup.button.url('🐦 X', 'https://x.com/robinpanchi'), Markup.button.url('🖼 OpenSea', 'https://opensea.io/collection/robinpanchi')],
   ]);
 }
@@ -180,6 +203,28 @@ function rewardsMenu() {
     [Markup.button.callback('🔗 Get My Referral Link', 'rewards_link')],
     [Markup.button.callback('⬅️ Back', 'menu_main')],
   ]);
+}
+
+function bridgeMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('Ethereum ➜ Robinhood', 'bridge_dir_eth_to_robinhood')],
+    [Markup.button.callback('Robinhood ➜ Ethereum', 'bridge_dir_robinhood_to_eth')],
+    [Markup.button.callback('🕘 Recent Bridges', 'bridge_history')],
+    [Markup.button.callback('⬅️ Back', 'menu_main')],
+  ]);
+}
+
+function bridgeConfirmMenu(direction, amount) {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('✅ Confirm', `bridge_confirm_${direction}_${amount}`),
+      Markup.button.callback('❌ Cancel', 'menu_bridge'),
+    ],
+  ]);
+}
+
+function directionLabel(direction) {
+  return direction === BRIDGE_DIRECTION.ETH_TO_ROBINHOOD ? 'Ethereum ➜ Robinhood' : 'Robinhood ➜ Ethereum';
 }
 
 function tokenMenu(uid, tokenAddress, hasPosition) {
@@ -363,6 +408,56 @@ function confirmMenu(kind, tokenAddress, value) {
   ]);
 }
 
+// ---------- Shared bridge execution ----------
+
+async function executeBridge(ctx, uid, direction, amountEth) {
+  const w = getActiveWallet(uid);
+  if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
+
+  if (bridgesInFlight.has(uid)) {
+    return ctx.reply('⏳ A bridge is already in progress — please wait for it to finish.');
+  }
+  bridgesInFlight.add(uid);
+
+  let pendingBridgeId;
+  try {
+    await ctx.reply(`Bridging ${amountEth} ETH (${directionLabel(direction)})... fetching quote.`);
+    const { fromChain, toChain } = chainIdsForDirection(direction);
+    const quote = await getBridgeQuote({ direction, amountEth, fromAddress: w.address });
+
+    pendingBridgeId = createPendingBridge({
+      uid, walletId: w.id, direction, amountEth, fromChain, toChain, bridgeTool: quote.tool,
+    });
+
+    const signer = new ethers.Wallet(w.privateKey, provider === null ? null : provider, );
+    // Bridges can originate on either chain — use a provider pointed at the source chain
+    // for ETH_TO_ROBINHOOD; the configured RPC_URL provider is Robinhood Chain, so for
+    // that direction we need a mainnet provider instead.
+    const sourceProvider = fromChain === ETH_CHAIN_ID
+      ? new ethers.JsonRpcProvider(process.env.ETH_RPC_URL || 'https://cloudflare-eth.com')
+      : provider;
+    const sourceSigner = new ethers.Wallet(w.privateKey, sourceProvider);
+
+    const { txResponse } = await sendBridgeTx(sourceSigner, quote);
+    markPendingBridgeSubmitted(pendingBridgeId, txResponse.hash);
+
+    const txLink = explorerTxUrlForChain(txResponse.hash, fromChain);
+    await ctx.reply(
+      `✅ Bridge submitted${txLink ? ` — [view transaction](${txLink})` : ''}.\n\n` +
+      `Estimated arrival: ~${quote.estimatedDurationSeconds ? Math.ceil(quote.estimatedDurationSeconds / 60) + ' min' : 'a few minutes'}.\n` +
+      `I'll message you here once it lands on the destination chain.`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (err) {
+    console.error(err);
+    if (pendingBridgeId) markPendingBridgeDone(pendingBridgeId, 'failed');
+    await ctx.reply(`❌ Bridge failed: ${err.message}`, mainMenu());
+    await sendAdminAlert(ctx.telegram, `Bridge failed for user ${uid} (${direction}, ${amountEth} ETH): ${err.message}`);
+  } finally {
+    bridgesInFlight.delete(uid);
+  }
+}
+
 // ---------- Start / Main menu ----------
 
 bot.start(async (ctx) => {
@@ -419,7 +514,8 @@ bot.command('admin_stats', async (ctx) => {
     `Total trades: ${s.totalTrades}\n` +
     `Total volume: ${s.totalVolumeEth.toFixed(4)} ETH\n` +
     `Est. fees earned: ${estFeesEth.toFixed(4)} ETH\n` +
-    `Total referrals: ${s.totalReferrals}\n\n` +
+    `Total referrals: ${s.totalReferrals}\n` +
+    `Total bridges: ${s.totalBridges} (completed volume: ${s.totalBridgeVolumeEth.toFixed(4)} ETH)\n\n` +
     `Last 24h:\n` +
     `Active users: ${s.activeUsers24h}\n` +
     `Volume: ${s.volume24hEth.toFixed(4)} ETH`,
@@ -628,6 +724,44 @@ bot.action('rewards_link', async (ctx) => {
   );
 });
 
+// ---------- Bridge ----------
+
+bot.action('menu_bridge', async (ctx) => {
+  await ctx.answerCbQuery();
+  const w = getActiveWallet(ctx.from.id);
+  if (!w) return ctx.editMessageText('No active wallet. Add one first.', walletsMenu(ctx.from.id));
+  await ctx.editMessageText(
+    `🌉 *Bridge ETH*\n\nMove ETH between Ethereum mainnet and Robinhood Chain.\nActive wallet: *${w.name}* (\`${shortAddr(w.address)}\`)`,
+    { parse_mode: 'Markdown', ...bridgeMenu() }
+  );
+});
+
+bot.action(/^bridge_dir_(eth_to_robinhood|robinhood_to_eth)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const direction = ctx.match[1] === 'eth_to_robinhood' ? BRIDGE_DIRECTION.ETH_TO_ROBINHOOD : BRIDGE_DIRECTION.ROBINHOOD_TO_ETH;
+  pending.set(ctx.from.id, { type: 'bridge_amount', direction });
+  await ctx.editMessageText(`Send the ETH amount to bridge (${directionLabel(direction)}), e.g. \`0.05\`:`, { parse_mode: 'Markdown' });
+});
+
+bot.action('bridge_history', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  const history = getBridgeHistory(uid, 10);
+  if (history.length === 0) {
+    return ctx.editMessageText('No bridges yet.', {
+      ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_bridge')]]),
+    });
+  }
+  const statusEmoji = { pending: '⏳', submitted: '⏳', done: '✅', failed: '❌' };
+  const lines = history.map((b) =>
+    `${statusEmoji[b.status] || '•'} ${directionLabel(b.direction)} — ${b.amount_eth} ETH (${b.status})`
+  );
+  await ctx.editMessageText(`🕘 *Recent Bridges*\n\n${lines.join('\n')}`, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_bridge')]]),
+  });
+});
+
 // ---------- Custom buy/sell prompts ----------
 
 bot.action(/^custombuy_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
@@ -717,12 +851,21 @@ bot.action(/^confirm_sell_(0x[a-fA-F0-9]{40})_(\d+)$/, async (ctx) => {
   await executeSell(ctx, ctx.from.id, ctx.match[1], Number(ctx.match[2]));
 });
 
+// ---------- Bridge confirm ----------
+
+bot.action(/^bridge_confirm_(eth_to_robinhood|robinhood_to_eth)_([\d.]+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  if (isRateLimited(ctx.from.id)) return ctx.reply('⏳ Slow down a bit — too many actions in the last minute.');
+  const direction = ctx.match[1] === 'eth_to_robinhood' ? BRIDGE_DIRECTION.ETH_TO_ROBINHOOD : BRIDGE_DIRECTION.ROBINHOOD_TO_ETH;
+  await executeBridge(ctx, ctx.from.id, direction, Number(ctx.match[2]));
+});
+
 bot.action('cancel_trade', async (ctx) => {
   await ctx.answerCbQuery('Cancelled');
   await ctx.editMessageText('Trade cancelled.', mainMenu());
 });
 
-// ---------- Free-text handler (wallet setup + CA paste) ----------
+// ---------- Free-text handler (wallet setup + CA paste + bridge amount) ----------
 
 bot.on('text', async (ctx) => {
   const uid = ctx.from.id;
@@ -867,6 +1010,33 @@ bot.on('text', async (ctx) => {
       }
       return;
     }
+
+    if (state.type === 'bridge_amount') {
+      const amt = parseFloat(text);
+      if (isNaN(amt) || amt <= 0) return ctx.reply('Send a valid positive ETH amount, e.g. `0.05`');
+      pending.delete(uid);
+
+      let quote;
+      try {
+        const w = getActiveWallet(uid);
+        if (!w) return ctx.reply('No active wallet. Add one first.', walletsMenu(uid));
+        quote = await getBridgeQuote({ direction: state.direction, amountEth: amt, fromAddress: w.address });
+      } catch (err) {
+        return ctx.reply(`❌ Couldn't get a bridge quote: ${err.message}`, mainMenu());
+      }
+
+      await ctx.reply(
+        `🌉 *${directionLabel(state.direction)}*\n\n` +
+        `Send: ${amt} ETH\n` +
+        `Receive (est.): ${Number(quote.toAmountFormatted).toFixed(4)} ETH\n` +
+        `Fees (est.): ${fmtUsd(quote.feesUsd)}\n` +
+        `Via: ${quote.tool || 'best available route'}\n` +
+        `ETA: ~${quote.estimatedDurationSeconds ? Math.ceil(quote.estimatedDurationSeconds / 60) + ' min' : 'a few minutes'}\n\n` +
+        `Confirm?`,
+        { parse_mode: 'Markdown', ...bridgeConfirmMenu(state.direction === BRIDGE_DIRECTION.ETH_TO_ROBINHOOD ? 'eth_to_robinhood' : 'robinhood_to_eth', amt) }
+      );
+      return;
+    }
   } catch (err) {
     console.error(err);
     pending.delete(uid);
@@ -889,6 +1059,65 @@ async function checkStuckTrades() {
   console.warn(`${stuck.length} pending trade(s) unresolved from before restart. See admin alert / pending_trades table.`);
 }
 
+async function checkStuckBridges() {
+  const stuck = getInFlightBridges();
+  if (stuck.length === 0) return;
+  await sendAdminAlert(
+    bot.telegram,
+    `Bot restarted with ${stuck.length} in-flight bridge(s) — the poller will resume tracking them automatically.`
+  );
+  console.warn(`${stuck.length} in-flight bridge(s) resuming after restart.`);
+}
+
+// Periodically checks LI.FI status for every bridge still pending/submitted and
+// notifies the user + updates storage once it resolves. This is what lets a
+// bridge started before a restart, or one whose status simply took a while,
+// still get tracked to completion without the user re-checking manually.
+function startBridgePoller() {
+  setInterval(async () => {
+    let inFlight;
+    try {
+      inFlight = getInFlightBridges();
+    } catch (err) {
+      console.error('Bridge poller: failed to read in-flight bridges:', err.message);
+      return;
+    }
+
+    for (const b of inFlight) {
+      if (!b.source_tx_hash) continue; // not submitted yet, nothing to poll
+      try {
+        const result = await checkBridgeStatusOnce({
+          txHash: b.source_tx_hash,
+          fromChain: b.from_chain,
+          toChain: b.to_chain,
+          bridgeTool: b.bridge_tool,
+        });
+
+        if (result.status === 'DONE') {
+          markPendingBridgeDone(b.id, 'done', result.destTxHash);
+          const destLink = result.destTxHash ? explorerTxUrlForChain(result.destTxHash, b.to_chain) : null;
+          await bot.telegram.sendMessage(
+            b.uid,
+            `✅ Your bridge (${directionLabel(b.direction)}, ${b.amount_eth} ETH) has landed!` +
+            (destLink ? `\n[View transaction](${destLink})` : ''),
+            { parse_mode: 'Markdown' }
+          ).catch((err) => console.error(`Failed to notify uid ${b.uid} of bridge completion:`, err.message));
+        } else if (result.status === 'FAILED') {
+          markPendingBridgeDone(b.id, 'failed', null);
+          await bot.telegram.sendMessage(
+            b.uid,
+            `❌ Your bridge (${directionLabel(b.direction)}, ${b.amount_eth} ETH) failed on the destination side. Contact support if funds don't show up: panchi.eth@gmail.com`
+          ).catch((err) => console.error(`Failed to notify uid ${b.uid} of bridge failure:`, err.message));
+          await sendAdminAlert(bot.telegram, `Bridge FAILED for user ${b.uid}: ${b.direction}, ${b.amount_eth} ETH, tx ${b.source_tx_hash}`);
+        }
+        // PENDING: leave as-is, will be re-checked next tick.
+      } catch (err) {
+        console.error(`Bridge poller: status check failed for bridge ${b.id}:`, err.message);
+      }
+    }
+  }, BRIDGE_POLL_INTERVAL_MS);
+}
+
 // Surface crashes to the admin instead of the process dying with no record anywhere.
 process.on('unhandledRejection', (err) => {
   console.error('Unhandled rejection:', err);
@@ -904,6 +1133,8 @@ process.on('uncaughtException', (err) => {
 
 bot.launch()
   .then(checkStuckTrades)
+  .then(checkStuckBridges)
+  .then(startBridgePoller)
   .then(() => sendAdminAlert(bot.telegram, '✅ Bot started.'))
   .catch((err) => {
     console.error('Failed to launch bot:', err);
