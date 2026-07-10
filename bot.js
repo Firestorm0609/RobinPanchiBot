@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import { ethers } from 'ethers';
 import { getQuote, getSwapTx } from './swap.js';
+import { ensureAllowance } from './erc20.js';
 import { createWallet, importWallet, shortAddr } from './wallet.js';
 import { getEthUsdPrice, getTokenMarketData, fmtUsd } from './price.js';
 import {
@@ -14,6 +15,7 @@ import {
   getWallet,
   recordTrade,
   getPosition,
+  getAllPositions,
   getSettings,
   updateSettings,
 } from './storage.js';
@@ -48,6 +50,7 @@ async function balanceLines(address) {
 function mainMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('🔍 Trade Token', 'menu_trade')],
+    [Markup.button.callback('📊 Positions', 'menu_positions')],
     [Markup.button.callback('💼 Wallets', 'menu_wallets'), Markup.button.callback('💰 Balance', 'menu_balance')],
     [Markup.button.callback('⚙️ Settings', 'menu_settings')],
   ]);
@@ -183,8 +186,12 @@ async function executeSell(ctx, uid, tokenAddress, pct) {
     await ctx.reply(`Selling ${pct}%... fetching quote.`);
     const sellAmount = ethers.parseUnits(tokenAmount.toFixed(18), 18).toString(); // adjust decimals per token if needed
     const { slippageBps } = getSettings(uid);
-    const quote = await getQuote({ sellToken: tokenAddress, buyToken: 'ETH', sellAmount, taker: w.address, slippageBps });
     const signer = new ethers.Wallet(w.privateKey, provider);
+
+    const approvalReceipt = await ensureAllowance(signer, tokenAddress, BigInt(sellAmount));
+    if (approvalReceipt) await ctx.reply('Approved token for trading (one-time step). Continuing...');
+
+    const quote = await getQuote({ sellToken: tokenAddress, buyToken: 'ETH', sellAmount, taker: w.address, slippageBps });
     const txResponse = await getSwapTx(signer, quote);
     await ctx.reply(`Tx sent: ${txResponse.hash}\nWaiting for confirmation...`);
     const receipt = await txResponse.wait();
@@ -278,6 +285,45 @@ bot.action(/^wallet_(?!create|import|activate|rename|remove)(.+)$/, async (ctx) 
     parse_mode: 'Markdown',
     ...walletDetailMenu(w.id),
   });
+});
+
+// ---------- Positions ----------
+
+bot.action('menu_positions', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  const w = getActiveWallet(uid);
+  if (!w) return ctx.editMessageText('No active wallet. Add one first.', walletsMenu(uid));
+
+  const positions = getAllPositions(uid, w.id);
+  if (positions.length === 0) {
+    return ctx.editMessageText('📊 No positions yet. Trade a token to open one.', {
+      ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_main')]]),
+    });
+  }
+
+  const ethUsd = await getEthUsdPrice().catch(() => null);
+  const rows = [];
+  let text = `📊 *Positions* — ${w.name}\n`;
+
+  for (const pos of positions) {
+    const market = await getTokenMarketData(pos.tokenAddress).catch(() => null);
+    const symbol = market?.symbol ?? shortAddr(pos.tokenAddress);
+    if (market && ethUsd) {
+      const valueUsd = pos.tokenAmount * market.priceUsd;
+      const costUsd = pos.costEth * ethUsd;
+      const pnlUsd = valueUsd - costUsd;
+      const pnlPct = costUsd > 0 ? (pnlUsd / costUsd) * 100 : 0;
+      const emoji = pnlUsd >= 0 ? '🟢' : '🔴';
+      text += `\n*${symbol}*: ${pos.tokenAmount.toFixed(4)} — ${fmtUsd(valueUsd)} (${emoji} ${pnlPct.toFixed(1)}%)`;
+    } else {
+      text += `\n*${symbol}*: ${pos.tokenAmount.toFixed(4)} — price unavailable`;
+    }
+    rows.push([Markup.button.callback(`View ${symbol}`, `refresh_${pos.tokenAddress}`)]);
+  }
+
+  rows.push([Markup.button.callback('⬅️ Back', 'menu_main')]);
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(rows) });
 });
 
 // ---------- Settings ----------
