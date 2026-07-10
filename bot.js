@@ -121,6 +121,15 @@ const HELP_TEXT =
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL, Number(process.env.CHAIN_ID));
 
+// Hoisted once at startup (was previously re-created on every single bridge
+// call inside executeBridge, opening a fresh RPC connection per trade).
+// Used whenever the bridge's source chain is Ethereum mainnet, since RPC_URL
+// above points at Robinhood Chain.
+const ethMainnetProvider = new ethers.JsonRpcProvider(
+  process.env.ETH_RPC_URL || 'https://cloudflare-eth.com',
+  ETH_CHAIN_ID
+);
+
 let BOT_USERNAME = null;
 bot.telegram.getMe()
   .then((me) => { BOT_USERNAME = me.username; })
@@ -230,6 +239,7 @@ function settingsMenu(uid) {
     [Markup.button.callback(`Sell presets: ${s.sellPresetsPct.join(', ')}%`, 'settings_sell')],
     [Markup.button.callback(`Slippage: ${(s.slippageBps / 100).toFixed(2)}%`, 'settings_slippage')],
     [Markup.button.callback(`Max buy size: ${s.maxBuyEth} ETH`, 'settings_maxbuy')],
+    [Markup.button.callback(`Max bridge size: ${s.maxBridgeEth} ETH`, 'settings_maxbridge')],
     [Markup.button.callback(`Confirm before trade: ${s.confirmTrades ? 'ON ✅' : 'OFF ❌'}`, 'settings_toggle_confirm')],
     [Markup.button.callback('⬅️ Back', 'menu_main')],
   ]);
@@ -451,6 +461,13 @@ async function executeBridge(ctx, uid, direction, amountEth) {
   const w = getActiveWallet(uid);
   if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
 
+  // Same guard shape as executeBuy's maxBuyEth check — belt-and-suspenders in
+  // case this got here via a route that skipped the earlier bridge_amount check.
+  const { maxBridgeEth } = getSettings(uid);
+  if (amountEth > maxBridgeEth) {
+    return ctx.reply(`❌ ${amountEth} ETH exceeds your max bridge size (${maxBridgeEth} ETH). Adjust it in Settings if this was intentional.`, mainMenu());
+  }
+
   if (bridgesInFlight.has(uid)) {
     return ctx.reply('⏳ A bridge is already in progress — please wait for it to finish.');
   }
@@ -468,10 +485,8 @@ async function executeBridge(ctx, uid, direction, amountEth) {
 
     // Bridges can originate on either chain — use a provider pointed at the source chain
     // for ETH_TO_ROBINHOOD; the configured RPC_URL provider is Robinhood Chain, so for
-    // that direction we need a mainnet provider instead.
-    const sourceProvider = fromChain === ETH_CHAIN_ID
-      ? new ethers.JsonRpcProvider(process.env.ETH_RPC_URL || 'https://cloudflare-eth.com')
-      : provider;
+    // that direction we use the shared mainnet provider created once at startup.
+    const sourceProvider = fromChain === ETH_CHAIN_ID ? ethMainnetProvider : provider;
     const sourceSigner = new ethers.Wallet(w.privateKey, sourceProvider);
 
     const { txResponse, bumped } = await sendBridgeTx(sourceSigner, quote);
@@ -726,6 +741,12 @@ bot.action('settings_maxbuy', async (ctx) => {
   await ctx.answerCbQuery();
   pending.set(ctx.from.id, { type: 'settings_maxbuy' });
   await ctx.editMessageText('Send the max ETH allowed per single buy, e.g. `0.5`', { parse_mode: 'Markdown' });
+});
+
+bot.action('settings_maxbridge', async (ctx) => {
+  await ctx.answerCbQuery();
+  pending.set(ctx.from.id, { type: 'settings_maxbridge' });
+  await ctx.editMessageText('Send the max ETH allowed per single bridge, e.g. `0.5`', { parse_mode: 'Markdown' });
 });
 
 bot.action('settings_toggle_confirm', async (ctx) => {
@@ -1018,6 +1039,15 @@ bot.on('text', async (ctx) => {
       return;
     }
 
+    if (state.type === 'settings_maxbridge') {
+      const amt = parseFloat(text);
+      if (isNaN(amt) || amt <= 0) return ctx.reply('Send a valid positive ETH amount, e.g. `0.5`');
+      updateSettings(uid, { maxBridgeEth: amt });
+      pending.delete(uid);
+      await ctx.reply(`✅ Max bridge size set to ${amt} ETH`, mainMenu());
+      return;
+    }
+
     if (state.type === 'custom_buy' || state.type === 'custom_sell') {
       const isBuy = state.type === 'custom_buy';
       const val = parseFloat(text);
@@ -1052,6 +1082,16 @@ bot.on('text', async (ctx) => {
     if (state.type === 'bridge_amount') {
       const amt = parseFloat(text);
       if (isNaN(amt) || amt <= 0) return ctx.reply('Send a valid positive ETH amount, e.g. `0.05`');
+
+      // Guard bridge amount against the configured cap, same as buy amounts —
+      // previously this check only existed on the buy path, so a bridge could
+      // go straight to a quote (and eventual raw signer error) for any size.
+      const { maxBridgeEth } = getSettings(uid);
+      if (amt > maxBridgeEth) {
+        pending.delete(uid);
+        return ctx.reply(`❌ ${amt} ETH exceeds your max bridge size (${maxBridgeEth} ETH). Adjust it in Settings if this was intentional.`, mainMenu());
+      }
+
       pending.delete(uid);
 
       let quote;
