@@ -121,6 +121,15 @@ const HELP_TEXT =
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL, Number(process.env.CHAIN_ID));
 
+// USDG (Paxos-issued stablecoin) — the canonical stablecoin on Robinhood Chain,
+// per official docs: https://docs.robinhood.com/chain/contracts
+// Not the same as USDC/USDT — those have no contract on Robinhood Chain.
+const USDG_ROBINHOOD_ADDRESS = '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168';
+const ERC20_BALANCE_ABI = [
+  'function balanceOf(address owner) view returns (uint256)',
+  'function decimals() view returns (uint8)',
+];
+
 // Hoisted once at startup (was previously re-created on every single bridge
 // call inside executeBridge, opening a fresh RPC connection per trade).
 // Used whenever the bridge's source chain is Ethereum mainnet, since RPC_URL
@@ -174,6 +183,31 @@ async function balanceLines(address) {
     // price feed hiccup, still show ETH
   }
   return `${fmtEth(ethAmount)} ETH${usdLine}`;
+}
+
+/**
+ * Fetches balances relevant to bridging, for display when the user opens the
+ * Bridge menu: ETH on both Ethereum mainnet and Robinhood Chain, plus USDG
+ * on Robinhood Chain (its canonical stablecoin — see USDG_ROBINHOOD_ADDRESS).
+ * Each fetch is independently caught so one RPC hiccup doesn't blank the rest.
+ */
+async function getBridgeBalances(address) {
+  const [ethMainnet, ethRobinhood, usdgRobinhood] = await Promise.all([
+    ethMainnetProvider.getBalance(address).then((b) => Number(ethers.formatEther(b))).catch(() => null),
+    provider.getBalance(address).then((b) => Number(ethers.formatEther(b))).catch(() => null),
+    (async () => {
+      const token = new ethers.Contract(USDG_ROBINHOOD_ADDRESS, ERC20_BALANCE_ABI, provider);
+      const [raw, decimals] = await Promise.all([token.balanceOf(address), token.decimals()]);
+      return Number(ethers.formatUnits(raw, decimals));
+    })().catch(() => null),
+  ]);
+  return { ethMainnet, ethRobinhood, usdgRobinhood };
+}
+
+function fmtBridgeBalanceLine(label, amount, ethUsd) {
+  if (amount === null) return `${label}: unavailable`;
+  const usdLine = ethUsd !== null ? ` (${fmtUsd(amount * ethUsd)})` : '';
+  return `${label}: ${amount.toFixed(4)}${usdLine}`;
 }
 
 /** Re-fetches the quote if too much time has passed since it was first obtained. */
@@ -821,8 +855,27 @@ bot.action('menu_bridge', async (ctx) => {
   await ctx.answerCbQuery();
   const w = getActiveWallet(ctx.from.id);
   if (!w) return ctx.editMessageText('No active wallet. Add one first.', walletsMenu(ctx.from.id));
+
+  await ctx.editMessageText('🌉 *Bridge ETH*\n\nFetching your balances...', { parse_mode: 'Markdown' });
+
+  const [balances, ethUsd] = await Promise.all([
+    getBridgeBalances(w.address),
+    getEthUsdPrice().catch(() => null),
+  ]);
+
+  const balanceLines = [
+    fmtBridgeBalanceLine('Ethereum — ETH', balances.ethMainnet, ethUsd),
+    fmtBridgeBalanceLine('Robinhood — ETH', balances.ethRobinhood, ethUsd),
+    // USDG is a dollar-pegged stablecoin, so its own amount is ~its USD value — no ethUsd conversion needed.
+    fmtBridgeBalanceLine('Robinhood — USDG', balances.usdgRobinhood, balances.usdgRobinhood !== null ? 1 : null),
+  ];
+
   await ctx.editMessageText(
-    `🌉 *Bridge ETH*\n\nMove ETH between Ethereum mainnet and Robinhood Chain.\nActive wallet: *${w.name}* (\`${shortAddr(w.address)}\`)\n\nYou'll be able to enter the amount in ETH or USD.`,
+    `🌉 *Bridge ETH*\n\n` +
+    `Move ETH between Ethereum mainnet and Robinhood Chain.\n` +
+    `Active wallet: *${w.name}* (\`${shortAddr(w.address)}\`)\n\n` +
+    `*Your balances:*\n${balanceLines.join('\n')}\n\n` +
+    `You'll be able to enter the amount in ETH or USD.`,
     { parse_mode: 'Markdown', ...bridgeMenu() }
   );
 });
@@ -831,8 +884,17 @@ bot.action(/^bridge_dir_(eth_to_robinhood|robinhood_to_eth)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const direction = ctx.match[1] === 'eth_to_robinhood' ? BRIDGE_DIRECTION.ETH_TO_ROBINHOOD : BRIDGE_DIRECTION.ROBINHOOD_TO_ETH;
   pending.set(ctx.from.id, { type: 'bridge_amount', direction });
+
+  const w = getActiveWallet(ctx.from.id);
+  let sourceBalanceLine = '';
+  if (w) {
+    const sourceProvider = direction === BRIDGE_DIRECTION.ETH_TO_ROBINHOOD ? ethMainnetProvider : provider;
+    const bal = await sourceProvider.getBalance(w.address).then((b) => Number(ethers.formatEther(b))).catch(() => null);
+    if (bal !== null) sourceBalanceLine = `\nAvailable: ${fmtEth(bal)} ETH\n`;
+  }
+
   await ctx.editMessageText(
-    `Send the amount to bridge (${directionLabel(direction)}) — ETH like \`0.05\`, or USD like \`$100\`:`,
+    `Send the amount to bridge (${directionLabel(direction)}) — ETH like \`0.05\`, or USD like \`$100\`:${sourceBalanceLine}`,
     { parse_mode: 'Markdown' }
   );
 });
