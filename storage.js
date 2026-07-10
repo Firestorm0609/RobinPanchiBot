@@ -114,3 +114,28 @@ export function getPosition(uid, walletId, tokenAddress) {
   const key = `${walletId}_${tokenAddress.toLowerCase()}`;
   return user.positions[key] || null;
 }
+
+// ---------- Settings ----------
+
+const DEFAULT_SETTINGS = {
+  buyPresetsEth: [0.01, 0.05, 0.1],
+  sellPresetsPct: [25, 50, 100],
+  slippageBps: 100, // 1%
+  confirmTrades: true,
+};
+
+export function getSettings(uid) {
+  const db = readDb();
+  const user = db.users[uid];
+  if (!user) return { ...DEFAULT_SETTINGS };
+  return { ...DEFAULT_SETTINGS, ...(user.settings || {}) };
+}
+
+export function updateSettings(uid, patch) {
+  const db = readDb();
+  const user = db.users[uid] || { wallets: [], activeWalletId: null };
+  user.settings = { ...DEFAULT_SETTINGS, ...(user.settings || {}), ...patch };
+  db.users[uid] = user;
+  writeDb(db);
+  return user.settings;
+}
