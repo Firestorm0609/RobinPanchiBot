@@ -14,6 +14,8 @@ import {
   getWallet,
   recordTrade,
   getPosition,
+  getSettings,
+  updateSettings,
 } from './storage.js';
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
@@ -21,7 +23,6 @@ const provider = new ethers.JsonRpcProvider(process.env.RPC_URL, Number(process.
 
 const pending = new Map(); // uid -> { type, ...context }
 const CA_REGEX = /^0x[a-fA-F0-9]{40}$/;
-const BUY_PRESETS = [0.01, 0.05, 0.1]; // ETH
 
 // ---------- Formatting ----------
 
@@ -48,6 +49,7 @@ function mainMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('🔍 Trade Token', 'menu_trade')],
     [Markup.button.callback('💼 Wallets', 'menu_wallets'), Markup.button.callback('💰 Balance', 'menu_balance')],
+    [Markup.button.callback('⚙️ Settings', 'menu_settings')],
   ]);
 }
 
@@ -74,16 +76,26 @@ function walletDetailMenu(walletId) {
   ]);
 }
 
-function tokenMenu(tokenAddress, hasPosition) {
+function settingsMenu(uid) {
+  const s = getSettings(uid);
+  return Markup.inlineKeyboard([
+    [Markup.button.callback(`Buy presets: ${s.buyPresetsEth.join(', ')} ETH`, 'settings_buy')],
+    [Markup.button.callback(`Sell presets: ${s.sellPresetsPct.join(', ')}%`, 'settings_sell')],
+    [Markup.button.callback(`Slippage: ${(s.slippageBps / 100).toFixed(2)}%`, 'settings_slippage')],
+    [Markup.button.callback(`Confirm before trade: ${s.confirmTrades ? 'ON ✅' : 'OFF ❌'}`, 'settings_toggle_confirm')],
+    [Markup.button.callback('⬅️ Back', 'menu_main')],
+  ]);
+}
+
+function tokenMenu(uid, tokenAddress, hasPosition) {
+  const s = getSettings(uid);
   const rows = [
-    BUY_PRESETS.map((amt) => Markup.button.callback(`Buy ${amt} ETH`, `buy_${tokenAddress}_${amt}`)),
+    s.buyPresetsEth.map((amt) => Markup.button.callback(`Buy ${amt} ETH`, `buy_${tokenAddress}_${amt}`)),
+    [Markup.button.callback('✏️ Custom Buy', `custombuy_${tokenAddress}`)],
   ];
   if (hasPosition) {
-    rows.push([
-      Markup.button.callback('Sell 25%', `sell_${tokenAddress}_25`),
-      Markup.button.callback('Sell 50%', `sell_${tokenAddress}_50`),
-      Markup.button.callback('Sell 100%', `sell_${tokenAddress}_100`),
-    ]);
+    rows.push(s.sellPresetsPct.map((pct) => Markup.button.callback(`Sell ${pct}%`, `sell_${tokenAddress}_${pct}`)));
+    rows.push([Markup.button.callback('✏️ Custom Sell', `customsell_${tokenAddress}`)]);
   }
   rows.push([
     Markup.button.callback('🔄 Refresh', `refresh_${tokenAddress}`),
@@ -124,15 +136,75 @@ async function renderTokenCard(uid, tokenAddress) {
   }
 
   const changeLine = market.priceChange24h !== null ? ` (${market.priceChange24h >= 0 ? '+' : ''}${market.priceChange24h.toFixed(1)}%)` : '';
+  const walletBalance = await balanceLines(w.address).catch(() => 'unavailable');
 
   const text =
     `*${market.symbol}*\n\`${tokenAddress}\`\n\n` +
     `Price: $${market.priceUsd.toPrecision(4)}${changeLine}\n` +
     `Market Cap: ${fmtUsd(market.marketCap)}\n` +
-    `Liquidity: ${fmtUsd(market.liquidityUsd)}` +
+    `Liquidity: ${fmtUsd(market.liquidityUsd)}\n` +
+    `Your balance: ${walletBalance}` +
     pnlLine;
 
-  return { text, markup: tokenMenu(tokenAddress, !!(pos && pos.tokenAmount > 0)) };
+  return { text, markup: tokenMenu(uid, tokenAddress, !!(pos && pos.tokenAmount > 0)) };
+}
+
+// ---------- Shared trade execution ----------
+
+async function executeBuy(ctx, uid, tokenAddress, ethAmount) {
+  const w = getActiveWallet(uid);
+  if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
+  try {
+    await ctx.reply(`Buying ${ethAmount} ETH worth... fetching quote.`);
+    const sellAmount = ethers.parseEther(ethAmount.toString()).toString();
+    const { slippageBps } = getSettings(uid);
+    const quote = await getQuote({ sellToken: 'ETH', buyToken: tokenAddress, sellAmount, taker: w.address, slippageBps });
+    const signer = new ethers.Wallet(w.privateKey, provider);
+    const txResponse = await getSwapTx(signer, quote);
+    await ctx.reply(`Tx sent: ${txResponse.hash}\nWaiting for confirmation...`);
+    const receipt = await txResponse.wait();
+    recordTrade(uid, w.id, tokenAddress, 'buy', Number(quote.buyAmountFormatted), ethAmount);
+    await ctx.reply(`✅ Confirmed in block ${receipt.blockNumber}`);
+    const { text, markup } = await renderTokenCard(uid, tokenAddress);
+    await ctx.reply(text, { parse_mode: 'Markdown', ...markup });
+  } catch (err) {
+    console.error(err);
+    await ctx.reply(`❌ Trade failed: ${err.message}`, mainMenu());
+  }
+}
+
+async function executeSell(ctx, uid, tokenAddress, pct) {
+  const w = getActiveWallet(uid);
+  if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
+  const pos = getPosition(uid, w.id, tokenAddress);
+  if (!pos || pos.tokenAmount <= 0) return ctx.reply('No position to sell.', mainMenu());
+  const tokenAmount = pos.tokenAmount * (pct / 100);
+  try {
+    await ctx.reply(`Selling ${pct}%... fetching quote.`);
+    const sellAmount = ethers.parseUnits(tokenAmount.toFixed(18), 18).toString(); // adjust decimals per token if needed
+    const { slippageBps } = getSettings(uid);
+    const quote = await getQuote({ sellToken: tokenAddress, buyToken: 'ETH', sellAmount, taker: w.address, slippageBps });
+    const signer = new ethers.Wallet(w.privateKey, provider);
+    const txResponse = await getSwapTx(signer, quote);
+    await ctx.reply(`Tx sent: ${txResponse.hash}\nWaiting for confirmation...`);
+    const receipt = await txResponse.wait();
+    recordTrade(uid, w.id, tokenAddress, 'sell', tokenAmount, Number(quote.buyAmountFormatted));
+    await ctx.reply(`✅ Confirmed in block ${receipt.blockNumber}`);
+    const { text, markup } = await renderTokenCard(uid, tokenAddress);
+    await ctx.reply(text, { parse_mode: 'Markdown', ...markup });
+  } catch (err) {
+    console.error(err);
+    await ctx.reply(`❌ Trade failed: ${err.message}`, mainMenu());
+  }
+}
+
+function confirmMenu(kind, tokenAddress, value) {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('✅ Confirm', `confirm_${kind}_${tokenAddress}_${value}`),
+      Markup.button.callback('❌ Cancel', 'cancel_trade'),
+    ],
+  ]);
 }
 
 // ---------- Start / Main menu ----------
@@ -208,6 +280,52 @@ bot.action(/^wallet_(?!create|import|activate|rename|remove)(.+)$/, async (ctx) 
   });
 });
 
+// ---------- Settings ----------
+
+bot.action('menu_settings', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.editMessageText('⚙️ *Settings*', { parse_mode: 'Markdown', ...settingsMenu(ctx.from.id) });
+});
+
+bot.action('settings_buy', async (ctx) => {
+  await ctx.answerCbQuery();
+  pending.set(ctx.from.id, { type: 'settings_buy' });
+  await ctx.editMessageText('Send comma-separated ETH amounts, e.g. `0.01, 0.05, 0.2`', { parse_mode: 'Markdown' });
+});
+
+bot.action('settings_sell', async (ctx) => {
+  await ctx.answerCbQuery();
+  pending.set(ctx.from.id, { type: 'settings_sell' });
+  await ctx.editMessageText('Send comma-separated sell percentages, e.g. `25, 50, 75, 100`', { parse_mode: 'Markdown' });
+});
+
+bot.action('settings_slippage', async (ctx) => {
+  await ctx.answerCbQuery();
+  pending.set(ctx.from.id, { type: 'settings_slippage' });
+  await ctx.editMessageText('Send slippage tolerance as a percentage, e.g. `1` for 1%', { parse_mode: 'Markdown' });
+});
+
+bot.action('settings_toggle_confirm', async (ctx) => {
+  const s = getSettings(ctx.from.id);
+  updateSettings(ctx.from.id, { confirmTrades: !s.confirmTrades });
+  await ctx.answerCbQuery(`Confirmation ${!s.confirmTrades ? 'enabled' : 'disabled'}`);
+  await ctx.editMessageText('⚙️ *Settings*', { parse_mode: 'Markdown', ...settingsMenu(ctx.from.id) });
+});
+
+// ---------- Custom buy/sell prompts ----------
+
+bot.action(/^custombuy_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  pending.set(ctx.from.id, { type: 'custom_buy', tokenAddress: ctx.match[1] });
+  await ctx.editMessageText('Send the ETH amount to spend, e.g. `0.03`');
+});
+
+bot.action(/^customsell_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  pending.set(ctx.from.id, { type: 'custom_sell', tokenAddress: ctx.match[1] });
+  await ctx.editMessageText('Send the percentage to sell, e.g. `40` for 40%');
+});
+
 // ---------- Balance ----------
 
 bot.action('menu_balance', async (ctx) => {
@@ -235,28 +353,14 @@ bot.action(/^buy_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const [, tokenAddress, ethAmountStr] = ctx.match;
   const uid = ctx.from.id;
-  const w = getActiveWallet(uid);
-  if (!w) return ctx.editMessageText('No active wallet.', walletsMenu(uid));
-
-  try {
-    await ctx.editMessageText(`Buying ${ethAmountStr} ETH worth... fetching quote.`);
-    const sellAmount = ethers.parseEther(ethAmountStr).toString();
-    const quote = await getQuote({ sellToken: 'ETH', buyToken: tokenAddress, sellAmount, taker: w.address });
-
-    const signer = new ethers.Wallet(w.privateKey, provider);
-    const txResponse = await getSwapTx(signer, quote);
-    await ctx.reply(`Tx sent: ${txResponse.hash}\nWaiting for confirmation...`);
-    const receipt = await txResponse.wait();
-
-    const tokenAmount = Number(quote.buyAmountFormatted);
-    recordTrade(uid, w.id, tokenAddress, 'buy', tokenAmount, Number(ethAmountStr));
-
-    const { text, markup } = await renderTokenCard(uid, tokenAddress);
-    await ctx.reply(`✅ Confirmed in block ${receipt.blockNumber}`);
-    await ctx.reply(text, { parse_mode: 'Markdown', ...markup });
-  } catch (err) {
-    console.error(err);
-    await ctx.reply(`❌ Trade failed: ${err.message}`, mainMenu());
+  const { confirmTrades } = getSettings(uid);
+  if (confirmTrades) {
+    await ctx.editMessageText(`Confirm: buy *${ethAmountStr} ETH* worth of this token?`, {
+      parse_mode: 'Markdown',
+      ...confirmMenu('buy', tokenAddress, ethAmountStr),
+    });
+  } else {
+    await executeBuy(ctx, uid, tokenAddress, Number(ethAmountStr));
   }
 });
 
@@ -266,34 +370,30 @@ bot.action(/^sell_(0x[a-fA-F0-9]{40})_(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const [, tokenAddress, pctStr] = ctx.match;
   const uid = ctx.from.id;
-  const w = getActiveWallet(uid);
-  if (!w) return ctx.editMessageText('No active wallet.', walletsMenu(uid));
-
-  const pos = getPosition(uid, w.id, tokenAddress);
-  if (!pos || pos.tokenAmount <= 0) return ctx.editMessageText('No position to sell.', mainMenu());
-
-  const pct = Number(pctStr) / 100;
-  const tokenAmount = pos.tokenAmount * pct;
-
-  try {
-    await ctx.editMessageText(`Selling ${pctStr}%... fetching quote.`);
-    const sellAmount = ethers.parseUnits(tokenAmount.toFixed(18), 18).toString(); // adjust decimals per token if needed
-    const quote = await getQuote({ sellToken: tokenAddress, buyToken: 'ETH', sellAmount, taker: w.address });
-
-    const signer = new ethers.Wallet(w.privateKey, provider);
-    const txResponse = await getSwapTx(signer, quote);
-    await ctx.reply(`Tx sent: ${txResponse.hash}\nWaiting for confirmation...`);
-    const receipt = await txResponse.wait();
-
-    recordTrade(uid, w.id, tokenAddress, 'sell', tokenAmount, Number(quote.buyAmountFormatted));
-
-    const { text, markup } = await renderTokenCard(uid, tokenAddress);
-    await ctx.reply(`✅ Confirmed in block ${receipt.blockNumber}`);
-    await ctx.reply(text, { parse_mode: 'Markdown', ...markup });
-  } catch (err) {
-    console.error(err);
-    await ctx.reply(`❌ Trade failed: ${err.message}`, mainMenu());
+  const { confirmTrades } = getSettings(uid);
+  if (confirmTrades) {
+    await ctx.editMessageText(`Confirm: sell *${pctStr}%* of your position?`, {
+      parse_mode: 'Markdown',
+      ...confirmMenu('sell', tokenAddress, pctStr),
+    });
+  } else {
+    await executeSell(ctx, uid, tokenAddress, Number(pctStr));
   }
+});
+
+bot.action(/^confirm_buy_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  await executeBuy(ctx, ctx.from.id, ctx.match[1], Number(ctx.match[2]));
+});
+
+bot.action(/^confirm_sell_(0x[a-fA-F0-9]{40})_(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  await executeSell(ctx, ctx.from.id, ctx.match[1], Number(ctx.match[2]));
+});
+
+bot.action('cancel_trade', async (ctx) => {
+  await ctx.answerCbQuery('Cancelled');
+  await ctx.editMessageText('Trade cancelled.', mainMenu());
 });
 
 // ---------- Free-text handler (wallet setup + CA paste) ----------
@@ -349,6 +449,55 @@ bot.on('text', async (ctx) => {
       renameWallet(uid, state.walletId, text);
       pending.delete(uid);
       await ctx.reply(`✅ Renamed to *${text}*`, { parse_mode: 'Markdown', ...mainMenu() });
+      return;
+    }
+
+    if (state.type === 'settings_buy') {
+      const amounts = text.split(',').map((s) => parseFloat(s.trim())).filter((n) => !isNaN(n) && n > 0);
+      if (amounts.length === 0) return ctx.reply('Send valid numbers, e.g. `0.01, 0.05, 0.2`', { parse_mode: 'Markdown' });
+      updateSettings(uid, { buyPresetsEth: amounts });
+      pending.delete(uid);
+      await ctx.reply(`✅ Buy presets updated: ${amounts.join(', ')} ETH`, mainMenu());
+      return;
+    }
+
+    if (state.type === 'settings_sell') {
+      const pcts = text.split(',').map((s) => parseFloat(s.trim())).filter((n) => !isNaN(n) && n > 0 && n <= 100);
+      if (pcts.length === 0) return ctx.reply('Send valid percentages (1-100), e.g. `25, 50, 100`');
+      updateSettings(uid, { sellPresetsPct: pcts });
+      pending.delete(uid);
+      await ctx.reply(`✅ Sell presets updated: ${pcts.join(', ')}%`, mainMenu());
+      return;
+    }
+
+    if (state.type === 'settings_slippage') {
+      const pct = parseFloat(text);
+      if (isNaN(pct) || pct <= 0 || pct > 50) return ctx.reply('Send a valid percentage between 0 and 50.');
+      updateSettings(uid, { slippageBps: Math.round(pct * 100) });
+      pending.delete(uid);
+      await ctx.reply(`✅ Slippage set to ${pct}%`, mainMenu());
+      return;
+    }
+
+    if (state.type === 'custom_buy' || state.type === 'custom_sell') {
+      const isBuy = state.type === 'custom_buy';
+      const val = parseFloat(text);
+      if (isNaN(val) || val <= 0 || (!isBuy && val > 100)) return ctx.reply('Send a valid positive number' + (isBuy ? '.' : ' (max 100 for %).'));
+      pending.delete(uid);
+
+      const { confirmTrades } = getSettings(uid);
+      if (confirmTrades) {
+        const kind = isBuy ? 'buy' : 'sell';
+        const label = isBuy ? `${val} ETH` : `${val}%`;
+        await ctx.reply(`Confirm: ${isBuy ? 'buy' : 'sell'} *${label}*?`, {
+          parse_mode: 'Markdown',
+          ...confirmMenu(kind, state.tokenAddress, val),
+        });
+      } else if (isBuy) {
+        await executeBuy(ctx, uid, state.tokenAddress, val);
+      } else {
+        await executeSell(ctx, uid, state.tokenAddress, val);
+      }
       return;
     }
   } catch (err) {
