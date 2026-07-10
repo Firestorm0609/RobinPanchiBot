@@ -60,17 +60,45 @@ export async function getBridgeQuote({ direction, amountEth, fromAddress, toAddr
 /**
  * Sends the bridge transaction on the source chain. Does not wait for the
  * destination-side delivery — call pollBridgeStatus for that.
+ *
+ * Same stuck-tx protection as swap.js's sendSwapWithGasBump: if the tx isn't
+ * mined within `timeoutMs`, resubmits the SAME nonce with fees bumped by
+ * `bumpPct`, repeating until it lands or `maxAttempts` is hit. Without this,
+ * a congested source-chain tx can hang the caller's `await` forever, which
+ * for bot.js means the per-user bridgesInFlight lock never releases and the
+ * user is silently stuck.
+ *
+ * Returns { txResponse, receipt, bumped } for the transaction that actually
+ * confirmed (the last resubmission, if any bumps happened).
  */
-export async function sendBridgeTx(signer, quote) {
+export async function sendBridgeTx(signer, quote, { timeoutMs = 45_000, bumpPct = 20, maxAttempts = 4 } = {}) {
   const tx = quote.transactionRequest;
-  const txResponse = await signer.sendTransaction({
+  const nonce = await signer.getNonce();
+  const feeData = await signer.provider.getFeeData();
+  let maxFeePerGas = tx.maxFeePerGas ? BigInt(tx.maxFeePerGas) : (feeData.maxFeePerGas ?? ethers.parseUnits('30', 'gwei'));
+  let maxPriorityFeePerGas = tx.maxPriorityFeePerGas ? BigInt(tx.maxPriorityFeePerGas) : (feeData.maxPriorityFeePerGas ?? ethers.parseUnits('1', 'gwei'));
+
+  const baseTxRequest = {
     to: tx.to,
     data: tx.data,
     value: tx.value ? BigInt(tx.value) : 0n,
     gasLimit: tx.gasLimit ? BigInt(tx.gasLimit) : undefined,
-  });
-  const receipt = await txResponse.wait();
-  return { txResponse, receipt };
+  };
+
+  let lastTxResponse;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    lastTxResponse = await signer.sendTransaction({ ...baseTxRequest, nonce, maxFeePerGas, maxPriorityFeePerGas });
+    try {
+      const receipt = await lastTxResponse.wait(1, timeoutMs);
+      return { txResponse: lastTxResponse, receipt, bumped: attempt > 1 };
+    } catch (err) {
+      const timedOut = err.code === 'TIMEOUT' || err.message?.toLowerCase().includes('timeout');
+      if (!timedOut || attempt === maxAttempts) throw err;
+      maxFeePerGas = (maxFeePerGas * BigInt(100 + bumpPct)) / 100n;
+      maxPriorityFeePerGas = (maxPriorityFeePerGas * BigInt(100 + bumpPct)) / 100n;
+    }
+  }
+  throw new Error('sendBridgeTx: exhausted attempts'); // unreachable
 }
 
 /**
