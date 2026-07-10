@@ -6,17 +6,19 @@ const ZEROX_BASE_URL = 'https://api.0x.org/swap/permit2/quote';
 /**
  * Fetch a firm swap quote from 0x, including your affiliate fee.
  */
+const NATIVE_ETH = '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE';
+
 export async function getQuote({ sellToken, buyToken, sellAmount, taker, slippageBps = 100 }) {
   const params = {
     chainId: process.env.CHAIN_ID,
-    sellToken,
-    buyToken,
+    sellToken: sellToken === 'ETH' ? NATIVE_ETH : ethers.getAddress(sellToken),
+    buyToken: buyToken === 'ETH' ? NATIVE_ETH : ethers.getAddress(buyToken),
     sellAmount,
-    taker,
+    taker: ethers.getAddress(taker),
     slippageBps,
-    swapFeeRecipient: process.env.AFFILIATE_ADDRESS,
+    swapFeeRecipient: ethers.getAddress(process.env.AFFILIATE_ADDRESS),
     swapFeeBps: process.env.AFFILIATE_FEE_BPS,
-    swapFeeToken: buyToken,
+    swapFeeToken: buyToken === 'ETH' ? NATIVE_ETH : ethers.getAddress(buyToken),
   };
 
   const res = await axios.get(ZEROX_BASE_URL, {
@@ -25,6 +27,9 @@ export async function getQuote({ sellToken, buyToken, sellAmount, taker, slippag
       '0x-api-key': process.env.ZEROX_API_KEY,
       '0x-version': 'v2',
     },
+  }).catch((err) => {
+    console.error('0x quote error:', JSON.stringify(err.response?.data ?? err.message, null, 2));
+    throw err;
   });
 
   const data = res.data;
