@@ -252,13 +252,14 @@ async function getFreshQuote(quoteParams, quote, fetchedAt) {
 }
 
 /**
- * Parses a user-entered bridge amount, accepting either a plain ETH figure
+ * Parses a user-entered amount, accepting either a plain ETH figure
  * (e.g. "0.05") or a USD figure prefixed with "$" (e.g. "$100"). Returns
  * { amountEth, usdInput } or throws with a user-facing message on bad input.
  * usdInput is the raw USD number if the user entered USD, otherwise null —
  * useful for showing "≈ $100 worth" back to the user for confirmation.
+ * Shared by bridge amount entry and custom buy amount entry.
  */
-async function parseBridgeAmountInput(text) {
+async function parseEthOrUsdInput(text) {
   const trimmed = text.trim();
   const isUsd = trimmed.startsWith('$');
 
@@ -282,6 +283,9 @@ async function parseBridgeAmountInput(text) {
   }
   return { amountEth: amt, usdInput: null };
 }
+
+// Kept as an alias for the bridge flow's original name, same function.
+const parseBridgeAmountInput = parseEthOrUsdInput;
 
 // ---------- Menus ----------
 
@@ -1002,7 +1006,10 @@ bot.action('bridge_history', async (ctx) => {
 bot.action(/^custombuy_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
   await ctx.answerCbQuery();
   pending.set(ctx.from.id, { type: 'custom_buy', tokenAddress: ctx.match[1] });
-  await ctx.editMessageText('Send the ETH amount to spend, e.g. `0.03`');
+  await ctx.editMessageText(
+    'Send the amount to spend — ETH like `0.03`, or USD like `$100`:',
+    { parse_mode: 'Markdown' }
+  );
 });
 
 bot.action(/^customsell_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
@@ -1224,31 +1231,49 @@ bot.on('text', async (ctx) => {
       return;
     }
 
-    if (state.type === 'custom_buy' || state.type === 'custom_sell') {
-      const isBuy = state.type === 'custom_buy';
-      const val = parseFloat(text);
-      if (isNaN(val) || val <= 0 || (!isBuy && val > 100)) return ctx.reply('Send a valid positive number' + (isBuy ? '.' : ' (max 100 for %).'));
+    if (state.type === 'custom_buy') {
+      // Accepts either a plain ETH figure ("0.03") or a USD figure ("$100"),
+      // same parser used by the bridge amount flow.
+      let val, usdInput;
+      try {
+        ({ amountEth: val, usdInput } = await parseEthOrUsdInput(text));
+      } catch (err) {
+        return ctx.reply(err.message, { parse_mode: 'Markdown' });
+      }
 
-      if (isBuy) {
-        const { maxBuyEth } = getSettings(uid);
-        if (val > maxBuyEth) {
-          pending.delete(uid);
-          return ctx.reply(`❌ ${val} ETH exceeds your max buy size (${maxBuyEth} ETH). Adjust it in Settings if this was intentional.`, mainMenu());
-        }
+      const { maxBuyEth } = getSettings(uid);
+      if (val > maxBuyEth) {
+        pending.delete(uid);
+        return ctx.reply(`❌ ${val.toFixed(6)} ETH exceeds your max buy size (${maxBuyEth} ETH). Adjust it in Settings if this was intentional.`, mainMenu());
       }
 
       pending.delete(uid);
 
       const { confirmTrades } = getSettings(uid);
+      const label = usdInput !== null ? `≈ ${val.toFixed(6)} ETH (${fmtUsd(usdInput)})` : `${val} ETH`;
       if (confirmTrades) {
-        const kind = isBuy ? 'buy' : 'sell';
-        const label = isBuy ? `${val} ETH` : `${val}%`;
-        await ctx.reply(`Confirm: ${isBuy ? 'buy' : 'sell'} *${label}*?`, {
+        await ctx.reply(`Confirm: buy *${label}*?`, {
           parse_mode: 'Markdown',
-          ...confirmMenu(kind, state.tokenAddress, val),
+          ...confirmMenu('buy', state.tokenAddress, val),
         });
-      } else if (isBuy) {
+      } else {
         await executeBuy(ctx, uid, state.tokenAddress, val);
+      }
+      return;
+    }
+
+    if (state.type === 'custom_sell') {
+      const val = parseFloat(text);
+      if (isNaN(val) || val <= 0 || val > 100) return ctx.reply('Send a valid positive number (max 100 for %).');
+
+      pending.delete(uid);
+
+      const { confirmTrades } = getSettings(uid);
+      if (confirmTrades) {
+        await ctx.reply(`Confirm: sell *${val}%*?`, {
+          parse_mode: 'Markdown',
+          ...confirmMenu('sell', state.tokenAddress, val),
+        });
       } else {
         await executeSell(ctx, uid, state.tokenAddress, val);
       }
