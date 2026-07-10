@@ -104,6 +104,7 @@ const DEFAULT_SETTINGS = {
   slippageBps: 100, // 1%
   confirmTrades: true,
   maxBuyEth: 1,
+  maxBridgeEth: 1, // mirrors maxBuyEth's guard, applied to bridge amounts
 };
 
 function ensureUserRow(uid) {
