@@ -1,7 +1,7 @@
 import { ethers } from 'ethers';
 
 // Canonical Permit2 contract address — same on all EVM chains that have it deployed.
-export const PERMIT2_ADDRESS = '0x000000000022D473030F116dDEE9F6B43aC78BA';
+export const PERMIT2_ADDRESS = '0x000000000022D473030F116dDEE9F6B43aC78BA3';
 
 const ERC20_ABI = [
   'function allowance(address owner, address spender) view returns (uint256)',
