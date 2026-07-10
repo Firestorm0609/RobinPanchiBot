@@ -53,11 +53,10 @@ export async function getSwapTx(signer, quote) {
 
   // If quote requires Permit2 signature, sign and append it (see 0x docs for exact EIP-712 payload).
   if (quote.permit2?.eip712) {
-    const signature = await signer.signTypedData(
-      quote.permit2.eip712.domain,
-      quote.permit2.eip712.types,
-      quote.permit2.eip712.message
-    );
+    const { domain, types, message } = quote.permit2.eip712;
+    const cleanTypes = { ...types };
+    delete cleanTypes.EIP712Domain; // ethers v6 derives this from `domain` itself
+    const signature = await signer.signTypedData(domain, cleanTypes, message);
     // Append signature length + signature to calldata per 0x spec
     const sigLengthHex = ethers.zeroPadValue(ethers.toBeHex(ethers.dataLength(signature)), 32);
     tx.data = ethers.concat([tx.data, sigLengthHex, signature]);
