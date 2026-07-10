@@ -51,7 +51,8 @@ export async function getBridgeQuote({ direction, amountEth, fromAddress, toAddr
     tool: data.toolDetails?.name || data.tool,
     estimatedDurationSeconds: data.estimate?.executionDuration ?? null,
     toAmountFormatted: ethers.formatEther(data.estimate?.toAmount ?? '0'),
-    feesEth: (data.estimate?.feeCosts || []).reduce((sum, f) => sum + Number(f.amountUSD || 0), 0),
+    // NOTE: these are USD-denominated fee costs from LI.FI, not ETH.
+    feesUsd: (data.estimate?.feeCosts || []).reduce((sum, f) => sum + Number(f.amountUSD || 0), 0),
     transactionRequest: data.transactionRequest,
   };
 }
