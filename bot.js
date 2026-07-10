@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import { ethers } from 'ethers';
-import { getQuote, getSwapTx } from './swap.js';
+import { getQuote, buildSwapTx, sendSwapWithGasBump } from './swap.js';
 import { ensureAllowance, getDecimals } from './erc20.js';
 import { createWallet, importWallet, shortAddr } from './wallet.js';
 import { getEthUsdPrice, getTokenMarketData, fmtUsd } from './price.js';
@@ -252,14 +252,11 @@ async function executeBuy(ctx, uid, tokenAddress, ethAmount) {
     const signer = new ethers.Wallet(w.privateKey, provider);
     quote = await getFreshQuote(quoteParams, quote, fetchedAt);
 
-    const txResponse = await getSwapTx(signer, quote);
+    const txRequest = await buildSwapTx(signer, quote);
+    const { txResponse, receipt, bumped } = await sendSwapWithGasBump(signer, txRequest);
     markPendingTradeSubmitted(pendingTradeId, txResponse.hash);
     const txLink = explorerTxUrl(txResponse.hash);
-    await ctx.reply(
-      txLink ? `Tx sent: [view on explorer](${txLink})\nWaiting for confirmation...` : `Tx sent: ${txResponse.hash}\nWaiting for confirmation...`,
-      { parse_mode: 'Markdown' }
-    );
-    const receipt = await txResponse.wait();
+    if (bumped) await ctx.reply('⛽ Network was congested — resubmitted with higher gas.');
     markPendingTradeDone(pendingTradeId, 'confirmed');
     recordTrade(uid, w.id, tokenAddress, 'buy', Number(quote.buyAmountFormatted), ethAmount);
     await ctx.reply(
@@ -312,14 +309,11 @@ async function executeSell(ctx, uid, tokenAddress, pct) {
     // Approval above can take a while to confirm — re-quote if price may have moved since.
     quote = await getFreshQuote(quoteParams, quote, fetchedAt);
 
-    const txResponse = await getSwapTx(signer, quote);
+    const txRequest = await buildSwapTx(signer, quote);
+    const { txResponse, receipt, bumped } = await sendSwapWithGasBump(signer, txRequest);
     markPendingTradeSubmitted(pendingTradeId, txResponse.hash);
     const txLink = explorerTxUrl(txResponse.hash);
-    await ctx.reply(
-      txLink ? `Tx sent: [view on explorer](${txLink})\nWaiting for confirmation...` : `Tx sent: ${txResponse.hash}\nWaiting for confirmation...`,
-      { parse_mode: 'Markdown' }
-    );
-    const receipt = await txResponse.wait();
+    if (bumped) await ctx.reply('⛽ Network was congested — resubmitted with higher gas.');
     markPendingTradeDone(pendingTradeId, 'confirmed');
     recordTrade(uid, w.id, tokenAddress, 'sell', tokenAmount, Number(quote.buyAmountFormatted));
     await ctx.reply(
@@ -457,14 +451,18 @@ bot.action(/^wallet_remove_(.+)$/, async (ctx) => {
   await ctx.editMessageText('💼 *Your Wallets*', { parse_mode: 'Markdown', ...walletsMenu(ctx.from.id) });
 });
 
+// Extra friction on top of the button tap: the user must type the wallet's
+// exact name before the key is shown. A compromised/left-open Telegram
+// session can tap a button by accident; typing the name is much less likely
+// to happen without the account owner actually meaning it.
 bot.action(/^wallet_export_confirm_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const w = getWallet(ctx.from.id, ctx.match[1]);
   if (!w) return ctx.editMessageText('Wallet not found.', walletsMenu(ctx.from.id));
+  pending.set(ctx.from.id, { type: 'export_type_confirm', walletId: w.id, walletName: w.name });
   await ctx.editMessageText(
-    `🔑 *${w.name}* private key:\n\`${w.privateKey}\`\n\n` +
-    'Save this somewhere safe, then delete this message. Anyone with this key can drain the wallet.',
-    { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_wallets')]]) }
+    `⚠️ Type the wallet's name exactly (*${w.name}*) to confirm you want to reveal its private key:`,
+    { parse_mode: 'Markdown' }
   );
 });
 
@@ -743,6 +741,22 @@ bot.on('text', async (ctx) => {
       return;
     }
 
+    if (state.type === 'export_type_confirm') {
+      pending.delete(uid);
+      if (text !== state.walletName) {
+        await ctx.reply('❌ Name didn\'t match — export cancelled.', mainMenu());
+        return;
+      }
+      const w = getWallet(uid, state.walletId);
+      if (!w) return ctx.reply('Wallet not found.', walletsMenu(uid));
+      await ctx.reply(
+        `🔑 *${w.name}* private key:\n\`${w.privateKey}\`\n\n` +
+        'Save this somewhere safe, then delete this message. Anyone with this key can drain the wallet.',
+        { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_wallets')]]) }
+      );
+      return;
+    }
+
     if (state.type === 'rename') {
       renameWallet(uid, state.walletId, text);
       pending.delete(uid);
@@ -838,7 +852,27 @@ async function checkStuckTrades() {
   console.warn(`${stuck.length} pending trade(s) unresolved from before restart. See admin alert / pending_trades table.`);
 }
 
-bot.launch().then(checkStuckTrades);
+// Surface crashes to the admin instead of the process dying with no record anywhere.
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err);
+  sendAdminAlert(bot.telegram, `🚨 Unhandled rejection: ${err?.message || err}`).catch(() => {});
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+  sendAdminAlert(bot.telegram, `🚨 Uncaught exception (process will exit): ${err.message}`)
+    .catch(() => {})
+    .finally(() => process.exit(1)); // an uncaught exception means state may be inconsistent — let pm2/systemd restart clean
+});
+
+bot.launch()
+  .then(checkStuckTrades)
+  .then(() => sendAdminAlert(bot.telegram, '✅ Bot started.'))
+  .catch((err) => {
+    console.error('Failed to launch bot:', err);
+    process.exit(1);
+  });
+
 console.log('Panchi trading bot running.');
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
