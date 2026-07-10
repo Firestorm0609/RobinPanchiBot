@@ -80,3 +80,37 @@ export function getWallet(uid, walletId) {
   const user = getUser(uid);
   return user.wallets.find((w) => w.id === walletId) || null;
 }
+
+// ---------- Positions / PnL ----------
+// Simple running-average cost basis per (wallet, token).
+
+export function recordTrade(uid, walletId, tokenAddress, side, tokenAmount, ethAmount) {
+  const db = readDb();
+  const user = db.users[uid];
+  if (!user) return;
+  if (!user.positions) user.positions = {};
+  const key = `${walletId}_${tokenAddress.toLowerCase()}`;
+  const pos = user.positions[key] || { walletId, tokenAddress, tokenAmount: 0, costEth: 0 };
+
+  if (side === 'buy') {
+    pos.tokenAmount += tokenAmount;
+    pos.costEth += ethAmount;
+  } else {
+    // sell: reduce holdings and cost basis proportionally
+    const fraction = pos.tokenAmount > 0 ? Math.min(tokenAmount / pos.tokenAmount, 1) : 0;
+    pos.costEth -= pos.costEth * fraction;
+    pos.tokenAmount = Math.max(pos.tokenAmount - tokenAmount, 0);
+  }
+
+  user.positions[key] = pos;
+  db.users[uid] = user;
+  writeDb(db);
+}
+
+export function getPosition(uid, walletId, tokenAddress) {
+  const db = readDb();
+  const user = db.users[uid];
+  if (!user?.positions) return null;
+  const key = `${walletId}_${tokenAddress.toLowerCase()}`;
+  return user.positions[key] || null;
+}
