@@ -2,7 +2,7 @@ import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import { ethers } from 'ethers';
 import { getQuote, getSwapTx } from './swap.js';
-import { ensureAllowance } from './erc20.js';
+import { ensureAllowance, getDecimals } from './erc20.js';
 import { createWallet, importWallet, shortAddr } from './wallet.js';
 import { getEthUsdPrice, getTokenMarketData, fmtUsd } from './price.js';
 import {
@@ -24,6 +24,7 @@ const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL, Number(process.env.CHAIN_ID));
 
 const pending = new Map(); // uid -> { type, ...context }
+const tradesInFlight = new Set(); // uid -> locked while a trade is executing (double-tap guard)
 const CA_REGEX = /^0x[a-fA-F0-9]{40}$/;
 
 // ---------- Formatting ----------
@@ -85,6 +86,7 @@ function settingsMenu(uid) {
     [Markup.button.callback(`Buy presets: ${s.buyPresetsEth.join(', ')} ETH`, 'settings_buy')],
     [Markup.button.callback(`Sell presets: ${s.sellPresetsPct.join(', ')}%`, 'settings_sell')],
     [Markup.button.callback(`Slippage: ${(s.slippageBps / 100).toFixed(2)}%`, 'settings_slippage')],
+    [Markup.button.callback(`Max buy size: ${s.maxBuyEth} ETH`, 'settings_maxbuy')],
     [Markup.button.callback(`Confirm before trade: ${s.confirmTrades ? 'ON ✅' : 'OFF ❌'}`, 'settings_toggle_confirm')],
     [Markup.button.callback('⬅️ Back', 'menu_main')],
   ]);
@@ -157,6 +159,17 @@ async function renderTokenCard(uid, tokenAddress) {
 async function executeBuy(ctx, uid, tokenAddress, ethAmount) {
   const w = getActiveWallet(uid);
   if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
+
+  const { maxBuyEth } = getSettings(uid);
+  if (ethAmount > maxBuyEth) {
+    return ctx.reply(`❌ ${ethAmount} ETH exceeds your max buy size (${maxBuyEth} ETH). Adjust it in Settings if this was intentional.`, mainMenu());
+  }
+
+  if (tradesInFlight.has(uid)) {
+    return ctx.reply('⏳ A trade is already in progress — please wait for it to finish.');
+  }
+  tradesInFlight.add(uid);
+
   try {
     await ctx.reply(`Buying ${ethAmount} ETH worth... fetching quote.`);
     const sellAmount = ethers.parseEther(ethAmount.toString()).toString();
@@ -173,6 +186,8 @@ async function executeBuy(ctx, uid, tokenAddress, ethAmount) {
   } catch (err) {
     console.error(err);
     await ctx.reply(`❌ Trade failed: ${err.message}`, mainMenu());
+  } finally {
+    tradesInFlight.delete(uid);
   }
 }
 
@@ -181,10 +196,20 @@ async function executeSell(ctx, uid, tokenAddress, pct) {
   if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
   const pos = getPosition(uid, w.id, tokenAddress);
   if (!pos || pos.tokenAmount <= 0) return ctx.reply('No position to sell.', mainMenu());
+
+  if (tradesInFlight.has(uid)) {
+    return ctx.reply('⏳ A trade is already in progress — please wait for it to finish.');
+  }
+  tradesInFlight.add(uid);
+
   const tokenAmount = pos.tokenAmount * (pct / 100);
   try {
     await ctx.reply(`Selling ${pct}%... fetching quote.`);
-    const sellAmount = ethers.parseUnits(tokenAmount.toFixed(18), 18).toString(); // adjust decimals per token if needed
+
+    // Fetch the token's real decimals — do not assume 18, many tokens differ.
+    const decimals = await getDecimals(provider, tokenAddress).catch(() => 18);
+    const sellAmount = ethers.parseUnits(tokenAmount.toFixed(Math.min(decimals, 18)), decimals).toString();
+
     const { slippageBps } = getSettings(uid);
     const signer = new ethers.Wallet(w.privateKey, provider);
 
@@ -202,6 +227,8 @@ async function executeSell(ctx, uid, tokenAddress, pct) {
   } catch (err) {
     console.error(err);
     await ctx.reply(`❌ Trade failed: ${err.message}`, mainMenu());
+  } finally {
+    tradesInFlight.delete(uid);
   }
 }
 
@@ -351,6 +378,12 @@ bot.action('settings_slippage', async (ctx) => {
   await ctx.editMessageText('Send slippage tolerance as a percentage, e.g. `1` for 1%', { parse_mode: 'Markdown' });
 });
 
+bot.action('settings_maxbuy', async (ctx) => {
+  await ctx.answerCbQuery();
+  pending.set(ctx.from.id, { type: 'settings_maxbuy' });
+  await ctx.editMessageText('Send the max ETH allowed per single buy, e.g. `0.5`', { parse_mode: 'Markdown' });
+});
+
 bot.action('settings_toggle_confirm', async (ctx) => {
   const s = getSettings(ctx.from.id);
   updateSettings(ctx.from.id, { confirmTrades: !s.confirmTrades });
@@ -401,14 +434,18 @@ bot.action(/^buy_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const [, tokenAddress, ethAmountStr] = ctx.match;
   const uid = ctx.from.id;
-  const { confirmTrades } = getSettings(uid);
+  const { confirmTrades, maxBuyEth } = getSettings(uid);
+  const ethAmount = Number(ethAmountStr);
+  if (ethAmount > maxBuyEth) {
+    return ctx.editMessageText(`❌ ${ethAmount} ETH exceeds your max buy size (${maxBuyEth} ETH).`, mainMenu());
+  }
   if (confirmTrades) {
     await ctx.editMessageText(`Confirm: buy *${ethAmountStr} ETH* worth of this token?`, {
       parse_mode: 'Markdown',
       ...confirmMenu('buy', tokenAddress, ethAmountStr),
     });
   } else {
-    await executeBuy(ctx, uid, tokenAddress, Number(ethAmountStr));
+    await executeBuy(ctx, uid, tokenAddress, ethAmount);
   }
 });
 
@@ -527,10 +564,28 @@ bot.on('text', async (ctx) => {
       return;
     }
 
+    if (state.type === 'settings_maxbuy') {
+      const amt = parseFloat(text);
+      if (isNaN(amt) || amt <= 0) return ctx.reply('Send a valid positive ETH amount, e.g. `0.5`');
+      updateSettings(uid, { maxBuyEth: amt });
+      pending.delete(uid);
+      await ctx.reply(`✅ Max buy size set to ${amt} ETH`, mainMenu());
+      return;
+    }
+
     if (state.type === 'custom_buy' || state.type === 'custom_sell') {
       const isBuy = state.type === 'custom_buy';
       const val = parseFloat(text);
       if (isNaN(val) || val <= 0 || (!isBuy && val > 100)) return ctx.reply('Send a valid positive number' + (isBuy ? '.' : ' (max 100 for %).'));
+
+      if (isBuy) {
+        const { maxBuyEth } = getSettings(uid);
+        if (val > maxBuyEth) {
+          pending.delete(uid);
+          return ctx.reply(`❌ ${val} ETH exceeds your max buy size (${maxBuyEth} ETH). Adjust it in Settings if this was intentional.`, mainMenu());
+        }
+      }
+
       pending.delete(uid);
 
       const { confirmTrades } = getSettings(uid);
