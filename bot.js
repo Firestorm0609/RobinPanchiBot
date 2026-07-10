@@ -1241,16 +1241,21 @@ bot.on('text', async (ctx) => {
         return ctx.reply(err.message, { parse_mode: 'Markdown' });
       }
 
+      // Round to 6 decimals: keeps callback_data short enough for Telegram's
+      // 64-byte limit (a raw USD/price division can produce 15+ decimal
+      // digits, which overflows it and causes BUTTON_DATA_INVALID).
+      val = Number(val.toFixed(6));
+
       const { maxBuyEth } = getSettings(uid);
       if (val > maxBuyEth) {
         pending.delete(uid);
-        return ctx.reply(`❌ ${val.toFixed(6)} ETH exceeds your max buy size (${maxBuyEth} ETH). Adjust it in Settings if this was intentional.`, mainMenu());
+        return ctx.reply(`❌ ${val} ETH exceeds your max buy size (${maxBuyEth} ETH). Adjust it in Settings if this was intentional.`, mainMenu());
       }
 
       pending.delete(uid);
 
       const { confirmTrades } = getSettings(uid);
-      const label = usdInput !== null ? `≈ ${val.toFixed(6)} ETH (${fmtUsd(usdInput)})` : `${val} ETH`;
+      const label = usdInput !== null ? `≈ ${val} ETH (${fmtUsd(usdInput)})` : `${val} ETH`;
       if (confirmTrades) {
         await ctx.reply(`Confirm: buy *${label}*?`, {
           parse_mode: 'Markdown',
@@ -1289,6 +1294,11 @@ bot.on('text', async (ctx) => {
       } catch (err) {
         return ctx.reply(err.message, { parse_mode: 'Markdown' });
       }
+
+      // Round to 6 decimals: keeps callback_data short enough for Telegram's
+      // 64-byte limit (a raw USD/price division can produce 15+ decimal
+      // digits, which overflows it and causes BUTTON_DATA_INVALID).
+      amt = Number(amt.toFixed(6));
 
       // Guard bridge amount against the configured cap, same as buy amounts —
       // previously this check only existed on the buy path, so a bridge could
