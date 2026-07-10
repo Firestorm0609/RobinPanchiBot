@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node bot.js",
     "migrate:encrypt-keys": "node migrate-encrypt-keys.js",
-    "migrate:sqlite": "node migrate-json-to-sqlite.js"
+    "migrate:sqlite": "node migrate-json-to-sqlite.js",
+    "setup:cron": "./setup-cron.sh",
+    "test": "node --test test/"
   },
   "dependencies": {
     "telegraf": "^4.16.3",
