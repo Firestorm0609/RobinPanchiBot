@@ -115,6 +115,13 @@ export function getPosition(uid, walletId, tokenAddress) {
   return user.positions[key] || null;
 }
 
+export function getAllPositions(uid, walletId) {
+  const db = readDb();
+  const user = db.users[uid];
+  if (!user?.positions) return [];
+  return Object.values(user.positions).filter((p) => p.walletId === walletId && p.tokenAmount > 0);
+}
+
 // ---------- Settings ----------
 
 const DEFAULT_SETTINGS = {
