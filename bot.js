@@ -48,7 +48,9 @@ const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL, Number(process.env.CHAIN_ID));
 
 let BOT_USERNAME = null;
-bot.telegram.getMe().then((me) => { BOT_USERNAME = me.username; });
+bot.telegram.getMe()
+  .then((me) => { BOT_USERNAME = me.username; })
+  .catch((err) => console.error('Failed to fetch bot username:', err.message));
 
 const pending = new Map(); // uid -> { type, ...context }
 const tradesInFlight = new Set(); // uid -> locked while a trade is executing (double-tap guard)
