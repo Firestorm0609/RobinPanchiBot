@@ -6,13 +6,14 @@ const ZEROX_BASE_URL = 'https://api.0x.org/swap/permit2/quote';
 /**
  * Fetch a firm swap quote from 0x, including your affiliate fee.
  */
-export async function getQuote({ sellToken, buyToken, sellAmount, taker }) {
+export async function getQuote({ sellToken, buyToken, sellAmount, taker, slippageBps = 100 }) {
   const params = {
     chainId: process.env.CHAIN_ID,
     sellToken,
     buyToken,
     sellAmount,
     taker,
+    slippageBps,
     swapFeeRecipient: process.env.AFFILIATE_ADDRESS,
     swapFeeBps: process.env.AFFILIATE_FEE_BPS,
     swapFeeToken: buyToken,
