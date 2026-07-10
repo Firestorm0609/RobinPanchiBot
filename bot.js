@@ -24,7 +24,20 @@ import {
   markPendingTradeSubmitted,
   markPendingTradeDone,
   getStuckPendingTrades,
+  getStats,
+  hasAgreedTerms,
+  setAgreedTerms,
 } from './storage.js';
+
+const TERMS_TEXT =
+  '⚠️ *Before you trade*\n\n' +
+  'This bot lets you swap tokens — including low-cap memecoins — directly with your own funds. ' +
+  'By using it you accept that:\n\n' +
+  '• Memecoins carry high rug-pull and total-loss risk\n' +
+  '• Trades are final once confirmed on-chain\n' +
+  '• You are solely responsible for funds in wallets you create or import here\n' +
+  '• This is not financial advice, and there are no guarantees of any kind\n\n' +
+  'Tap below to confirm you understand and wish to continue.';
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL, Number(process.env.CHAIN_ID));
@@ -88,8 +101,16 @@ function walletDetailMenu(walletId) {
   return Markup.inlineKeyboard([
     [Markup.button.callback('✅ Set Active', `wallet_activate_${walletId}`)],
     [Markup.button.callback('✏️ Rename', `wallet_rename_${walletId}`)],
+    [Markup.button.callback('🔑 Export Key', `wallet_export_${walletId}`)],
     [Markup.button.callback('🗑 Remove', `wallet_remove_${walletId}`)],
     [Markup.button.callback('⬅️ Back', 'menu_wallets')],
+  ]);
+}
+
+function exportConfirmMenu(walletId) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('⚠️ Yes, show my key', `wallet_export_confirm_${walletId}`)],
+    [Markup.button.callback('❌ Cancel', 'menu_wallets')],
   ]);
 }
 
@@ -281,10 +302,46 @@ function confirmMenu(kind, tokenAddress, value) {
 // ---------- Start / Main menu ----------
 
 bot.start((ctx) => {
+  if (!hasAgreedTerms(ctx.from.id)) {
+    return ctx.reply(TERMS_TEXT, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([[Markup.button.callback('✅ I understand, continue', 'agree_terms')]]),
+    });
+  }
   ctx.reply('🐒 *Panchi Trading Bot*\n\nPaste a token contract address to trade it.', {
     parse_mode: 'Markdown',
     ...mainMenu(),
   });
+});
+
+bot.action('agree_terms', async (ctx) => {
+  setAgreedTerms(ctx.from.id);
+  await ctx.answerCbQuery('Thanks — happy trading');
+  await ctx.editMessageText('🐒 *Panchi Trading Bot*\n\nPaste a token contract address to trade it.', {
+    parse_mode: 'Markdown',
+    ...mainMenu(),
+  });
+});
+
+// Admin-only: usage and volume snapshot
+bot.command('admin_stats', async (ctx) => {
+  if (String(ctx.from.id) !== String(process.env.ADMIN_CHAT_ID)) return; // silently ignore non-admins
+  const s = getStats();
+  const feeBps = Number(process.env.AFFILIATE_FEE_BPS || 0);
+  const estFeesEth = (s.totalVolumeEth * feeBps) / 10000;
+  await ctx.reply(
+    `📊 *Admin Stats*\n\n` +
+    `Users: ${s.totalUsers}\n` +
+    `Wallets: ${s.totalWallets}\n` +
+    `Open positions: ${s.openPositions}\n` +
+    `Total trades: ${s.totalTrades}\n` +
+    `Total volume: ${s.totalVolumeEth.toFixed(4)} ETH\n` +
+    `Est. fees earned: ${estFeesEth.toFixed(4)} ETH\n\n` +
+    `Last 24h:\n` +
+    `Active users: ${s.activeUsers24h}\n` +
+    `Volume: ${s.volume24hEth.toFixed(4)} ETH`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
 bot.action('menu_main', async (ctx) => {
@@ -340,7 +397,28 @@ bot.action(/^wallet_remove_(.+)$/, async (ctx) => {
   await ctx.editMessageText('💼 *Your Wallets*', { parse_mode: 'Markdown', ...walletsMenu(ctx.from.id) });
 });
 
-bot.action(/^wallet_(?!create|import|activate|rename|remove)(.+)$/, async (ctx) => {
+bot.action(/^wallet_export_confirm_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const w = getWallet(ctx.from.id, ctx.match[1]);
+  if (!w) return ctx.editMessageText('Wallet not found.', walletsMenu(ctx.from.id));
+  await ctx.editMessageText(
+    `🔑 *${w.name}* private key:\n\`${w.privateKey}\`\n\n` +
+    'Save this somewhere safe, then delete this message. Anyone with this key can drain the wallet.',
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_wallets')]]) }
+  );
+});
+
+bot.action(/^wallet_export_(?!confirm)(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const w = getWallet(ctx.from.id, ctx.match[1]);
+  if (!w) return ctx.editMessageText('Wallet not found.', walletsMenu(ctx.from.id));
+  await ctx.editMessageText(
+    `⚠️ This will display the raw private key for *${w.name}* in this chat.\n\nAnyone who sees it can take everything in this wallet. Continue?`,
+    { parse_mode: 'Markdown', ...exportConfirmMenu(w.id) }
+  );
+});
+
+bot.action(/^wallet_(?!create|import|activate|rename|remove|export)(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const w = getWallet(ctx.from.id, ctx.match[1]);
   if (!w) return ctx.editMessageText('Wallet not found.', walletsMenu(ctx.from.id));
@@ -531,6 +609,12 @@ bot.on('text', async (ctx) => {
 
   // CA paste is allowed any time, not just when explicitly prompted
   if (CA_REGEX.test(text)) {
+    if (!hasAgreedTerms(uid)) {
+      return ctx.reply(TERMS_TEXT, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([[Markup.button.callback('✅ I understand, continue', 'agree_terms')]]),
+      });
+    }
     if (isRateLimited(uid)) return ctx.reply('⏳ Slow down a bit — too many lookups in the last minute.');
     pending.delete(uid);
     const { text: cardText, markup } = await renderTokenCard(uid, text);
