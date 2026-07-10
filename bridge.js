@@ -79,7 +79,7 @@ export async function getBridgeQuote({ direction, amountEth, fromAddress, toAddr
 
 /**
  * Sends the bridge transaction on the source chain. Does not wait for the
- * destination-side delivery — call pollBridgeStatus for that.
+ * destination-side delivery — call checkBridgeStatusOnce / the bot.js poller for that.
  *
  * Same stuck-tx protection as swap.js's sendSwapWithGasBump: if the tx isn't
  * mined within `timeoutMs`, resubmits the SAME nonce with fees bumped by
@@ -121,41 +121,7 @@ export async function sendBridgeTx(signer, quote, { timeoutMs = 45_000, bumpPct 
   throw new Error('sendBridgeTx: exhausted attempts'); // unreachable
 }
 
-/**
- * Polls LI.FI's status endpoint for a bridge transaction until it's DONE or
- * FAILED, or until maxWaitMs elapses (caller should keep the pending_bridges
- * row and let the background poller in bot.js pick it back up later if so).
- *
- * Returns { status: 'DONE' | 'FAILED' | 'PENDING', destTxHash, raw }
- */
-export async function pollBridgeStatus({ txHash, fromChain, toChain, bridgeTool }, { maxWaitMs = 120_000, intervalMs = 5_000 } = {}) {
-  const deadline = Date.now() + maxWaitMs;
-
-  while (Date.now() < deadline) {
-    const res = await axios.get(`${LIFI_BASE_URL}/status`, {
-      params: { txHash, fromChain, toChain, bridge: bridgeTool },
-    }).catch((err) => {
-      console.error('LI.FI status error:', err.response?.data ?? err.message);
-      return null;
-    });
-
-    if (res?.data) {
-      const { status, receiving } = res.data;
-      if (status === 'DONE') {
-        return { status: 'DONE', destTxHash: receiving?.txHash ?? null, raw: res.data };
-      }
-      if (status === 'FAILED') {
-        return { status: 'FAILED', destTxHash: null, raw: res.data };
-      }
-    }
-
-    await new Promise((r) => setTimeout(r, intervalMs));
-  }
-
-  return { status: 'PENDING', destTxHash: null, raw: null };
-}
-
-/** One-shot status check (no waiting) — used by the periodic background poller. */
+/** One-shot status check (no waiting) — used by the periodic background poller in bot.js. */
 export async function checkBridgeStatusOnce({ txHash, fromChain, toChain, bridgeTool }) {
   const res = await axios.get(`${LIFI_BASE_URL}/status`, {
     params: { txHash, fromChain, toChain, bridge: bridgeTool },
