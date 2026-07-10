@@ -44,8 +44,18 @@ CREATE TABLE IF NOT EXISTS pending_trades (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS trade_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  uid TEXT NOT NULL,
+  wallet_id TEXT NOT NULL,
+  token_address TEXT NOT NULL,
+  side TEXT NOT NULL,
+  eth_amount REAL NOT NULL,
+  created_at INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_wallets_uid ON wallets(uid);
 CREATE INDEX IF NOT EXISTS idx_positions_uid_wallet ON positions(uid, wallet_id);
+CREATE INDEX IF NOT EXISTS idx_trade_log_created ON trade_log(created_at);
 `);
 
 const DEFAULT_SETTINGS = {
@@ -155,6 +165,12 @@ export function recordTrade(uid, walletId, tokenAddress, side, tokenAmount, ethA
     VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(uid, wallet_id, token_address) DO UPDATE SET token_amount = excluded.token_amount, cost_eth = excluded.cost_eth
   `).run(uid, walletId, key, pos.token_amount, pos.cost_eth);
+
+  // ethAmount is always the ETH-side value of the trade (spent on buy, received on sell)
+  db.prepare(`
+    INSERT INTO trade_log (uid, wallet_id, token_address, side, eth_amount, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(uid, walletId, key, side, ethAmount, Date.now());
 }
 
 export function getPosition(uid, walletId, tokenAddress) {
@@ -225,4 +241,28 @@ export function markPendingTradeDone(id, status) {
 /** Trades left in 'pending' or 'submitted' from before the last restart. */
 export function getStuckPendingTrades() {
   return db.prepare(`SELECT * FROM pending_trades WHERE status IN ('pending', 'submitted') ORDER BY created_at ASC`).all();
+}
+
+// ---------- Admin stats ----------
+
+export function getStats() {
+  const totalUsers = db.prepare('SELECT COUNT(*) c FROM users').get().c;
+  const totalWallets = db.prepare('SELECT COUNT(*) c FROM wallets').get().c;
+  const totalTrades = db.prepare('SELECT COUNT(*) c FROM trade_log').get().c;
+  const totalVolumeEth = db.prepare('SELECT COALESCE(SUM(eth_amount), 0) v FROM trade_log').get().v;
+  const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+  const activeUsers24h = db.prepare('SELECT COUNT(DISTINCT uid) c FROM trade_log WHERE created_at > ?').get(dayAgo).c;
+  const volume24hEth = db.prepare('SELECT COALESCE(SUM(eth_amount), 0) v FROM trade_log WHERE created_at > ?').get(dayAgo).v;
+  const openPositions = db.prepare('SELECT COUNT(*) c FROM positions WHERE token_amount > 0').get().c;
+  return { totalUsers, totalWallets, totalTrades, totalVolumeEth, activeUsers24h, volume24hEth, openPositions };
+}
+
+// ---------- Terms of use ----------
+
+export function hasAgreedTerms(uid) {
+  return !!getSettings(uid).agreedTerms;
+}
+
+export function setAgreedTerms(uid) {
+  updateSettings(uid, { agreedTerms: true });
 }
