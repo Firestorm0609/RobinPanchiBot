@@ -74,12 +74,19 @@ async function getFreshQuote(quoteParams, quote, fetchedAt) {
 
 // ---------- Menus ----------
 
+const WELCOME_TEXT =
+  '🌴 *RobinPanchi Trading Bot*\n' +
+  'The first NFT trading bot on Robinhood 🍃\n\n' +
+  'Paste a token contract address to trade it.';
+
 function mainMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('🔍 Trade Token', 'menu_trade')],
     [Markup.button.callback('📊 Positions', 'menu_positions')],
     [Markup.button.callback('💼 Wallets', 'menu_wallets'), Markup.button.callback('💰 Balance', 'menu_balance')],
     [Markup.button.callback('⚙️ Settings', 'menu_settings')],
+    [Markup.button.url('🐦 X', 'https://x.com/robinpanchi'), Markup.button.url('🖼 OpenSea', 'https://opensea.io/collection/robinpanchi')],
+    [Markup.button.url('✉️ Support', 'mailto:panchi.eth@gmail.com')],
   ]);
 }
 
@@ -308,7 +315,7 @@ bot.start((ctx) => {
       ...Markup.inlineKeyboard([[Markup.button.callback('✅ I understand, continue', 'agree_terms')]]),
     });
   }
-  ctx.reply('🐒 *Panchi Trading Bot*\n\nPaste a token contract address to trade it.', {
+  ctx.reply(WELCOME_TEXT, {
     parse_mode: 'Markdown',
     ...mainMenu(),
   });
@@ -317,7 +324,7 @@ bot.start((ctx) => {
 bot.action('agree_terms', async (ctx) => {
   setAgreedTerms(ctx.from.id);
   await ctx.answerCbQuery('Thanks — happy trading');
-  await ctx.editMessageText('🐒 *Panchi Trading Bot*\n\nPaste a token contract address to trade it.', {
+  await ctx.editMessageText(WELCOME_TEXT, {
     parse_mode: 'Markdown',
     ...mainMenu(),
   });
@@ -346,7 +353,7 @@ bot.command('admin_stats', async (ctx) => {
 
 bot.action('menu_main', async (ctx) => {
   await ctx.answerCbQuery();
-  await ctx.editMessageText('🐒 *Panchi Trading Bot*', { parse_mode: 'Markdown', ...mainMenu() });
+  await ctx.editMessageText('🌴 *RobinPanchi Trading Bot*', { parse_mode: 'Markdown', ...mainMenu() });
 });
 
 bot.action('menu_trade', async (ctx) => {
