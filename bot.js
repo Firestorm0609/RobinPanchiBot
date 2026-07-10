@@ -210,6 +210,41 @@ function fmtBridgeBalanceLine(label, amount, ethUsd) {
   return `${label}: ${amount.toFixed(4)}${usdLine}`;
 }
 
+/**
+ * Translates a raw ethers/RPC/LI.FI error into a short, user-facing message.
+ * Raw errors (especially from ethers v6) can be enormous JSON blobs — this
+ * keeps DMs clean instead of dumping that at the user.
+ */
+function friendlyErrorMessage(err) {
+  const code = err?.code;
+  const raw = `${err?.message || ''} ${err?.shortMessage || ''} ${err?.reason || ''}`.toLowerCase();
+
+  if (code === 'INSUFFICIENT_FUNDS' || raw.includes('insufficient funds')) {
+    return 'Insufficient balance to cover this trade plus gas. Add more ETH to your wallet and try again.';
+  }
+  if (raw.includes('gas required exceeds allowance') || raw.includes('out of gas') || raw.includes('intrinsic gas too low')) {
+    return 'Not enough ETH to cover network gas fees. Add a bit more ETH and try again.';
+  }
+  if (code === 'ACTION_REJECTED' || raw.includes('user rejected')) {
+    return 'Transaction was rejected.';
+  }
+  if (code === 'TIMEOUT' || raw.includes('timeout')) {
+    return 'The network was too slow to confirm this in time. It may still land — check 🕘 Recent Bridges or your position, or try again in a moment.';
+  }
+  if (raw.includes('slippage') || raw.includes('price impact')) {
+    return 'Price moved too much before this could confirm (slippage). Try again, or raise your slippage tolerance in Settings.';
+  }
+  if (raw.includes('nonce')) {
+    return 'A transaction is already pending for this wallet. Wait a moment and try again.';
+  }
+  if (code === 'CALL_EXCEPTION' || raw.includes('execution reverted')) {
+    return 'The transaction was rejected by the network. This can happen with low-liquidity tokens or expired quotes — try again.';
+  }
+  // Fallback: keep it short even for unrecognized errors, no raw payloads.
+  const short = (err?.shortMessage || err?.message || 'Unknown error').slice(0, 140);
+  return short;
+}
+
 /** Re-fetches the quote if too much time has passed since it was first obtained. */
 async function getFreshQuote(quoteParams, quote, fetchedAt) {
   if (Date.now() - fetchedAt < QUOTE_STALE_MS) return quote;
@@ -448,7 +483,7 @@ async function executeBuy(ctx, uid, tokenAddress, ethAmount) {
   } catch (err) {
     console.error(err);
     if (pendingTradeId) markPendingTradeDone(pendingTradeId, 'failed');
-    await ctx.reply(`❌ Trade failed: ${err.message}`, mainMenu());
+    await ctx.reply(`❌ Trade failed: ${friendlyErrorMessage(err)}`, mainMenu());
     await sendAdminAlert(ctx.telegram, `Buy failed for user ${uid} on ${tokenAddress}: ${err.message}`);
   } finally {
     tradesInFlight.delete(uid);
@@ -505,7 +540,7 @@ async function executeSell(ctx, uid, tokenAddress, pct) {
   } catch (err) {
     console.error(err);
     if (pendingTradeId) markPendingTradeDone(pendingTradeId, 'failed');
-    await ctx.reply(`❌ Trade failed: ${err.message}`, mainMenu());
+    await ctx.reply(`❌ Trade failed: ${friendlyErrorMessage(err)}`, mainMenu());
     await sendAdminAlert(ctx.telegram, `Sell failed for user ${uid} on ${tokenAddress}: ${err.message}`);
   } finally {
     tradesInFlight.delete(uid);
@@ -570,7 +605,7 @@ async function executeBridge(ctx, uid, direction, amountEth) {
   } catch (err) {
     console.error(err);
     if (pendingBridgeId) markPendingBridgeDone(pendingBridgeId, 'failed');
-    await ctx.reply(`❌ Bridge failed: ${err.message}`, mainMenu());
+    await ctx.reply(`❌ Bridge failed: ${friendlyErrorMessage(err)}`, mainMenu());
     await sendAdminAlert(ctx.telegram, `Bridge failed for user ${uid} (${direction}, ${amountEth} ETH): ${err.message}`);
   } finally {
     bridgesInFlight.delete(uid);
@@ -640,6 +675,50 @@ bot.command('admin_stats', async (ctx) => {
     `Volume: ${s.volume24hEth.toFixed(4)} ETH`,
     { parse_mode: 'Markdown' }
   );
+});
+
+// Admin-only: inspect bridges stuck in pending/submitted and force an
+// immediate LI.FI status recheck on each. Exists because the background
+// poller fails silently into console.error — this surfaces the same check
+// with its actual result/error visible in Telegram, and updates storage +
+// admin stats if it turns out to have actually completed.
+bot.command('admin_bridges', async (ctx) => {
+  if (String(ctx.from.id) !== String(process.env.ADMIN_CHAT_ID)) return; // silently ignore non-admins
+
+  const stuck = getInFlightBridges();
+  if (stuck.length === 0) {
+    await ctx.reply('No bridges currently pending/submitted.');
+    return;
+  }
+
+  await ctx.reply(`Checking ${stuck.length} in-flight bridge(s)...`);
+
+  for (const b of stuck) {
+    const header = `*${b.id}* — ${directionLabel(b.direction)} — ${b.amount_eth} ETH (user ${b.uid})`;
+    if (!b.source_tx_hash) {
+      await ctx.reply(`${header}\nStatus: no source tx hash recorded — cannot recheck, needs manual verification.`, { parse_mode: 'Markdown' });
+      continue;
+    }
+    try {
+      const result = await checkBridgeStatusOnce({
+        txHash: b.source_tx_hash,
+        fromChain: b.from_chain,
+        toChain: b.to_chain,
+        bridgeTool: b.bridge_tool,
+      });
+      if (result.status === 'DONE') {
+        markPendingBridgeDone(b.id, 'done', result.destTxHash);
+        await ctx.reply(`${header}\n✅ LI.FI reports DONE — marked as completed.`, { parse_mode: 'Markdown' });
+      } else if (result.status === 'FAILED') {
+        markPendingBridgeDone(b.id, 'failed', null);
+        await ctx.reply(`${header}\n❌ LI.FI reports FAILED — marked as failed.`, { parse_mode: 'Markdown' });
+      } else {
+        await ctx.reply(`${header}\n⏳ LI.FI still reports PENDING. Source tx: \`${b.source_tx_hash}\``, { parse_mode: 'Markdown' });
+      }
+    } catch (err) {
+      await ctx.reply(`${header}\n⚠️ Status check errored: ${friendlyErrorMessage(err)}\nSource tx: \`${b.source_tx_hash}\``, { parse_mode: 'Markdown' });
+    }
+  }
 });
 
 bot.action('menu_main', async (ctx) => {
@@ -1203,7 +1282,7 @@ bot.on('text', async (ctx) => {
         if (!w) return ctx.reply('No active wallet. Add one first.', walletsMenu(uid));
         quote = await getBridgeQuote({ direction: state.direction, amountEth: amt, fromAddress: w.address });
       } catch (err) {
-        return ctx.reply(`❌ Couldn't get a bridge quote: ${err.message}`, mainMenu());
+        return ctx.reply(`❌ Couldn't get a bridge quote: ${friendlyErrorMessage(err)}`, mainMenu());
       }
 
       const sendLine = usdInput !== null
@@ -1225,7 +1304,7 @@ bot.on('text', async (ctx) => {
   } catch (err) {
     console.error(err);
     pending.delete(uid);
-    await ctx.reply(`❌ Error: ${err.message}`, mainMenu());
+    await ctx.reply(`❌ Error: ${friendlyErrorMessage(err)}`, mainMenu());
   }
 });
 
