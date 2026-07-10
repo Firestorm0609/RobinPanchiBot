@@ -77,7 +77,8 @@ async function getFreshQuote(quoteParams, quote, fetchedAt) {
 const WELCOME_TEXT =
   '🌴 *RobinPanchi Trading Bot*\n' +
   'The first NFT trading bot on Robinhood 🍃\n\n' +
-  'Paste a token contract address to trade it.';
+  'Paste a token contract address to trade it.\n\n' +
+  '_Support: panchi.eth@gmail.com_';
 
 function mainMenu() {
   return Markup.inlineKeyboard([
@@ -86,7 +87,6 @@ function mainMenu() {
     [Markup.button.callback('💼 Wallets', 'menu_wallets'), Markup.button.callback('💰 Balance', 'menu_balance')],
     [Markup.button.callback('⚙️ Settings', 'menu_settings')],
     [Markup.button.url('🐦 X', 'https://x.com/robinpanchi'), Markup.button.url('🖼 OpenSea', 'https://opensea.io/collection/robinpanchi')],
-    [Markup.button.url('✉️ Support', 'mailto:panchi.eth@gmail.com')],
   ]);
 }
 
