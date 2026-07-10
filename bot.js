@@ -27,6 +27,11 @@ import {
   getStats,
   hasAgreedTerms,
   setAgreedTerms,
+  getOrCreateReferralCode,
+  findUidByReferralCode,
+  recordReferral,
+  getTicketCount,
+  hasBeenReferred,
 } from './storage.js';
 
 const TERMS_TEXT =
@@ -42,6 +47,9 @@ const TERMS_TEXT =
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL, Number(process.env.CHAIN_ID));
 
+let BOT_USERNAME = null;
+bot.telegram.getMe().then((me) => { BOT_USERNAME = me.username; });
+
 const pending = new Map(); // uid -> { type, ...context }
 const tradesInFlight = new Set(); // uid -> locked while a trade is executing (double-tap guard)
 const CA_REGEX = /^0x[a-fA-F0-9]{40}$/;
@@ -56,6 +64,10 @@ function fmtEth(n) {
 function explorerTxUrl(hash) {
   const base = (process.env.EXPLORER_BASE_URL || '').replace(/\/$/, '');
   return base ? `${base}/tx/${hash}` : null;
+}
+
+function referralLink(code) {
+  return `https://t.me/${BOT_USERNAME || 'your_bot'}?start=ref_${code}`;
 }
 
 async function balanceLines(address) {
@@ -90,6 +102,7 @@ function mainMenu() {
     [Markup.button.callback('🔍 Trade Token', 'menu_trade')],
     [Markup.button.callback('📊 Positions', 'menu_positions')],
     [Markup.button.callback('💼 Wallets', 'menu_wallets'), Markup.button.callback('💰 Balance', 'menu_balance')],
+    [Markup.button.callback('🎟 Rewards', 'menu_rewards')],
     [Markup.button.callback('⚙️ Settings', 'menu_settings')],
     [Markup.button.url('🐦 X', 'https://x.com/robinpanchi'), Markup.button.url('🖼 OpenSea', 'https://opensea.io/collection/robinpanchi')],
   ]);
@@ -134,6 +147,13 @@ function settingsMenu(uid) {
     [Markup.button.callback(`Slippage: ${(s.slippageBps / 100).toFixed(2)}%`, 'settings_slippage')],
     [Markup.button.callback(`Max buy size: ${s.maxBuyEth} ETH`, 'settings_maxbuy')],
     [Markup.button.callback(`Confirm before trade: ${s.confirmTrades ? 'ON ✅' : 'OFF ❌'}`, 'settings_toggle_confirm')],
+    [Markup.button.callback('⬅️ Back', 'menu_main')],
+  ]);
+}
+
+function rewardsMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('🔗 Get My Referral Link', 'rewards_link')],
     [Markup.button.callback('⬅️ Back', 'menu_main')],
   ]);
 }
@@ -327,8 +347,19 @@ function confirmMenu(kind, tokenAddress, value) {
 
 // ---------- Start / Main menu ----------
 
-bot.start((ctx) => {
-  if (!hasAgreedTerms(ctx.from.id)) {
+bot.start(async (ctx) => {
+  const uid = ctx.from.id;
+  const payload = ctx.startPayload; // telegraf parses "/start ref_XXXX" into this
+
+  // Attribute referral on a user's very first /start, before the terms gate,
+  // so it works even for people who never finish onboarding.
+  if (payload && payload.startsWith('ref_') && !hasBeenReferred(uid)) {
+    const code = payload.slice(4);
+    const referrerUid = findUidByReferralCode(code);
+    if (referrerUid) recordReferral(referrerUid, uid);
+  }
+
+  if (!hasAgreedTerms(uid)) {
     return ctx.reply(TERMS_TEXT, {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard([[Markup.button.callback('✅ I understand, continue', 'agree_terms')]]),
@@ -362,7 +393,8 @@ bot.command('admin_stats', async (ctx) => {
     `Open positions: ${s.openPositions}\n` +
     `Total trades: ${s.totalTrades}\n` +
     `Total volume: ${s.totalVolumeEth.toFixed(4)} ETH\n` +
-    `Est. fees earned: ${estFeesEth.toFixed(4)} ETH\n\n` +
+    `Est. fees earned: ${estFeesEth.toFixed(4)} ETH\n` +
+    `Total referrals: ${s.totalReferrals}\n\n` +
     `Last 24h:\n` +
     `Active users: ${s.activeUsers24h}\n` +
     `Volume: ${s.volume24hEth.toFixed(4)} ETH`,
@@ -530,6 +562,33 @@ bot.action('settings_toggle_confirm', async (ctx) => {
   updateSettings(ctx.from.id, { confirmTrades: !s.confirmTrades });
   await ctx.answerCbQuery(`Confirmation ${!s.confirmTrades ? 'enabled' : 'disabled'}`);
   await ctx.editMessageText('⚙️ *Settings*', { parse_mode: 'Markdown', ...settingsMenu(ctx.from.id) });
+});
+
+// ---------- Rewards ----------
+
+bot.action('menu_rewards', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  const tickets = getTicketCount(uid);
+  await ctx.editMessageText(
+    `🎟 *Rewards*\n\n` +
+    `Refer friends to earn raffle tickets for a chance to win a Panchi NFT.\n` +
+    `1 successful referral = 1 ticket. No limit.\n\n` +
+    `Your tickets: *${tickets}*`,
+    { parse_mode: 'Markdown', ...rewardsMenu() }
+  );
+});
+
+bot.action('rewards_link', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  const code = getOrCreateReferralCode(uid);
+  const link = referralLink(code);
+  await ctx.editMessageText(
+    `🔗 *Your referral link:*\n\`${link}\`\n\n` +
+    `Share it — when someone starts the bot through it, you get a raffle ticket.`,
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_rewards')]]) }
+  );
 });
 
 // ---------- Custom buy/sell prompts ----------
