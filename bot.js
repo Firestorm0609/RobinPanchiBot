@@ -429,7 +429,6 @@ async function executeBridge(ctx, uid, direction, amountEth) {
       uid, walletId: w.id, direction, amountEth, fromChain, toChain, bridgeTool: quote.tool,
     });
 
-    const signer = new ethers.Wallet(w.privateKey, provider === null ? null : provider, );
     // Bridges can originate on either chain — use a provider pointed at the source chain
     // for ETH_TO_ROBINHOOD; the configured RPC_URL provider is Robinhood Chain, so for
     // that direction we need a mainnet provider instead.
@@ -438,8 +437,10 @@ async function executeBridge(ctx, uid, direction, amountEth) {
       : provider;
     const sourceSigner = new ethers.Wallet(w.privateKey, sourceProvider);
 
-    const { txResponse } = await sendBridgeTx(sourceSigner, quote);
+    const { txResponse, bumped } = await sendBridgeTx(sourceSigner, quote);
     markPendingBridgeSubmitted(pendingBridgeId, txResponse.hash);
+
+    if (bumped) await ctx.reply('⛽ Network was congested — resubmitted with higher gas.');
 
     const txLink = explorerTxUrlForChain(txResponse.hash, fromChain);
     await ctx.reply(
