@@ -47,6 +47,43 @@ import {
   getBridgeHistory,
 } from './storage.js';
 
+// ---------- Startup env validation ----------
+// Fail fast and loudly instead of silently falling back to defaults that are
+// unsafe in production (e.g. a public RPC endpoint) or that quietly break a
+// feature (e.g. missing tx explorer links).
+const REQUIRED_ENV_VARS = [
+  'TELEGRAM_BOT_TOKEN',
+  'RPC_URL',
+  'CHAIN_ID',
+  'ZEROX_API_KEY',
+  'AFFILIATE_ADDRESS',
+  'AFFILIATE_FEE_BPS',
+  'MASTER_KEY',
+];
+// Required specifically for the bridge feature to be safe/complete in production.
+// Bridging still works without these (via fallback), but ETH_RPC_URL's fallback
+// (a public endpoint) is not reliable enough for real trading volume, and
+// without EXPLORER_BASE_URL users get no tx link for Robinhood-side transactions.
+const REQUIRED_FOR_BRIDGE = ['ETH_RPC_URL', 'EXPLORER_BASE_URL'];
+
+function validateEnv() {
+  const missing = REQUIRED_ENV_VARS.filter((k) => !process.env[k]);
+  if (missing.length > 0) {
+    console.error(`Missing required environment variable(s): ${missing.join(', ')}. See .env.example.`);
+    process.exit(1);
+  }
+  const missingBridge = REQUIRED_FOR_BRIDGE.filter((k) => !process.env[k]);
+  if (missingBridge.length > 0) {
+    console.warn(
+      `⚠️  Missing bridge-related env var(s): ${missingBridge.join(', ')}. ` +
+      `Bridging will still run but ETH_RPC_URL falls back to a public endpoint ` +
+      `(unreliable at volume) and/or Robinhood-side tx links will be omitted. ` +
+      `See .env.example.`
+    );
+  }
+}
+validateEnv();
+
 const TERMS_TEXT =
   '⚠️ *Before you trade*\n\n' +
   'This bot lets you swap tokens — including low-cap memecoins — directly with your own funds. ' +
@@ -1060,14 +1097,41 @@ async function checkStuckTrades() {
   console.warn(`${stuck.length} pending trade(s) unresolved from before restart. See admin alert / pending_trades table.`);
 }
 
+// Bridges left "pending"/"submitted" after a restart split into two buckets:
+// - resumable: has a source_tx_hash, so the poller can keep checking LI.FI's
+//   status for it automatically.
+// - needs manual review: no source_tx_hash, meaning the process crashed
+//   before we know whether the source-chain tx was ever sent. The poller
+//   cannot recover these on its own (there's nothing to poll), so they are
+//   called out separately and explicitly so they don't get mistaken for
+//   something that will resolve itself.
 async function checkStuckBridges() {
   const stuck = getInFlightBridges();
   if (stuck.length === 0) return;
-  await sendAdminAlert(
-    bot.telegram,
-    `Bot restarted with ${stuck.length} in-flight bridge(s) — the poller will resume tracking them automatically.`
-  );
-  console.warn(`${stuck.length} in-flight bridge(s) resuming after restart.`);
+
+  const resumable = stuck.filter((b) => b.source_tx_hash);
+  const needsManualReview = stuck.filter((b) => !b.source_tx_hash);
+
+  if (resumable.length > 0) {
+    await sendAdminAlert(
+      bot.telegram,
+      `Bot restarted with ${resumable.length} in-flight bridge(s) — the poller will resume tracking them automatically.`
+    );
+    console.warn(`${resumable.length} in-flight bridge(s) resuming after restart.`);
+  }
+
+  if (needsManualReview.length > 0) {
+    const lines = needsManualReview.map((b) =>
+      `• ${b.direction} — ${b.amount_eth} ETH (user ${b.uid}, id ${b.id}, status: ${b.status})`
+    );
+    await sendAdminAlert(
+      bot.telegram,
+      `⚠️ Bot restarted with ${needsManualReview.length} bridge(s) that have NO source tx hash — ` +
+      `unknown whether the source-chain transaction was ever sent. These CANNOT be auto-recovered ` +
+      `by the poller and need manual verification (check the user's wallet/chain explorer):\n${lines.join('\n')}`
+    );
+    console.warn(`${needsManualReview.length} bridge(s) with no source_tx_hash need manual review after restart.`);
+  }
 }
 
 // Periodically checks LI.FI status for every bridge still pending/submitted and
