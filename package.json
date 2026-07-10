@@ -4,12 +4,15 @@
   "type": "module",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js"
+    "start": "node bot.js",
+    "migrate:encrypt-keys": "node migrate-encrypt-keys.js",
+    "migrate:sqlite": "node migrate-json-to-sqlite.js"
   },
   "dependencies": {
     "telegraf": "^4.16.3",
     "ethers": "^6.13.0",
     "axios": "^1.7.2",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "better-sqlite3": "^11.3.0"
   }
 }
