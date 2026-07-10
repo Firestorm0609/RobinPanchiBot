@@ -53,9 +53,16 @@ CREATE TABLE IF NOT EXISTS trade_log (
   eth_amount REAL NOT NULL,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS referrals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  referrer_uid TEXT NOT NULL,
+  referred_uid TEXT NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_wallets_uid ON wallets(uid);
 CREATE INDEX IF NOT EXISTS idx_positions_uid_wallet ON positions(uid, wallet_id);
 CREATE INDEX IF NOT EXISTS idx_trade_log_created ON trade_log(created_at);
+CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_uid);
 `);
 
 const DEFAULT_SETTINGS = {
@@ -254,7 +261,8 @@ export function getStats() {
   const activeUsers24h = db.prepare('SELECT COUNT(DISTINCT uid) c FROM trade_log WHERE created_at > ?').get(dayAgo).c;
   const volume24hEth = db.prepare('SELECT COALESCE(SUM(eth_amount), 0) v FROM trade_log WHERE created_at > ?').get(dayAgo).v;
   const openPositions = db.prepare('SELECT COUNT(*) c FROM positions WHERE token_amount > 0').get().c;
-  return { totalUsers, totalWallets, totalTrades, totalVolumeEth, activeUsers24h, volume24hEth, openPositions };
+  const totalReferrals = db.prepare('SELECT COUNT(*) c FROM referrals').get().c;
+  return { totalUsers, totalWallets, totalTrades, totalVolumeEth, activeUsers24h, volume24hEth, openPositions, totalReferrals };
 }
 
 // ---------- Terms of use ----------
@@ -265,4 +273,69 @@ export function hasAgreedTerms(uid) {
 
 export function setAgreedTerms(uid) {
   updateSettings(uid, { agreedTerms: true });
+}
+
+// ---------- Rewards / Referrals ----------
+// Ticket count = number of successful referrals. A referred user can only ever
+// be attributed to ONE referrer (first one wins), preventing re-invite farming.
+// referral_code is stored in the user's settings JSON to avoid a schema bump;
+// if the user base grows large, move it to its own indexed table.
+
+function genReferralCode(uid) {
+  return Buffer.from(`${uid}_${Math.random().toString(36).slice(2, 8)}`).toString('base64url').slice(0, 10);
+}
+
+export function getOrCreateReferralCode(uid) {
+  uid = String(uid);
+  const s = getSettings(uid);
+  if (s.referralCode) return s.referralCode;
+  const code = genReferralCode(uid);
+  updateSettings(uid, { referralCode: code });
+  return code;
+}
+
+/** Reverse lookup: referral code -> referrer uid. O(n) over users; fine at this scale. */
+export function findUidByReferralCode(code) {
+  const rows = db.prepare('SELECT uid, settings FROM users').all();
+  for (const row of rows) {
+    try {
+      const s = JSON.parse(row.settings || '{}');
+      if (s.referralCode === code) return row.uid;
+    } catch {
+      // skip malformed settings row
+    }
+  }
+  return null;
+}
+
+/**
+ * Records a referral. Call once, on a brand-new user's first /start with a ref payload.
+ * Returns true if recorded, false if this user was already referred (or self-referral).
+ */
+export function recordReferral(referrerUid, referredUid) {
+  referrerUid = String(referrerUid);
+  referredUid = String(referredUid);
+  if (referrerUid === referredUid) return false;
+  try {
+    db.prepare(`
+      INSERT INTO referrals (referrer_uid, referred_uid, created_at)
+      VALUES (?, ?, ?)
+    `).run(referrerUid, referredUid, Date.now());
+    return true;
+  } catch (err) {
+    if (err.code === 'SQLITE_CONSTRAINT_UNIQUE' || err.code === 'SQLITE_CONSTRAINT_PRIMARYKEY') {
+      return false; // already referred by someone else
+    }
+    throw err;
+  }
+}
+
+export function getTicketCount(uid) {
+  const row = db.prepare('SELECT COUNT(*) c FROM referrals WHERE referrer_uid = ?').get(String(uid));
+  return row.c;
+}
+
+export function hasBeenReferred(uid) {
+  const row = db.prepare('SELECT 1 FROM referrals WHERE referred_uid = ?').get(String(uid));
+  return !!row;
 }
