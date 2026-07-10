@@ -40,10 +40,10 @@ export async function getQuote({ sellToken, buyToken, sellAmount, taker, slippag
 }
 
 /**
- * Execute the swap tx returned by 0x using the user's signer.
+ * Builds the swap tx request (does NOT send it) from the 0x quote.
  * Handles Permit2 signature if required by the quote.
  */
-export async function getSwapTx(signer, quote) {
+export async function buildSwapTx(signer, quote) {
   const tx = {
     to: quote.transaction.to,
     data: quote.transaction.data,
@@ -62,5 +62,36 @@ export async function getSwapTx(signer, quote) {
     tx.data = ethers.concat([tx.data, sigLengthHex, signature]);
   }
 
-  return signer.sendTransaction(tx);
+  return tx;
+}
+
+/**
+ * Sends a built tx and waits for confirmation. If the tx isn't mined within
+ * `timeoutMs`, resubmits the SAME nonce with fees bumped by `bumpPct`,
+ * repeating until it lands or `maxAttempts` is hit. This is what keeps a
+ * trade from getting silently stuck forever when the network is congested.
+ *
+ * Returns { txResponse, receipt, bumped } for the transaction that actually
+ * confirmed (the last resubmission, if any bumps happened).
+ */
+export async function sendSwapWithGasBump(signer, txRequest, { timeoutMs = 45_000, bumpPct = 20, maxAttempts = 4 } = {}) {
+  const nonce = await signer.getNonce();
+  const feeData = await signer.provider.getFeeData();
+  let maxFeePerGas = feeData.maxFeePerGas ?? ethers.parseUnits('30', 'gwei');
+  let maxPriorityFeePerGas = feeData.maxPriorityFeePerGas ?? ethers.parseUnits('1', 'gwei');
+
+  let lastTxResponse;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    lastTxResponse = await signer.sendTransaction({ ...txRequest, nonce, maxFeePerGas, maxPriorityFeePerGas });
+    try {
+      const receipt = await lastTxResponse.wait(1, timeoutMs);
+      return { txResponse: lastTxResponse, receipt, bumped: attempt > 1 };
+    } catch (err) {
+      const timedOut = err.code === 'TIMEOUT' || err.message?.toLowerCase().includes('timeout');
+      if (!timedOut || attempt === maxAttempts) throw err;
+      maxFeePerGas = (maxFeePerGas * BigInt(100 + bumpPct)) / 100n;
+      maxPriorityFeePerGas = (maxPriorityFeePerGas * BigInt(100 + bumpPct)) / 100n;
+    }
+  }
+  throw new Error('sendSwapWithGasBump: exhausted attempts'); // unreachable
 }
