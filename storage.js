@@ -60,10 +60,27 @@ CREATE TABLE IF NOT EXISTS referrals (
   referred_uid TEXT NOT NULL UNIQUE,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS pending_bridges (
+  id TEXT PRIMARY KEY,
+  uid TEXT NOT NULL,
+  wallet_id TEXT NOT NULL,
+  direction TEXT NOT NULL,
+  amount_eth REAL NOT NULL,
+  bridge_tool TEXT,
+  from_chain INTEGER NOT NULL,
+  to_chain INTEGER NOT NULL,
+  source_tx_hash TEXT,
+  dest_tx_hash TEXT,
+  status TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_wallets_uid ON wallets(uid);
 CREATE INDEX IF NOT EXISTS idx_positions_uid_wallet ON positions(uid, wallet_id);
 CREATE INDEX IF NOT EXISTS idx_trade_log_created ON trade_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_uid);
+CREATE INDEX IF NOT EXISTS idx_pending_bridges_status ON pending_bridges(status);
+CREATE INDEX IF NOT EXISTS idx_pending_bridges_uid ON pending_bridges(uid);
 `);
 
 // Migration: move referral_code from settings JSON (old location) to an indexed column.
@@ -266,6 +283,49 @@ export function getStuckPendingTrades() {
   return db.prepare(`SELECT * FROM pending_trades WHERE status IN ('pending', 'submitted') ORDER BY created_at ASC`).all();
 }
 
+// ---------- Pending bridges (cross-chain, async) ----------
+// Unlike trades, a bridge can take minutes to settle on the destination chain,
+// so the flow is: create row -> mark submitted (source tx confirmed) ->
+// background poller checks LI.FI status periodically -> mark done/failed.
+// Anything left 'pending' or 'submitted' after a restart needs re-polling,
+// same crash-recovery shape as pending_trades.
+
+export function createPendingBridge({ uid, walletId, direction, amountEth, fromChain, toChain, bridgeTool }) {
+  const id = `pb_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const now = Date.now();
+  db.prepare(`
+    INSERT INTO pending_bridges
+      (id, uid, wallet_id, direction, amount_eth, bridge_tool, from_chain, to_chain, source_tx_hash, dest_tx_hash, status, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'pending', ?, ?)
+  `).run(id, String(uid), walletId, direction, amountEth, bridgeTool || null, fromChain, toChain, now, now);
+  return id;
+}
+
+export function markPendingBridgeSubmitted(id, sourceTxHash) {
+  db.prepare('UPDATE pending_bridges SET status = ?, source_tx_hash = ?, updated_at = ? WHERE id = ?')
+    .run('submitted', sourceTxHash, Date.now(), id);
+}
+
+export function markPendingBridgeDone(id, status, destTxHash) {
+  // status: 'done' | 'failed'
+  db.prepare('UPDATE pending_bridges SET status = ?, dest_tx_hash = ?, updated_at = ? WHERE id = ?')
+    .run(status, destTxHash || null, Date.now(), id);
+}
+
+export function getPendingBridge(id) {
+  return db.prepare('SELECT * FROM pending_bridges WHERE id = ?').get(id);
+}
+
+/** Bridges still in flight — polled periodically by the background worker in bot.js. */
+export function getInFlightBridges() {
+  return db.prepare(`SELECT * FROM pending_bridges WHERE status IN ('pending', 'submitted') ORDER BY created_at ASC`).all();
+}
+
+export function getBridgeHistory(uid, limit = 10) {
+  return db.prepare('SELECT * FROM pending_bridges WHERE uid = ? ORDER BY created_at DESC LIMIT ?')
+    .all(String(uid), limit);
+}
+
 // ---------- Admin stats ----------
 
 export function getStats() {
@@ -278,7 +338,9 @@ export function getStats() {
   const volume24hEth = db.prepare('SELECT COALESCE(SUM(eth_amount), 0) v FROM trade_log WHERE created_at > ?').get(dayAgo).v;
   const openPositions = db.prepare('SELECT COUNT(*) c FROM positions WHERE token_amount > 0').get().c;
   const totalReferrals = db.prepare('SELECT COUNT(*) c FROM referrals').get().c;
-  return { totalUsers, totalWallets, totalTrades, totalVolumeEth, activeUsers24h, volume24hEth, openPositions, totalReferrals };
+  const totalBridges = db.prepare('SELECT COUNT(*) c FROM pending_bridges').get().c;
+  const totalBridgeVolumeEth = db.prepare("SELECT COALESCE(SUM(amount_eth), 0) v FROM pending_bridges WHERE status = 'done'").get().v;
+  return { totalUsers, totalWallets, totalTrades, totalVolumeEth, activeUsers24h, volume24hEth, openPositions, totalReferrals, totalBridges, totalBridgeVolumeEth };
 }
 
 // ---------- Terms of use ----------
