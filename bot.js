@@ -44,6 +44,28 @@ const TERMS_TEXT =
   '• This is not financial advice, and there are no guarantees of any kind\n\n' +
   'Tap below to confirm you understand and wish to continue.';
 
+const HELP_TEXT =
+  '❓ *Help & FAQ*\n\n' +
+  '*How do I use this bot?*\n' +
+  'Create or import a wallet under 💼 Wallets, fund it with ETH, then paste any token contract address to pull up its price and trade it.\n\n' +
+  '*Where\'s my referral link?*\n' +
+  'Open 🎟 Rewards from the main menu.\n\n' +
+  '*What are the fees?*\n' +
+  `A ${(Number(process.env.AFFILIATE_FEE_BPS || 0) / 100).toFixed(2)}% fee applies on swaps, taken from the trade itself. No subscription, no feature is paywalled.\n\n` +
+  '*Security tips*\n' +
+  '• This bot never DMs you first — if you receive an unsolicited message claiming to be us, it\'s a scammer\n' +
+  '• We will never ask you to "verify" your wallet by sending funds or signing a message elsewhere\n' +
+  '• Only use the official bot link — search results and copycat bots are common\n' +
+  '• Anyone who private-messages you offering "support" and asks for your private key or seed phrase is trying to steal your funds\n\n' +
+  '*Common trade failures*\n' +
+  '• *Slippage exceeded* — raise your slippage tolerance in Settings, or trade a smaller size\n' +
+  '• *Insufficient balance* — you need enough ETH to cover both the trade and gas; add funds or reduce the amount\n' +
+  '• *Timed out* — the network was congested; the bot automatically resubmits with higher gas, but if it still fails, try again in a moment\n\n' +
+  '*Why does my PnL look off?*\n' +
+  'PnL is based on your running average cost basis and the live price, so it can shift with volatility between refreshes. Gas costs are not factored into the displayed cost basis — check the transaction on your block explorer for the exact net amount.\n\n' +
+  '*Still stuck?*\n' +
+  'Contact support: panchi.eth@gmail.com';
+
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL, Number(process.env.CHAIN_ID));
 
@@ -104,7 +126,7 @@ function mainMenu() {
     [Markup.button.callback('🔍 Trade Token', 'menu_trade')],
     [Markup.button.callback('📊 Positions', 'menu_positions')],
     [Markup.button.callback('💼 Wallets', 'menu_wallets'), Markup.button.callback('💰 Balance', 'menu_balance')],
-    [Markup.button.callback('🎟 Rewards', 'menu_rewards')],
+    [Markup.button.callback('🎟 Rewards', 'menu_rewards'), Markup.button.callback('❓ Help', 'menu_help')],
     [Markup.button.callback('⚙️ Settings', 'menu_settings')],
     [Markup.button.url('🐦 X', 'https://x.com/robinpanchi'), Markup.button.url('🖼 OpenSea', 'https://opensea.io/collection/robinpanchi')],
   ]);
@@ -367,6 +389,13 @@ bot.start(async (ctx) => {
   });
 });
 
+bot.command('help', async (ctx) => {
+  await ctx.reply(HELP_TEXT, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Main Menu', 'menu_main')]]),
+  });
+});
+
 bot.action('agree_terms', async (ctx) => {
   setAgreedTerms(ctx.from.id);
   await ctx.answerCbQuery('Thanks — happy trading');
@@ -407,6 +436,14 @@ bot.action('menu_trade', async (ctx) => {
   await ctx.answerCbQuery();
   pending.set(ctx.from.id, { type: 'awaiting_ca' });
   await ctx.editMessageText('Paste the token contract address:');
+});
+
+bot.action('menu_help', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(HELP_TEXT, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_main')]]),
+  });
 });
 
 // ---------- Wallets ----------
