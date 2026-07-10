@@ -1,18 +1,21 @@
 import { ethers } from 'ethers';
 
 /**
- * Creates a fresh wallet for a Telegram user.
- * ⚠️ For production: encrypt privateKey at rest (e.g. AES with a per-user key
- * derived from a KMS/secrets manager), never keep raw keys in memory/logs long-term,
- * and consider ERC-4337 smart accounts + session keys instead of raw EOAs
- * so users can limit what the bot is allowed to do.
+ * ⚠️ Production note: encrypt privateKey at rest (per-user key via KMS/secrets manager).
+ * data/db.json currently stores keys in plaintext on disk — fine to get moving,
+ * not fine for real user funds at scale. Migrate before serious volume.
  */
-export function createWallet() {
+export function createWallet(name) {
   const wallet = ethers.Wallet.createRandom();
-  return { address: wallet.address, privateKey: wallet.privateKey };
+  return { name, address: wallet.address, privateKey: wallet.privateKey };
 }
 
-export function loadWallet(privateKey) {
-  const wallet = new ethers.Wallet(privateKey);
-  return { address: wallet.address, privateKey: wallet.privateKey };
+export function importWallet(name, privateKey) {
+  const pk = privateKey.startsWith('0x') ? privateKey : `0x${privateKey}`;
+  const wallet = new ethers.Wallet(pk); // throws if invalid
+  return { name, address: wallet.address, privateKey: wallet.privateKey };
+}
+
+export function shortAddr(addr) {
+  return `${addr.slice(0, 6)}...${addr.slice(-4)}`;
 }
