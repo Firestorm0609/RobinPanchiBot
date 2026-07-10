@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { encrypt, decrypt } from './crypto.js';
 
 const DB_DIR = path.join(process.cwd(), 'data');
@@ -64,6 +65,21 @@ CREATE INDEX IF NOT EXISTS idx_positions_uid_wallet ON positions(uid, wallet_id)
 CREATE INDEX IF NOT EXISTS idx_trade_log_created ON trade_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_uid);
 `);
+
+// Migration: move referral_code from settings JSON (old location) to an indexed column.
+const userCols = db.prepare("PRAGMA table_info(users)").all().map((c) => c.name);
+if (!userCols.includes('referral_code')) {
+  db.exec('ALTER TABLE users ADD COLUMN referral_code TEXT');
+  const rows = db.prepare('SELECT uid, settings FROM users').all();
+  const backfill = db.prepare('UPDATE users SET referral_code = ? WHERE uid = ?');
+  for (const row of rows) {
+    try {
+      const s = JSON.parse(row.settings || '{}');
+      if (s.referralCode) backfill.run(s.referralCode, row.uid);
+    } catch { /* skip malformed settings row */ }
+  }
+}
+db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code ON users(referral_code)');
 
 const DEFAULT_SETTINGS = {
   buyPresetsEth: [0.01, 0.05, 0.1],
@@ -281,34 +297,35 @@ export function setAgreedTerms(uid) {
 // referral_code is stored in the user's settings JSON to avoid a schema bump;
 // if the user base grows large, move it to its own indexed table.
 
-function genReferralCode(uid) {
-  return Buffer.from(`${uid}_${Math.random().toString(36).slice(2, 8)}`).toString('base64url').slice(0, 10);
+function genReferralCode() {
+  // Pure random bytes — NOT derived from uid. A uid-prefixed string truncated
+  // to a short slice can cut off before the random part is even encoded,
+  // causing deterministic collisions between users with a shared uid prefix.
+  return crypto.randomBytes(6).toString('base64url'); // 8 chars, ~48 bits of entropy
 }
 
+/** referral_code is a real, uniquely-indexed column — O(1) lookups either direction. */
 export function getOrCreateReferralCode(uid) {
   uid = String(uid);
-  const s = getSettings(uid);
-  if (s.referralCode) return s.referralCode;
-  let code;
-  do {
-    code = genReferralCode(uid);
-  } while (findUidByReferralCode(code)); // guard against the rare collision
-  updateSettings(uid, { referralCode: code });
-  return code;
-}
+  ensureUserRow(uid);
+  const existing = db.prepare('SELECT referral_code FROM users WHERE uid = ?').get(uid);
+  if (existing.referral_code) return existing.referral_code;
 
-/** Reverse lookup: referral code -> referrer uid. O(n) over users; fine at this scale. */
-export function findUidByReferralCode(code) {
-  const rows = db.prepare('SELECT uid, settings FROM users').all();
-  for (const row of rows) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = genReferralCode();
     try {
-      const s = JSON.parse(row.settings || '{}');
-      if (s.referralCode === code) return row.uid;
-    } catch {
-      // skip malformed settings row
+      db.prepare('UPDATE users SET referral_code = ? WHERE uid = ?').run(code, uid);
+      return code;
+    } catch (err) {
+      if (err.code !== 'SQLITE_CONSTRAINT_UNIQUE') throw err; // collision, retry with a new random code
     }
   }
-  return null;
+  throw new Error('Failed to generate a unique referral code after 5 attempts');
+}
+
+export function findUidByReferralCode(code) {
+  const row = db.prepare('SELECT uid FROM users WHERE referral_code = ?').get(code);
+  return row ? row.uid : null;
 }
 
 /**
