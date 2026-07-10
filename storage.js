@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { encrypt, decrypt } from './crypto.js';
 
 const DB_PATH = path.join(process.cwd(), 'data', 'db.json');
 
@@ -18,6 +19,11 @@ function writeDb(db) {
   fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
 }
 
+function withDecryptedKey(wallet) {
+  if (!wallet) return wallet;
+  return { ...wallet, privateKey: decrypt(wallet.privateKey) };
+}
+
 export function getUser(uid) {
   const db = readDb();
   if (!db.users[uid]) {
@@ -34,13 +40,13 @@ export function addWallet(uid, wallet) {
     id: `w_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
     name: wallet.name,
     address: wallet.address,
-    privateKey: wallet.privateKey,
+    privateKey: encrypt(wallet.privateKey), // encrypted at rest
   };
   user.wallets.push(entry);
   if (!user.activeWalletId) user.activeWalletId = entry.id;
   db.users[uid] = user;
   writeDb(db);
-  return entry;
+  return withDecryptedKey(entry);
 }
 
 export function removeWallet(uid, walletId) {
@@ -73,12 +79,14 @@ export function setActiveWallet(uid, walletId) {
 
 export function getActiveWallet(uid) {
   const user = getUser(uid);
-  return user.wallets.find((w) => w.id === user.activeWalletId) || null;
+  const w = user.wallets.find((w) => w.id === user.activeWalletId) || null;
+  return withDecryptedKey(w);
 }
 
 export function getWallet(uid, walletId) {
   const user = getUser(uid);
-  return user.wallets.find((w) => w.id === walletId) || null;
+  const w = user.wallets.find((w) => w.id === walletId) || null;
+  return withDecryptedKey(w);
 }
 
 // ---------- Positions / PnL ----------
@@ -129,6 +137,7 @@ const DEFAULT_SETTINGS = {
   sellPresetsPct: [25, 50, 100],
   slippageBps: 100, // 1%
   confirmTrades: true,
+  maxBuyEth: 1, // hard cap per single buy trade; guards against fat-finger amounts
 };
 
 export function getSettings(uid) {
