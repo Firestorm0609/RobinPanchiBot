@@ -75,12 +75,39 @@ CREATE TABLE IF NOT EXISTS pending_bridges (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS auto_rules (
+  id TEXT PRIMARY KEY,
+  uid TEXT NOT NULL,
+  wallet_id TEXT NOT NULL,
+  token_address TEXT NOT NULL,
+  tp_pct REAL,
+  sl_pct REAL,
+  status TEXT NOT NULL, -- 'active' | 'cancelled' | 'triggered'
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS limit_orders (
+  id TEXT PRIMARY KEY,
+  uid TEXT NOT NULL,
+  wallet_id TEXT NOT NULL,
+  token_address TEXT NOT NULL,
+  side TEXT NOT NULL, -- 'buy' | 'sell'
+  trigger_price REAL NOT NULL, -- USD price
+  amount REAL NOT NULL, -- ETH amount for buy side, token amount for sell side
+  status TEXT NOT NULL, -- 'open' | 'filled' | 'cancelled' | 'failed'
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_wallets_uid ON wallets(uid);
 CREATE INDEX IF NOT EXISTS idx_positions_uid_wallet ON positions(uid, wallet_id);
 CREATE INDEX IF NOT EXISTS idx_trade_log_created ON trade_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_uid);
 CREATE INDEX IF NOT EXISTS idx_pending_bridges_status ON pending_bridges(status);
 CREATE INDEX IF NOT EXISTS idx_pending_bridges_uid ON pending_bridges(uid);
+CREATE INDEX IF NOT EXISTS idx_auto_rules_status ON auto_rules(status);
+CREATE INDEX IF NOT EXISTS idx_auto_rules_uid ON auto_rules(uid);
+CREATE INDEX IF NOT EXISTS idx_limit_orders_status ON limit_orders(status);
+CREATE INDEX IF NOT EXISTS idx_limit_orders_uid ON limit_orders(uid);
 `);
 
 // Migration: move referral_code from settings JSON (old location) to an indexed column.
@@ -108,8 +135,8 @@ const DEFAULT_SETTINGS = {
   // Gas priority tier used to scale maxFeePerGas/maxPriorityFeePerGas on
   // every trade/bridge tx. See GAS_TIER_MULTIPLIERS in bot.js.
   gasTier: 'normal', // 'slow' | 'normal' | 'fast'
-  // Auto-buy/auto-sell (take-profit / stop-loss). Off by default — must be
-  // explicitly enabled per user before any rule can fire.
+  // Auto-buy/auto-sell (take-profit / stop-loss). Rules are per-position
+  // (auto_rules table) — this flag is currently informational only.
   autoTradeEnabled: false,
   // DM once when active wallet ETH balance drops below this. Set to 0 to disable.
   lowBalanceThresholdEth: 0.01,
@@ -370,6 +397,82 @@ export function getBridgeHistory(uid, limit = 10) {
     .all(String(uid), limit);
 }
 
+// ---------- Auto-trade rules (take-profit / stop-loss) ----------
+// One active rule per (uid, wallet, token) at a time — creating a new one
+// implicitly supersedes any prior active rule for the same position (see
+// bot.js, which cancels the old one before inserting). status transitions:
+// active -> triggered (fired successfully or position gone) | cancelled (user action).
+
+export function createAutoRule({ uid, walletId, tokenAddress, tpPct, slPct }) {
+  const id = `ar_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const now = Date.now();
+  db.prepare(`
+    INSERT INTO auto_rules (id, uid, wallet_id, token_address, tp_pct, sl_pct, status, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+  `).run(id, String(uid), walletId, tokenAddress.toLowerCase(), tpPct ?? null, slPct ?? null, now, now);
+  return id;
+}
+
+export function cancelAutoRule(uid, id) {
+  db.prepare(`UPDATE auto_rules SET status = 'cancelled', updated_at = ? WHERE id = ? AND uid = ?`)
+    .run(Date.now(), id, String(uid));
+}
+
+export function markAutoRuleTriggered(id) {
+  db.prepare(`UPDATE auto_rules SET status = 'triggered', updated_at = ? WHERE id = ?`).run(Date.now(), id);
+}
+
+/** All active rules across all users — polled periodically by bot.js. */
+export function getActiveAutoRules() {
+  return db.prepare(`SELECT * FROM auto_rules WHERE status = 'active'`).all();
+}
+
+export function getActiveAutoRuleForPosition(uid, walletId, tokenAddress) {
+  return db.prepare(`
+    SELECT * FROM auto_rules WHERE uid = ? AND wallet_id = ? AND token_address = ? AND status = 'active'
+  `).get(String(uid), walletId, tokenAddress.toLowerCase());
+}
+
+export function getActiveAutoRulesForUser(uid) {
+  return db.prepare(`SELECT * FROM auto_rules WHERE uid = ? AND status = 'active' ORDER BY created_at DESC`)
+    .all(String(uid));
+}
+
+// ---------- Limit orders ----------
+// trigger_price is a USD price. side='buy' fires when market price drops to
+// or below trigger_price; side='sell' fires when it rises to or above it.
+// amount is an ETH amount for buy orders, a token amount for sell orders.
+
+export function createLimitOrder({ uid, walletId, tokenAddress, side, triggerPrice, amount }) {
+  const id = `lo_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const now = Date.now();
+  db.prepare(`
+    INSERT INTO limit_orders (id, uid, wallet_id, token_address, side, trigger_price, amount, status, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
+  `).run(id, String(uid), walletId, tokenAddress.toLowerCase(), side, triggerPrice, amount, now, now);
+  return id;
+}
+
+export function cancelLimitOrder(uid, id) {
+  db.prepare(`UPDATE limit_orders SET status = 'cancelled', updated_at = ? WHERE id = ? AND uid = ? AND status = 'open'`)
+    .run(Date.now(), id, String(uid));
+}
+
+export function markLimitOrderDone(id, status) {
+  // status: 'filled' | 'cancelled' | 'failed'
+  db.prepare(`UPDATE limit_orders SET status = ?, updated_at = ? WHERE id = ?`).run(status, Date.now(), id);
+}
+
+/** All open orders across all users — polled periodically by bot.js. */
+export function getOpenLimitOrders() {
+  return db.prepare(`SELECT * FROM limit_orders WHERE status = 'open'`).all();
+}
+
+export function getOpenLimitOrdersForUser(uid) {
+  return db.prepare(`SELECT * FROM limit_orders WHERE uid = ? AND status = 'open' ORDER BY created_at DESC`)
+    .all(String(uid));
+}
+
 // ---------- Admin stats ----------
 
 export function getStats() {
@@ -384,7 +487,12 @@ export function getStats() {
   const totalReferrals = db.prepare('SELECT COUNT(*) c FROM referrals').get().c;
   const totalBridges = db.prepare('SELECT COUNT(*) c FROM pending_bridges').get().c;
   const totalBridgeVolumeEth = db.prepare("SELECT COALESCE(SUM(amount_eth), 0) v FROM pending_bridges WHERE status = 'done'").get().v;
-  return { totalUsers, totalWallets, totalTrades, totalVolumeEth, activeUsers24h, volume24hEth, openPositions, totalReferrals, totalBridges, totalBridgeVolumeEth };
+  const activeAutoRules = db.prepare(`SELECT COUNT(*) c FROM auto_rules WHERE status = 'active'`).get().c;
+  const openLimitOrders = db.prepare(`SELECT COUNT(*) c FROM limit_orders WHERE status = 'open'`).get().c;
+  return {
+    totalUsers, totalWallets, totalTrades, totalVolumeEth, activeUsers24h, volume24hEth,
+    openPositions, totalReferrals, totalBridges, totalBridgeVolumeEth, activeAutoRules, openLimitOrders,
+  };
 }
 
 // ---------- Terms of use ----------
@@ -464,4 +572,4 @@ export function getTicketCount(uid) {
 export function hasBeenReferred(uid) {
   const row = db.prepare('SELECT 1 FROM referrals WHERE referred_uid = ?').get(String(uid));
   return !!row;
-                                    }
+}
