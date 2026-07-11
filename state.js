@@ -6,6 +6,11 @@ export const tradesInFlight = new Set(); // uid -> a buy/sell (interactive OR he
 export const bridgesInFlight = new Set();
 export const fundsInFlight = new Set(); // uid -> locked while a batch-fund/collect distribution is executing
 
+// uid (string) -> true once we've sent a low-balance alert, so the poller in
+// pollers.js doesn't re-notify every cycle while still under threshold.
+// Cleared when the user updates their threshold in Settings.
+export const lowBalanceWarned = new Set();
+
 // Mutable holder so multiple modules can read the bot's own username once
 // it's resolved at startup (bot.telegram.getMe() is async).
 export const botIdentity = { username: null };
