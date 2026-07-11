@@ -33,17 +33,19 @@ import {
   cancelAutoRule,
   getActiveAutoRuleForPosition,
   createLimitOrder,
+  cancelLimitOrder,
+  getOpenLimitOrdersForUser,
   getInFlightBridges,
   markPendingBridgeDone,
 } from './storage.js';
 
 import { validateEnv, provider, ethMainnetProvider, CA_REGEX, FALLBACK_GAS_LIMIT_BUY, FALLBACK_GAS_LIMIT_SELL, MAX_BATCH_FUND_NEW_WALLETS, GAS_TIERS, TERMS_TEXT, HELP_TEXT, WELCOME_TEXT } from './config.js';
 import { pending, fundsInFlight, lowBalanceWarned, botIdentity, gasMultiplierFor } from './state.js';
-import { dualEthBalanceLines, getBridgeBalances, fmtBridgeBalanceLine, gasEstimateLine, friendlyErrorMessage, parseEthOrUsdInput, parseBridgeAmountInput, fmtEth, fmtAmountLabel } from './format.js';
+import { dualEthBalanceLines, getBridgeBalances, fmtBridgeBalanceLine, gasEstimateLine, friendlyErrorMessage, parseEthOrUsdInput, parseBridgeAmountInput, parseMcapInput, mcapToPrice, fmtEth, fmtAmountLabel } from './format.js';
 import {
   mainMenu, walletsMenu, walletDetailMenu, exportConfirmMenu, settingsMenu, rewardsMenu,
   bridgeMenu, bridgeConfirmMenu, directionLabel, tokenMenu, batchSelectMenu, batchSellSelectMenu,
-  batchFundSelectMenu, collectSelectMenu, confirmMenu, renderTokenCard,
+  batchFundSelectMenu, collectSelectMenu, confirmMenu, renderTokenCard, limitOrdersText, limitOrdersMenu,
 } from './menus.js';
 import { executeBuy, executeSell, performBuyCore, performSellCore, estimateTransferGasReserve, distributeEth, performCollectCore } from './trade-core.js';
 import { executeBridge } from './bridge-actions.js';
@@ -289,6 +291,9 @@ bot.action('menu_positions', async (ctx) => {
       const pnlPct = costUsd > 0 ? (pnlUsd / costUsd) * 100 : 0;
       const emoji = pnlUsd >= 0 ? '🟢' : '🔴';
       text += `\n*${symbol}*: ${pos.tokenAmount.toFixed(4)} — ${fmtUsd(valueUsd)} (${emoji} ${pnlPct.toFixed(1)}%)`;
+      if (pos.entryMcap != null) {
+        text += `\n  Entry mcap: ${fmtUsd(pos.entryMcap)}`;
+      }
     } else {
       text += `\n*${symbol}*: ${pos.tokenAmount.toFixed(4)} — price unavailable`;
     }
@@ -329,7 +334,9 @@ bot.action('menu_portfolio', async (ctx) => {
       const pnlUsd = valueUsd - costUsd;
       const pnlPct = costUsd > 0 ? (pnlUsd / costUsd) * 100 : 0;
       const emoji = pnlUsd >= 0 ? '🟢' : '🔴';
-      lines.push(`*${symbol}* (${pos.walletName}): ${fmtUsd(valueUsd)} (${emoji} ${pnlPct.toFixed(1)}%)`);
+      let line = `*${symbol}* (${pos.walletName}): ${fmtUsd(valueUsd)} (${emoji} ${pnlPct.toFixed(1)}%)`;
+      if (pos.entryMcap != null) line += `\n  Entry mcap: ${fmtUsd(pos.entryMcap)}`;
+      lines.push(line);
     } else {
       anyPriceUnavailable = true;
       lines.push(`*${symbol}* (${pos.walletName}): price unavailable`);
@@ -546,14 +553,67 @@ bot.action(/^tpsl_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
 
 bot.action(/^limitbuy_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
   await ctx.answerCbQuery();
-  pending.set(ctx.from.id, { type: 'limitbuy_price', tokenAddress: ctx.match[1] });
-  await ctx.editMessageText('Send the target price in USD to buy at (fires when price drops to or below this), e.g. `0.002`', { parse_mode: 'Markdown' });
+  pending.set(ctx.from.id, { type: 'limitbuy_mcap', tokenAddress: ctx.match[1] });
+  await ctx.editMessageText(
+    'Send the target *market cap* to buy at (fires when mcap drops to or below this).\n' +
+    'Use shorthand: `50k`, `2.5m`, `1b` — or a plain number.',
+    { parse_mode: 'Markdown' }
+  );
 });
 
 bot.action(/^limitsell_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
   await ctx.answerCbQuery();
-  pending.set(ctx.from.id, { type: 'limitsell_price', tokenAddress: ctx.match[1] });
-  await ctx.editMessageText('Send the target price in USD to sell at (fires when price rises to or above this), e.g. `0.01`', { parse_mode: 'Markdown' });
+  pending.set(ctx.from.id, { type: 'limitsell_mcap', tokenAddress: ctx.match[1] });
+  await ctx.editMessageText(
+    'Send the target *market cap* to sell at (fires when mcap rises to or above this).\n' +
+    'Use shorthand: `50k`, `2.5m`, `1b` — or a plain number.',
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// ---------- Limit order list / cancel ----------
+
+bot.action('menu_limitorders', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  const orders = getOpenLimitOrdersForUser(uid);
+
+  const marketByToken = new Map();
+  for (const o of orders) {
+    if (!marketByToken.has(o.token_address)) {
+      const market = await getTokenMarketData(o.token_address).catch(() => null);
+      marketByToken.set(o.token_address, market);
+      o._symbol = market?.symbol ?? shortAddr(o.token_address);
+    } else {
+      o._symbol = marketByToken.get(o.token_address)?.symbol ?? shortAddr(o.token_address);
+    }
+  }
+
+  await ctx.editMessageText(limitOrdersText(orders, marketByToken), {
+    parse_mode: 'Markdown',
+    ...limitOrdersMenu(orders),
+  });
+});
+
+bot.action(/^limitordercancel_(.+)$/, async (ctx) => {
+  const uid = ctx.from.id;
+  const cancelled = cancelLimitOrder(uid, ctx.match[1]);
+  await ctx.answerCbQuery(cancelled ? 'Order cancelled' : 'Could not cancel (already filled/cancelled?)');
+
+  const orders = getOpenLimitOrdersForUser(uid);
+  const marketByToken = new Map();
+  for (const o of orders) {
+    if (!marketByToken.has(o.token_address)) {
+      const market = await getTokenMarketData(o.token_address).catch(() => null);
+      marketByToken.set(o.token_address, market);
+    }
+    o._symbol = marketByToken.get(o.token_address)?.symbol ?? shortAddr(o.token_address);
+  }
+
+  await ctx.editMessageText(limitOrdersText(orders, marketByToken), {
+    parse_mode: 'Markdown',
+    ...limitOrdersMenu(orders),
+  }).catch(() => {});
 });
 
 // ---------- Batch Buy ----------
@@ -1190,11 +1250,22 @@ bot.on('text', async (ctx) => {
       return;
     }
 
-    if (state.type === 'limitbuy_price') {
-      const price = parseFloat(text);
-      if (isNaN(price) || price <= 0) return ctx.reply('Send a valid positive price, e.g. `0.002`');
-      pending.set(uid, { type: 'limitbuy_amount', tokenAddress: state.tokenAddress, triggerPrice: price });
-      await ctx.reply('Send the ETH amount to spend when triggered, e.g. `0.05`');
+    if (state.type === 'limitbuy_mcap') {
+      let targetMcap;
+      try {
+        targetMcap = parseMcapInput(text);
+      } catch (err) {
+        return ctx.reply(err.message, { parse_mode: 'Markdown' });
+      }
+
+      const market = await getTokenMarketData(state.tokenAddress).catch(() => null);
+      const triggerPrice = mcapToPrice(targetMcap, market);
+      if (triggerPrice === null) {
+        return ctx.reply('Could not fetch live market data for this token right now — try again in a moment.');
+      }
+
+      pending.set(uid, { type: 'limitbuy_amount', tokenAddress: state.tokenAddress, triggerPrice, targetMcap });
+      await ctx.reply(`Send the ETH amount to spend when triggered, e.g. \`0.05\``, { parse_mode: 'Markdown' });
       return;
     }
 
@@ -1204,17 +1275,22 @@ bot.on('text', async (ctx) => {
       const w = getActiveWallet(uid);
       if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
       pending.delete(uid);
-      createLimitOrder({ uid, walletId: w.id, tokenAddress: state.tokenAddress, side: 'buy', triggerPrice: state.triggerPrice, amount: amt });
+      createLimitOrder({ uid, walletId: w.id, tokenAddress: state.tokenAddress, side: 'buy', triggerPrice: state.triggerPrice, amount: amt, targetMcap: state.targetMcap });
       await ctx.reply(
-        `✅ Limit buy queued: ${amt} ETH when price ≤ $${state.triggerPrice} (checked ~every 30s). I'll DM you when it fills.`,
+        `✅ Limit buy queued: ${amt} ETH when mcap ≤ ${fmtUsd(state.targetMcap)} (checked ~every 30s). I'll DM you when it fills.`,
         mainMenu()
       );
       return;
     }
 
-    if (state.type === 'limitsell_price') {
-      const price = parseFloat(text);
-      if (isNaN(price) || price <= 0) return ctx.reply('Send a valid positive price, e.g. `0.01`');
+    if (state.type === 'limitsell_mcap') {
+      let targetMcap;
+      try {
+        targetMcap = parseMcapInput(text);
+      } catch (err) {
+        return ctx.reply(err.message, { parse_mode: 'Markdown' });
+      }
+
       const w = getActiveWallet(uid);
       if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
       const pos = getPosition(uid, w.id, state.tokenAddress);
@@ -1222,7 +1298,14 @@ bot.on('text', async (ctx) => {
         pending.delete(uid);
         return ctx.reply('No open position on this token to sell.', mainMenu());
       }
-      pending.set(uid, { type: 'limitsell_amount', tokenAddress: state.tokenAddress, triggerPrice: price, maxAmount: pos.tokenAmount });
+
+      const market = await getTokenMarketData(state.tokenAddress).catch(() => null);
+      const triggerPrice = mcapToPrice(targetMcap, market);
+      if (triggerPrice === null) {
+        return ctx.reply('Could not fetch live market data for this token right now — try again in a moment.');
+      }
+
+      pending.set(uid, { type: 'limitsell_amount', tokenAddress: state.tokenAddress, triggerPrice, targetMcap, maxAmount: pos.tokenAmount });
       await ctx.reply(`Send the token amount to sell when triggered (you hold ${pos.tokenAmount.toFixed(4)}):`);
       return;
     }
@@ -1234,9 +1317,9 @@ bot.on('text', async (ctx) => {
       const w = getActiveWallet(uid);
       if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
       const clamped = Math.min(amt, state.maxAmount);
-      createLimitOrder({ uid, walletId: w.id, tokenAddress: state.tokenAddress, side: 'sell', triggerPrice: state.triggerPrice, amount: clamped });
+      createLimitOrder({ uid, walletId: w.id, tokenAddress: state.tokenAddress, side: 'sell', triggerPrice: state.triggerPrice, amount: clamped, targetMcap: state.targetMcap });
       await ctx.reply(
-        `✅ Limit sell queued: ${clamped.toFixed(4)} tokens when price ≥ $${state.triggerPrice} (checked ~every 30s). I'll DM you when it fills.`,
+        `✅ Limit sell queued: ${clamped.toFixed(4)} tokens when mcap ≥ ${fmtUsd(state.targetMcap)} (checked ~every 30s). I'll DM you when it fills.`,
         mainMenu()
       );
       return;
