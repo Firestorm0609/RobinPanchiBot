@@ -66,19 +66,42 @@ export async function buildSwapTx(signer, quote) {
 }
 
 /**
+ * Estimates the ETH cost of a built tx BEFORE it's sent, for display on a
+ * confirm screen. Uses the tx's own gasLimit (from the 0x quote) times the
+ * network's current fee estimate, scaled by the same gasMultiplier that
+ * will actually be applied at send time — so the number shown matches what
+ * the user will pay (modulo any gas bumps if the network is congested).
+ */
+export async function estimateSwapGasEth(provider, txRequest, gasMultiplier = 1) {
+  const feeData = await provider.getFeeData();
+  const baseFee = feeData.maxFeePerGas ?? ethers.parseUnits('30', 'gwei');
+  const maxFeePerGas = (baseFee * BigInt(Math.round(gasMultiplier * 1000))) / 1000n;
+  const gasLimit = txRequest.gasLimit ?? 250_000n;
+  const costWei = gasLimit * maxFeePerGas;
+  return Number(ethers.formatEther(costWei));
+}
+
+/**
  * Sends a built tx and waits for confirmation. If the tx isn't mined within
  * `timeoutMs`, resubmits the SAME nonce with fees bumped by `bumpPct`,
  * repeating until it lands or `maxAttempts` is hit. This is what keeps a
  * trade from getting silently stuck forever when the network is congested.
  *
+ * `gasMultiplier` scales the INITIAL fee estimate before any congestion
+ * bumps are applied — this is how the user's configured gas priority tier
+ * (slow/normal/fast, see GAS_TIER_MULTIPLIERS in bot.js) takes effect.
+ *
  * Returns { txResponse, receipt, bumped } for the transaction that actually
  * confirmed (the last resubmission, if any bumps happened).
  */
-export async function sendSwapWithGasBump(signer, txRequest, { timeoutMs = 45_000, bumpPct = 20, maxAttempts = 4 } = {}) {
+export async function sendSwapWithGasBump(signer, txRequest, { timeoutMs = 45_000, bumpPct = 20, maxAttempts = 4, gasMultiplier = 1 } = {}) {
   const nonce = await signer.getNonce();
   const feeData = await signer.provider.getFeeData();
-  let maxFeePerGas = feeData.maxFeePerGas ?? ethers.parseUnits('30', 'gwei');
-  let maxPriorityFeePerGas = feeData.maxPriorityFeePerGas ?? ethers.parseUnits('1', 'gwei');
+  const baseMaxFee = feeData.maxFeePerGas ?? ethers.parseUnits('30', 'gwei');
+  const basePriorityFee = feeData.maxPriorityFeePerGas ?? ethers.parseUnits('1', 'gwei');
+  const multBps = BigInt(Math.round(gasMultiplier * 1000));
+  let maxFeePerGas = (baseMaxFee * multBps) / 1000n;
+  let maxPriorityFeePerGas = (basePriorityFee * multBps) / 1000n;
 
   let lastTxResponse;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
