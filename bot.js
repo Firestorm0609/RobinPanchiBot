@@ -183,15 +183,14 @@ bot.command('flex', async (ctx) => {
   const w = getActiveWallet(uid);
   if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
 
-  const pos = getPosition(uid, w.id, arg);
-  if (!pos || pos.tokenAmount <= 0) {
-    return ctx.reply('No open position on that token to flex.', mainMenu());
-  }
-
   try {
+    // generateFlexCard handles both an open position (live unrealized PnL)
+    // and a closed one (realized PnL from trade history) — it returns null
+    // only if there's no trade history at all for this token on this wallet,
+    // or market/price data is unavailable.
     const cardBuffer = await generateFlexCard(uid, arg);
     if (!cardBuffer) {
-      return ctx.reply('Could not generate a flex card right now — market data may be unavailable. Try again shortly.', mainMenu());
+      return ctx.reply('No trade history on that token for your active wallet — nothing to flex.', mainMenu());
     }
     await ctx.replyWithPhoto({ source: cardBuffer });
   } catch (err) {
