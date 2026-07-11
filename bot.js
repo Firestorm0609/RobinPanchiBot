@@ -732,10 +732,6 @@ bot.action('batchsellconfirm', async (ctx) => {
 });
 
 // ---------- Batch Fund ----------
-// Identifies the best-funded wallet as the source and lets the user pick
-// which of their OTHER wallets to split ETH across equally. If the user
-// only has one wallet, offers to create N new wallets and fund each one
-// from it instead.
 
 bot.action('batchfund_start', async (ctx) => {
   await ctx.answerCbQuery();
@@ -820,10 +816,6 @@ bot.action('bfundconfirm', async (ctx) => {
 });
 
 // ---------- Batch Collect ----------
-// Inverse of Batch Fund: choose ONE destination wallet, then choose which of
-// your other wallets to sweep FROM. Every source wallet has its native ETH
-// (Robinhood Chain) AND every token it holds a tracked position in sent to
-// the destination wallet.
 
 bot.action('collect_start', async (ctx) => {
   await ctx.answerCbQuery();
@@ -1265,19 +1257,28 @@ bot.on('text', async (ctx) => {
       }
 
       pending.set(uid, { type: 'limitbuy_amount', tokenAddress: state.tokenAddress, triggerPrice, targetMcap });
-      await ctx.reply(`Send the ETH amount to spend when triggered, e.g. \`0.05\``, { parse_mode: 'Markdown' });
+      await ctx.reply(
+        'Send the amount to spend when triggered — USD like `100`, or ETH like `0.05 eth`:',
+        { parse_mode: 'Markdown' }
+      );
       return;
     }
 
     if (state.type === 'limitbuy_amount') {
-      const amt = parseFloat(text);
-      if (isNaN(amt) || amt <= 0) return ctx.reply('Send a valid positive ETH amount.');
+      let amt, usdInput;
+      try {
+        ({ amountEth: amt, usdInput } = await parseEthOrUsdInput(text));
+      } catch (err) {
+        return ctx.reply(err.message, { parse_mode: 'Markdown' });
+      }
+      amt = Number(amt.toFixed(6));
+
       const w = getActiveWallet(uid);
       if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
       pending.delete(uid);
       createLimitOrder({ uid, walletId: w.id, tokenAddress: state.tokenAddress, side: 'buy', triggerPrice: state.triggerPrice, amount: amt, targetMcap: state.targetMcap });
       await ctx.reply(
-        `✅ Limit buy queued: ${amt} ETH when mcap ≤ ${fmtUsd(state.targetMcap)} (checked ~every 30s). I'll DM you when it fills.`,
+        `✅ Limit buy queued: ${fmtAmountLabel(amt, usdInput)} when mcap ≤ ${fmtUsd(state.targetMcap)} (checked ~every 30s). I'll DM you when it fills.`,
         mainMenu()
       );
       return;
