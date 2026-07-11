@@ -236,6 +236,14 @@ export async function renderTokenCard(uid, tokenAddress) {
       const emoji = pnlUsd >= 0 ? '🟢' : '🔴';
       pnlLine = `\n\n*Your position:*\n${pos.tokenAmount.toFixed(4)} ${market.symbol}\nCost: ${fmtUsd(costUsd)} | Value: ${fmtUsd(currentValueUsd)}\nPnL: ${emoji} ${fmtUsd(pnlUsd)} (${pnlPct.toFixed(1)}%)`;
     }
+    if (pos.entryMcap != null) {
+      pnlLine += `\nEntry mcap: ${fmtUsd(pos.entryMcap)}`;
+      if (market.marketCap != null && pos.entryMcap > 0) {
+        const mcapChangePct = ((market.marketCap - pos.entryMcap) / pos.entryMcap) * 100;
+        const mcapEmoji = mcapChangePct >= 0 ? '🟢' : '🔴';
+        pnlLine += ` → Now: ${fmtUsd(market.marketCap)} (${mcapEmoji} ${mcapChangePct >= 0 ? '+' : ''}${mcapChangePct.toFixed(1)}%)`;
+      }
+    }
     const rule = getActiveAutoRuleForPosition(uid, w.id, tokenAddress);
     if (rule) {
       const parts = [];
