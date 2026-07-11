@@ -9,6 +9,7 @@ import {
   getBridgeQuote,
   sendBridgeTx,
   checkBridgeStatusOnce,
+  estimateBridgeGasEth,
   BRIDGE_DIRECTION,
   chainIdsForDirection,
   ETH_CHAIN_ID,
@@ -23,9 +24,11 @@ import {
   setActiveWallet,
   getActiveWallet,
   getWallet,
+  getAllActiveWallets,
   recordTrade,
   getPosition,
   getAllPositions,
+  getAllPositionsForUser,
   getSettings,
   updateSettings,
   createPendingTrade,
@@ -115,6 +118,12 @@ const HELP_TEXT =
   'PnL is based on your running average cost basis and the live price, so it can shift with volatility between refreshes. Gas costs are not factored into the displayed cost basis — check the transaction on your block explorer for the exact net amount.\n\n' +
   '*Bridging ETH*\n' +
   'Use 🌉 Bridge to move ETH between Ethereum mainnet and Robinhood Chain. You can enter either an ETH amount (e.g. `0.05`) or a USD amount (e.g. `$100`) — we\'ll convert it for you. Bridges can take a few minutes to settle on the destination side — the bot will DM you once it lands.\n\n' +
+  '*Gas priority*\n' +
+  'Settings lets you pick slow/normal/fast gas priority, which scales the fee offered on every trade and bridge. Faster = more likely to land quickly during congestion, at a higher cost.\n\n' +
+  '*Portfolio summary*\n' +
+  'Use 📈 Portfolio from the main menu for a combined PnL view across every wallet you own, not just the active one.\n\n' +
+  '*Low balance alerts*\n' +
+  'The bot will DM you once if your active wallet\'s ETH balance drops below the threshold set in Settings (default 0.01 ETH). Set it to 0 to disable.\n\n' +
   '*Still stuck?*\n' +
   'Contact support: panchi.eth@gmail.com';
 
@@ -150,6 +159,28 @@ const bridgesInFlight = new Set(); // uid -> locked while a bridge tx is being s
 const CA_REGEX = /^0x[a-fA-F0-9]{40}$/;
 const QUOTE_STALE_MS = 15_000; // re-quote if this much time passes before sending the tx
 const BRIDGE_POLL_INTERVAL_MS = 30_000;
+const LOW_BALANCE_POLL_INTERVAL_MS = 5 * 60_000; // check every 5 min
+
+// ---------- Gas priority tiers ----------
+// Multiplies the network's suggested maxFeePerGas/maxPriorityFeePerGas before
+// the tx is sent. Applied in swap.js/bridge.js via the gasMultiplier option,
+// and mirrored here (fallback-gas-limit based) for pre-confirm estimates.
+const GAS_TIERS = ['slow', 'normal', 'fast'];
+const GAS_TIER_MULTIPLIERS = { slow: 0.85, normal: 1, fast: 1.35 };
+const FALLBACK_GAS_LIMIT_BUY = 300_000n;
+const FALLBACK_GAS_LIMIT_SELL = 280_000n;
+
+function gasMultiplierFor(uid) {
+  const { gasTier } = getSettings(uid);
+  return GAS_TIER_MULTIPLIERS[gasTier] ?? 1;
+}
+
+// ---------- Low-balance alert state ----------
+// In-memory "already warned" set, same pattern as ratelimit.js — resets on
+// restart, which is fine since this is a convenience nudge, not a security
+// boundary. Keyed by uid so a user is only DMed once per dip below threshold,
+// and can be re-warned after balance recovers and drops again.
+const lowBalanceWarned = new Set();
 
 // ---------- Formatting ----------
 
@@ -208,6 +239,27 @@ function fmtBridgeBalanceLine(label, amount, ethUsd) {
   if (amount === null) return `${label}: unavailable`;
   const usdLine = ethUsd !== null ? ` (${fmtUsd(amount * ethUsd)})` : '';
   return `${label}: ${amount.toFixed(4)}${usdLine}`;
+}
+
+/**
+ * Rough pre-confirm gas estimate for buy/sell, shown on the confirm screen
+ * before the user commits. Uses a fixed fallback gas limit (not a real 0x
+ * quote) so this is cheap — no extra API round-trip — at the cost of some
+ * precision. The user's configured gas priority tier (Settings) is applied
+ * so the number shown roughly matches what sendSwapWithGasBump will pay.
+ */
+async function gasEstimateLine(uid, fallbackGasLimit) {
+  try {
+    const mult = gasMultiplierFor(uid);
+    const feeData = await provider.getFeeData();
+    const baseFee = feeData.maxFeePerGas ?? ethers.parseUnits('30', 'gwei');
+    const maxFee = (baseFee * BigInt(Math.round(mult * 1000))) / 1000n;
+    const gasEth = Number(ethers.formatEther(fallbackGasLimit * maxFee));
+    const ethUsd = await getEthUsdPrice().catch(() => null);
+    return `\nEst. gas: ~${gasEth.toFixed(5)} ETH${ethUsd !== null ? ` (${fmtUsd(gasEth * ethUsd)})` : ''}`;
+  } catch {
+    return ''; // fee data unavailable — skip the line rather than block the confirm screen
+  }
 }
 
 /**
@@ -298,7 +350,7 @@ const WELCOME_TEXT =
 function mainMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('🔍 Trade Token', 'menu_trade')],
-    [Markup.button.callback('📊 Positions', 'menu_positions')],
+    [Markup.button.callback('📊 Positions', 'menu_positions'), Markup.button.callback('📈 Portfolio', 'menu_portfolio')],
     [Markup.button.callback('💼 Wallets', 'menu_wallets'), Markup.button.callback('💰 Balance', 'menu_balance')],
     [Markup.button.callback('🌉 Bridge', 'menu_bridge'), Markup.button.callback('🎟 Rewards', 'menu_rewards')],
     [Markup.button.callback('❓ Help', 'menu_help'), Markup.button.callback('⚙️ Settings', 'menu_settings')],
@@ -345,6 +397,8 @@ function settingsMenu(uid) {
     [Markup.button.callback(`Slippage: ${(s.slippageBps / 100).toFixed(2)}%`, 'settings_slippage')],
     [Markup.button.callback(`Max buy size: ${s.maxBuyEth} ETH`, 'settings_maxbuy')],
     [Markup.button.callback(`Max bridge size: ${s.maxBridgeEth} ETH`, 'settings_maxbridge')],
+    [Markup.button.callback(`Gas priority: ${s.gasTier} (tap to cycle)`, 'settings_gastier')],
+    [Markup.button.callback(`Low balance alert: ${s.lowBalanceThresholdEth} ETH`, 'settings_lowbalance')],
     [Markup.button.callback(`Confirm before trade: ${s.confirmTrades ? 'ON ✅' : 'OFF ❌'}`, 'settings_toggle_confirm')],
     [Markup.button.callback('⬅️ Back', 'menu_main')],
   ]);
@@ -475,7 +529,7 @@ async function executeBuy(ctx, uid, tokenAddress, ethAmount) {
     quote = await getFreshQuote(quoteParams, quote, fetchedAt);
 
     const txRequest = await buildSwapTx(signer, quote);
-    const { txResponse, receipt, bumped } = await sendSwapWithGasBump(signer, txRequest);
+    const { txResponse, receipt, bumped } = await sendSwapWithGasBump(signer, txRequest, { gasMultiplier: gasMultiplierFor(uid) });
     markPendingTradeSubmitted(pendingTradeId, txResponse.hash);
     const txLink = explorerTxUrl(txResponse.hash);
     if (bumped) await ctx.reply('⛽ Network was congested — resubmitted with higher gas.');
@@ -532,7 +586,7 @@ async function executeSell(ctx, uid, tokenAddress, pct) {
     quote = await getFreshQuote(quoteParams, quote, fetchedAt);
 
     const txRequest = await buildSwapTx(signer, quote);
-    const { txResponse, receipt, bumped } = await sendSwapWithGasBump(signer, txRequest);
+    const { txResponse, receipt, bumped } = await sendSwapWithGasBump(signer, txRequest, { gasMultiplier: gasMultiplierFor(uid) });
     markPendingTradeSubmitted(pendingTradeId, txResponse.hash);
     const txLink = explorerTxUrl(txResponse.hash);
     if (bumped) await ctx.reply('⛽ Network was congested — resubmitted with higher gas.');
@@ -597,7 +651,7 @@ async function executeBridge(ctx, uid, direction, amountEth) {
     const sourceProvider = fromChain === ETH_CHAIN_ID ? ethMainnetProvider : provider;
     const sourceSigner = new ethers.Wallet(w.privateKey, sourceProvider);
 
-    const { txResponse, bumped } = await sendBridgeTx(sourceSigner, quote);
+    const { txResponse, bumped } = await sendBridgeTx(sourceSigner, quote, { gasMultiplier: gasMultiplierFor(uid) });
     markPendingBridgeSubmitted(pendingBridgeId, txResponse.hash);
 
     if (bumped) await ctx.reply('⛽ Network was congested — resubmitted with higher gas.');
@@ -864,6 +918,63 @@ bot.action('menu_positions', async (ctx) => {
   await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(rows) });
 });
 
+// ---------- Portfolio-wide PnL summary ----------
+// Same math as menu_positions but aggregated across EVERY wallet the user
+// owns, not just the active one — gives a single "how am I doing overall" view.
+
+bot.action('menu_portfolio', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  const positions = getAllPositionsForUser(uid);
+
+  if (positions.length === 0) {
+    return ctx.editMessageText('📈 No open positions across any wallet yet.', {
+      ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_main')]]),
+    });
+  }
+
+  const ethUsd = await getEthUsdPrice().catch(() => null);
+  const lines = [];
+  let totalValueUsd = 0;
+  let totalCostUsd = 0;
+  let anyPriceUnavailable = false;
+
+  for (const pos of positions) {
+    const market = await getTokenMarketData(pos.tokenAddress).catch(() => null);
+    const symbol = market?.symbol ?? shortAddr(pos.tokenAddress);
+    if (market && ethUsd) {
+      const valueUsd = pos.tokenAmount * market.priceUsd;
+      const costUsd = pos.costEth * ethUsd;
+      totalValueUsd += valueUsd;
+      totalCostUsd += costUsd;
+      const pnlUsd = valueUsd - costUsd;
+      const pnlPct = costUsd > 0 ? (pnlUsd / costUsd) * 100 : 0;
+      const emoji = pnlUsd >= 0 ? '🟢' : '🔴';
+      lines.push(`*${symbol}* (${pos.walletName}): ${fmtUsd(valueUsd)} (${emoji} ${pnlPct.toFixed(1)}%)`);
+    } else {
+      anyPriceUnavailable = true;
+      lines.push(`*${symbol}* (${pos.walletName}): price unavailable`);
+    }
+  }
+
+  const totalPnlUsd = totalValueUsd - totalCostUsd;
+  const totalPnlPct = totalCostUsd > 0 ? (totalPnlUsd / totalCostUsd) * 100 : 0;
+  const totalEmoji = totalPnlUsd >= 0 ? '🟢' : '🔴';
+  const disclaimer = anyPriceUnavailable ? '\n_Totals exclude positions with unavailable pricing._' : '';
+
+  const text =
+    `📈 *Portfolio Summary* — all wallets\n\n` +
+    `Total value: ${fmtUsd(totalValueUsd)}\n` +
+    `Total cost: ${fmtUsd(totalCostUsd)}\n` +
+    `Total PnL: ${totalEmoji} ${fmtUsd(totalPnlUsd)} (${totalPnlPct.toFixed(1)}%)${disclaimer}\n\n` +
+    `*Positions:*\n${lines.join('\n')}`;
+
+  await ctx.editMessageText(text, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_main')]]),
+  });
+});
+
 // ---------- Settings ----------
 
 bot.action('menu_settings', async (ctx) => {
@@ -899,6 +1010,26 @@ bot.action('settings_maxbridge', async (ctx) => {
   await ctx.answerCbQuery();
   pending.set(ctx.from.id, { type: 'settings_maxbridge' });
   await ctx.editMessageText('Send the max ETH allowed per single bridge, e.g. `0.5`', { parse_mode: 'Markdown' });
+});
+
+// Cycles slow -> normal -> fast -> slow. A tap-to-cycle button avoids yet
+// another free-text prompt for a 3-value setting.
+bot.action('settings_gastier', async (ctx) => {
+  const s = getSettings(ctx.from.id);
+  const idx = GAS_TIERS.indexOf(s.gasTier);
+  const next = GAS_TIERS[(idx + 1) % GAS_TIERS.length];
+  updateSettings(ctx.from.id, { gasTier: next });
+  await ctx.answerCbQuery(`Gas priority set to ${next}`);
+  await ctx.editMessageText('⚙️ *Settings*', { parse_mode: 'Markdown', ...settingsMenu(ctx.from.id) });
+});
+
+bot.action('settings_lowbalance', async (ctx) => {
+  await ctx.answerCbQuery();
+  pending.set(ctx.from.id, { type: 'settings_lowbalance' });
+  await ctx.editMessageText(
+    'Send the ETH balance threshold to alert on, e.g. `0.01`. Send `0` to disable low-balance alerts.',
+    { parse_mode: 'Markdown' }
+  );
 });
 
 bot.action('settings_toggle_confirm', async (ctx) => {
@@ -1057,7 +1188,8 @@ bot.action(/^buy_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
     return ctx.editMessageText(`❌ ${ethAmount} ETH exceeds your max buy size (${maxBuyEth} ETH).`, mainMenu());
   }
   if (confirmTrades) {
-    await ctx.editMessageText(`Confirm: buy *${ethAmountStr} ETH* worth of this token?`, {
+    const gasLine = await gasEstimateLine(uid, FALLBACK_GAS_LIMIT_BUY);
+    await ctx.editMessageText(`Confirm: buy *${ethAmountStr} ETH* worth of this token?${gasLine}`, {
       parse_mode: 'Markdown',
       ...confirmMenu('buy', tokenAddress, ethAmountStr),
     });
@@ -1075,7 +1207,8 @@ bot.action(/^sell_(0x[a-fA-F0-9]{40})_(\d+)$/, async (ctx) => {
   const uid = ctx.from.id;
   const { confirmTrades } = getSettings(uid);
   if (confirmTrades) {
-    await ctx.editMessageText(`Confirm: sell *${pctStr}%* of your position?`, {
+    const gasLine = await gasEstimateLine(uid, FALLBACK_GAS_LIMIT_SELL);
+    await ctx.editMessageText(`Confirm: sell *${pctStr}%* of your position?${gasLine}`, {
       parse_mode: 'Markdown',
       ...confirmMenu('sell', tokenAddress, pctStr),
     });
@@ -1234,6 +1367,19 @@ bot.on('text', async (ctx) => {
       return;
     }
 
+    if (state.type === 'settings_lowbalance') {
+      const amt = parseFloat(text);
+      if (isNaN(amt) || amt < 0) return ctx.reply('Send a valid non-negative ETH amount, e.g. `0.01`, or `0` to disable.');
+      updateSettings(uid, { lowBalanceThresholdEth: amt });
+      lowBalanceWarned.delete(String(uid)); // threshold changed — allow a fresh check against the new value
+      pending.delete(uid);
+      await ctx.reply(
+        amt === 0 ? '✅ Low balance alerts disabled.' : `✅ Low balance alert threshold set to ${amt} ETH`,
+        mainMenu()
+      );
+      return;
+    }
+
     if (state.type === 'custom_buy') {
       // Accepts either a plain ETH figure ("0.03") or a USD figure ("$100"),
       // same parser used by the bridge amount flow.
@@ -1260,7 +1406,8 @@ bot.on('text', async (ctx) => {
       const { confirmTrades } = getSettings(uid);
       const label = usdInput !== null ? `≈ ${val} ETH (${fmtUsd(usdInput)})` : `${val} ETH`;
       if (confirmTrades) {
-        await ctx.reply(`Confirm: buy *${label}*?`, {
+        const gasLine = await gasEstimateLine(uid, FALLBACK_GAS_LIMIT_BUY);
+        await ctx.reply(`Confirm: buy *${label}*?${gasLine}`, {
           parse_mode: 'Markdown',
           ...confirmMenu('buy', state.tokenAddress, val),
         });
@@ -1278,7 +1425,8 @@ bot.on('text', async (ctx) => {
 
       const { confirmTrades } = getSettings(uid);
       if (confirmTrades) {
-        await ctx.reply(`Confirm: sell *${val}%*?`, {
+        const gasLine = await gasEstimateLine(uid, FALLBACK_GAS_LIMIT_SELL);
+        await ctx.reply(`Confirm: sell *${val}%*?${gasLine}`, {
           parse_mode: 'Markdown',
           ...confirmMenu('sell', state.tokenAddress, val),
         });
@@ -1327,11 +1475,22 @@ bot.on('text', async (ctx) => {
         ? `Send: ≈ ${amt.toFixed(6)} ETH (${fmtUsd(usdInput)})`
         : `Send: ${amt} ETH`;
 
+      // Gas estimate uses the real quote's gas limit (LI.FI supplies one) on
+      // the actual source-chain provider, so this is more precise than the
+      // fallback-based estimate used for buy/sell.
+      const { fromChain } = chainIdsForDirection(state.direction);
+      const sourceProviderForEstimate = fromChain === ETH_CHAIN_ID ? ethMainnetProvider : provider;
+      const gasEth = await estimateBridgeGasEth(sourceProviderForEstimate, quote, gasMultiplierFor(uid)).catch(() => null);
+      const ethUsdForGas = await getEthUsdPrice().catch(() => null);
+      const gasLine = gasEth !== null
+        ? `\nEst. gas: ~${gasEth.toFixed(5)} ETH${ethUsdForGas !== null ? ` (${fmtUsd(gasEth * ethUsdForGas)})` : ''}`
+        : '';
+
       await ctx.reply(
         `🌉 *${directionLabel(state.direction)}*\n\n` +
         `${sendLine}\n` +
         `Receive (est.): ${Number(quote.toAmountFormatted).toFixed(4)} ETH\n` +
-        `Fees (est.): ${fmtUsd(quote.feesUsd)}\n` +
+        `Fees (est.): ${fmtUsd(quote.feesUsd)}${gasLine}\n` +
         `Via: ${quote.tool || 'best available route'}\n` +
         `ETA: ~${quote.estimatedDurationSeconds ? Math.ceil(quote.estimatedDurationSeconds / 60) + ' min' : 'a few minutes'}\n\n` +
         `Confirm?`,
@@ -1447,6 +1606,50 @@ function startBridgePoller() {
   }, BRIDGE_POLL_INTERVAL_MS);
 }
 
+// Periodically checks every user's active wallet ETH balance and DMs a
+// one-time warning when it drops below their configured threshold (default
+// 0.01 ETH, 0 = disabled). Re-arms once the balance recovers above the
+// threshold, so a user can be warned again on a future dip. Runs on active
+// wallets only (getAllActiveWallets), not every wallet ever created, to keep
+// this cheap as the user base grows.
+function startLowBalancePoller() {
+  setInterval(async () => {
+    let wallets;
+    try {
+      wallets = getAllActiveWallets();
+    } catch (err) {
+      console.error('Low-balance poller: failed to read active wallets:', err.message);
+      return;
+    }
+
+    for (const w of wallets) {
+      try {
+        const { lowBalanceThresholdEth } = getSettings(w.uid);
+        if (!lowBalanceThresholdEth || lowBalanceThresholdEth <= 0) continue;
+
+        const bal = await provider.getBalance(w.address).then((b) => Number(ethers.formatEther(b)));
+        const key = String(w.uid);
+
+        if (bal < lowBalanceThresholdEth) {
+          if (!lowBalanceWarned.has(key)) {
+            lowBalanceWarned.add(key);
+            await bot.telegram.sendMessage(
+              w.uid,
+              `⚠️ Low balance: *${w.name}* has ${bal.toFixed(4)} ETH, below your alert threshold of ${lowBalanceThresholdEth} ETH.\n` +
+              `Add funds to keep trading smoothly. Adjust this threshold anytime in ⚙️ Settings.`,
+              { parse_mode: 'Markdown' }
+            ).catch((err) => console.error(`Failed to send low-balance alert to uid ${w.uid}:`, err.message));
+          }
+        } else {
+          lowBalanceWarned.delete(key); // recovered — allow a future re-alert if it drops again
+        }
+      } catch (err) {
+        console.error(`Low-balance poller: check failed for uid ${w.uid}:`, err.message);
+      }
+    }
+  }, LOW_BALANCE_POLL_INTERVAL_MS);
+}
+
 // Surface crashes to the admin instead of the process dying with no record anywhere.
 process.on('unhandledRejection', (err) => {
   console.error('Unhandled rejection:', err);
@@ -1464,6 +1667,7 @@ bot.launch()
   .then(checkStuckTrades)
   .then(checkStuckBridges)
   .then(startBridgePoller)
+  .then(startLowBalancePoller)
   .then(() => sendAdminAlert(bot.telegram, '✅ Bot started.'))
   .catch((err) => {
     console.error('Failed to launch bot:', err);
