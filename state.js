@@ -14,3 +14,25 @@ export function gasMultiplierFor(uid) {
   const { gasTier } = getSettings(uid);
   return GAS_TIER_MULTIPLIERS[gasTier] ?? 1;
 }
+
+// ---------- Token card auto-refresh ----------
+// uid -> setInterval handle for the token card currently being kept live.
+// Only one auto-refresh runs per user at a time — starting a new one (via
+// scheduleCardAutoRefresh) clears whatever was running before, so an old
+// card doesn't keep getting edited in the background after the user has
+// moved on to a different token or menu.
+export const autoRefreshTimers = new Map();
+
+export function stopAutoRefresh(uid) {
+  uid = String(uid);
+  const timer = autoRefreshTimers.get(uid);
+  if (timer) {
+    clearInterval(timer);
+    autoRefreshTimers.delete(uid);
+  }
+}
+
+export function stopAllAutoRefreshes() {
+  for (const timer of autoRefreshTimers.values()) clearInterval(timer);
+  autoRefreshTimers.clear();
+}
