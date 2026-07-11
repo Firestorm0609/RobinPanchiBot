@@ -2,7 +2,7 @@ import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import { ethers } from 'ethers';
 import { getQuote, buildSwapTx, sendSwapWithGasBump } from './swap.js';
-import { ensureAllowance, getDecimals } from './erc20.js';
+import { ensureAllowance, getDecimals, getTokenBalance, transferToken } from './erc20.js';
 import { createWallet, importWallet, shortAddr } from './wallet.js';
 import { getEthUsdPrice, getTokenMarketData, fmtUsd } from './price.js';
 import {
@@ -138,6 +138,8 @@ const HELP_TEXT =
   'Tap 📦 Batch Sell on a token to sell the same percentage across every wallet that holds a position in it.\n\n' +
   '*Batch Fund*\n' +
   'Open 💼 Wallets → 📤 Batch Fund to send ETH from your best-funded wallet to your other wallets in one go, split evenly. If you only have one wallet, it can create new wallets for you and fund each one.\n\n' +
+  '*Batch Collect*\n' +
+  'Open 💼 Wallets → 📥 Batch Collect to sweep ETH (Robinhood Chain) plus every token you hold from a set of wallets into a single wallet you choose — handy for consolidating before a withdrawal.\n\n' +
   '*Still stuck?*\n' +
   'Contact support: panchi.eth@gmail.com';
 
@@ -163,7 +165,7 @@ bot.telegram.getMe()
 const pending = new Map(); // uid -> { type, ...context }
 const tradesInFlight = new Set();
 const bridgesInFlight = new Set();
-const fundsInFlight = new Set(); // uid -> locked while a batch-fund distribution is executing
+const fundsInFlight = new Set(); // uid -> locked while a batch-fund/collect distribution is executing
 const CA_REGEX = /^0x[a-fA-F0-9]{40}$/;
 const QUOTE_STALE_MS = 15_000;
 const BRIDGE_POLL_INTERVAL_MS = 30_000;
@@ -206,17 +208,24 @@ function referralLink(code) {
   return `https://t.me/${BOT_USERNAME || 'your_bot'}?start=ref_${code}`;
 }
 
-async function balanceLines(address) {
-  const bal = await provider.getBalance(address);
-  const ethAmount = Number(ethers.formatEther(bal));
-  let usdLine = '';
-  try {
-    const ethUsd = await getEthUsdPrice();
-    usdLine = ` (${fmtUsd(ethAmount * ethUsd)})`;
-  } catch {
-    // price feed hiccup, still show ETH
-  }
-  return `${fmtEth(ethAmount)} ETH${usdLine}`;
+/**
+ * Shows BOTH chains explicitly — "Robinhood ETH" and "Ethereum ETH" — never
+ * a bare "ETH" that leaves it ambiguous which chain it's on. A zero balance
+ * is shown as "0.0000", not hidden; only an actual RPC failure shows
+ * "unavailable".
+ */
+async function dualEthBalanceLines(address) {
+  const ethUsd = await getEthUsdPrice().catch(() => null);
+  const [robinhood, mainnet] = await Promise.all([
+    provider.getBalance(address).then((b) => Number(ethers.formatEther(b))).catch(() => null),
+    ethMainnetProvider.getBalance(address).then((b) => Number(ethers.formatEther(b))).catch(() => null),
+  ]);
+  const line = (label, amt) => {
+    if (amt === null) return `${label} ETH: unavailable`;
+    const usd = ethUsd !== null ? ` (${fmtUsd(amt * ethUsd)})` : '';
+    return `${label} ETH: ${fmtEth(amt)}${usd}`;
+  };
+  return `${line('Robinhood', robinhood)}\n${line('Ethereum', mainnet)}`;
 }
 
 async function getBridgeBalances(address) {
@@ -343,6 +352,7 @@ function walletsMenu(uid) {
     Markup.button.callback('📥 Import', 'wallet_import'),
   ]);
   rows.push([Markup.button.callback('📤 Batch Fund', 'batchfund_start')]);
+  rows.push([Markup.button.callback('📥 Batch Collect', 'collect_start')]);
   rows.push([Markup.button.callback('⬅️ Back', 'menu_main')]);
   return Markup.inlineKeyboard(rows);
 }
@@ -476,6 +486,19 @@ function batchFundSelectMenu(candidates, selected) {
   return Markup.inlineKeyboard(rows);
 }
 
+/** Multi-select wallet picker used by Batch Collect — sources feeding one chosen destination. */
+function collectSelectMenu(candidates, selected) {
+  const rows = candidates.map((w) => {
+    const checked = selected.includes(w.id) ? '☑️ ' : '⬜ ';
+    return [Markup.button.callback(`${checked}${w.name} (${shortAddr(w.address)})`, `collecttoggle_${w.id}`)];
+  });
+  rows.push([
+    Markup.button.callback(`✅ Confirm (${selected.length} selected)`, 'collectconfirm'),
+    Markup.button.callback('❌ Cancel', 'menu_main'),
+  ]);
+  return Markup.inlineKeyboard(rows);
+}
+
 // ---------- Token info + PnL rendering ----------
 
 async function renderTokenCard(uid, tokenAddress) {
@@ -515,14 +538,14 @@ async function renderTokenCard(uid, tokenAddress) {
   }
 
   const changeLine = market.priceChange24h !== null ? ` (${market.priceChange24h >= 0 ? '+' : ''}${market.priceChange24h.toFixed(1)}%)` : '';
-  const walletBalance = await balanceLines(w.address).catch(() => 'unavailable');
+  const walletBalance = await dualEthBalanceLines(w.address).catch(() => 'unavailable');
 
   const text =
     `*${market.symbol}*\n\`${tokenAddress}\`\n\n` +
     `Price: $${market.priceUsd.toPrecision(4)}${changeLine}\n` +
     `Market Cap: ${fmtUsd(market.marketCap)}\n` +
     `Liquidity: ${fmtUsd(market.liquidityUsd)}\n` +
-    `Your balance: ${walletBalance}` +
+    `Your balance:\n${walletBalance}` +
     pnlLine;
 
   return { text, markup: tokenMenu(uid, tokenAddress, !!(pos && pos.tokenAmount > 0)) };
@@ -707,9 +730,9 @@ async function performSellCore(uid, wallet, tokenAddress, pct) {
   }
 }
 
-// ---------- Headless native ETH transfer (used by Batch Fund) ----------
+// ---------- Headless native ETH transfer (used by Batch Fund / Batch Collect) ----------
 // Same stuck-tx protection shape as swap.js/bridge.js: resubmit with bumped
-// fees if the network is too slow, so a batch fund run can't hang forever.
+// fees if the network is too slow, so a batch run can't hang forever.
 
 async function performTransferCore(uid, sourceWallet, toAddress, amountEth, gasMultiplier, { timeoutMs = 45_000, bumpPct = 20, maxAttempts = 4 } = {}) {
   try {
@@ -753,14 +776,9 @@ async function performTransferCore(uid, sourceWallet, toAddress, amountEth, gasM
 }
 
 /**
- * Sends `amountEth` from `sourceWallet` to each wallet in `targets`
- * (sequentially, to avoid nonce collisions), returning a per-target result.
- */
-/**
  * Estimated ETH to reserve for gas across `count` sequential native transfers,
  * so a batch fund run doesn't spend the whole source balance on principal and
- * leave nothing for the transactions themselves (which would fail the later
- * transfers in the loop after gas was already burned on earlier ones).
+ * leave nothing for the transactions themselves.
  */
 async function estimateTransferGasReserve(uid, count) {
   try {
@@ -782,6 +800,49 @@ async function distributeEth(uid, sourceWallet, targets, amountEth) {
     const result = await performTransferCore(uid, sourceWallet, target.address, amountEth, gasMultiplier);
     results.push({ ...result, walletName: target.name });
   }
+  return results;
+}
+
+// ---------- Headless collect: sweep ETH + every tracked token from one wallet ----------
+// Used by Batch Collect. Tokens are sent first (each its own tx, gas paid out
+// of the wallet's native balance), then whatever native ETH remains is swept
+// last, minus a gas reserve for that final transfer.
+
+async function performCollectCore(uid, sourceWallet, destAddress, gasMultiplier) {
+  const results = [];
+  const signer = new ethers.Wallet(sourceWallet.privateKey, provider);
+
+  const positions = getAllPositions(uid, sourceWallet.id);
+  for (const pos of positions) {
+    try {
+      const onChainBalance = await getTokenBalance(provider, pos.tokenAddress, sourceWallet.address);
+      if (onChainBalance <= 0n) continue;
+      const receipt = await transferToken(signer, pos.tokenAddress, destAddress, onChainBalance);
+      results.push({ ok: true, label: shortAddr(pos.tokenAddress), txHash: receipt.hash });
+    } catch (err) {
+      results.push({ ok: false, label: shortAddr(pos.tokenAddress), error: friendlyErrorMessage(err) });
+    }
+  }
+
+  try {
+    const balance = await provider.getBalance(sourceWallet.address);
+    const feeData = await provider.getFeeData();
+    const baseFee = feeData.maxFeePerGas ?? ethers.parseUnits('30', 'gwei');
+    const maxFeePerGas = (baseFee * BigInt(Math.round(gasMultiplier * 1000))) / 1000n;
+    const gasReserve = FALLBACK_GAS_LIMIT_TRANSFER * maxFeePerGas;
+    const sendable = balance - gasReserve;
+
+    if (sendable > 0n) {
+      const amountEth = Number(ethers.formatEther(sendable));
+      const result = await performTransferCore(uid, sourceWallet, destAddress, amountEth, gasMultiplier);
+      results.push(result.ok
+        ? { ok: true, label: 'Robinhood ETH', txHash: result.txHash }
+        : { ok: false, label: 'Robinhood ETH', error: result.error });
+    }
+  } catch (err) {
+    results.push({ ok: false, label: 'Robinhood ETH', error: friendlyErrorMessage(err) });
+  }
+
   return results;
 }
 
@@ -1025,8 +1086,8 @@ bot.action(/^wallet_(?!create|import|activate|rename|remove|export)(.+)$/, async
   await ctx.answerCbQuery();
   const w = getWallet(ctx.from.id, ctx.match[1]);
   if (!w) return ctx.editMessageText('Wallet not found.', walletsMenu(ctx.from.id));
-  const bal = await balanceLines(w.address).catch(() => 'unavailable');
-  await ctx.editMessageText(`*${w.name}*\n\`${w.address}\`\n\nBalance: ${bal}`, {
+  const bal = await dualEthBalanceLines(w.address).catch(() => 'unavailable');
+  await ctx.editMessageText(`*${w.name}*\n\`${w.address}\`\n\nBalance:\n${bal}`, {
     parse_mode: 'Markdown',
     ...walletDetailMenu(w.id),
   });
@@ -1533,14 +1594,110 @@ bot.action('bfundconfirm', async (ctx) => {
   );
 });
 
+// ---------- Batch Collect ----------
+// Inverse of Batch Fund: choose ONE destination wallet, then choose which of
+// your other wallets to sweep FROM. Every source wallet has its native ETH
+// (Robinhood Chain) AND every token it holds a tracked position in sent to
+// the destination wallet.
+
+bot.action('collect_start', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  const user = getUser(uid);
+  if (user.wallets.length < 2) return ctx.editMessageText('You need at least 2 wallets to use Batch Collect.', walletsMenu(uid));
+
+  pending.set(uid, { type: 'collect_select_dest' });
+  const rows = user.wallets.map((w) => [Markup.button.callback(`${w.name} (${shortAddr(w.address)})`, `collectdest_${w.id}`)]);
+  rows.push([Markup.button.callback('❌ Cancel', 'menu_wallets')]);
+  await ctx.editMessageText(
+    '📥 *Batch Collect*\n\nChoose the destination wallet — ETH and all tokens from your other wallets will be swept here:',
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(rows) }
+  );
+});
+
+bot.action(/^collectdest_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  const dest = getWallet(uid, ctx.match[1]);
+  if (!dest) return ctx.editMessageText('Wallet not found.', walletsMenu(uid));
+
+  const user = getUser(uid);
+  const candidates = user.wallets.filter((w) => w.id !== dest.id);
+  const allIds = candidates.map((w) => w.id);
+  pending.set(uid, { type: 'collect_select_sources', destWalletId: dest.id, destName: dest.name, destAddress: dest.address, candidates, selected: allIds });
+
+  await ctx.editMessageText(
+    `📥 *Batch Collect* → *${dest.name}*\n\nSelect source wallets to sweep from (all selected by default):`,
+    { parse_mode: 'Markdown', ...collectSelectMenu(candidates, allIds) }
+  );
+});
+
+bot.action(/^collecttoggle_(.+)$/, async (ctx) => {
+  const uid = ctx.from.id;
+  const state = pending.get(uid);
+  if (!state || state.type !== 'collect_select_sources') return ctx.answerCbQuery();
+  await ctx.answerCbQuery();
+  const walletId = ctx.match[1];
+  const idx = state.selected.indexOf(walletId);
+  if (idx >= 0) state.selected.splice(idx, 1); else state.selected.push(walletId);
+  pending.set(uid, state);
+  await ctx.editMessageText(
+    `📥 *Batch Collect* → *${state.destName}*\n\nSelect source wallets to sweep from:`,
+    { parse_mode: 'Markdown', ...collectSelectMenu(state.candidates, state.selected) }
+  ).catch(() => {});
+});
+
+bot.action('collectconfirm', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  const state = pending.get(uid);
+  if (!state || state.type !== 'collect_select_sources') return;
+  if (state.selected.length === 0) return ctx.reply('No wallets selected — tap wallets to select, then Confirm.');
+  if (fundsInFlight.has(uid)) return ctx.reply('⏳ A batch fund/collect run is already in progress — please wait for it to finish.');
+  if (isRateLimited(uid)) return ctx.reply('⏳ Slow down a bit — too many actions in the last minute.');
+
+  const dest = getWallet(uid, state.destWalletId);
+  if (!dest) { pending.delete(uid); return ctx.reply('Destination wallet not found.', walletsMenu(uid)); }
+  const sources = state.candidates.filter((w) => state.selected.includes(w.id));
+
+  fundsInFlight.add(uid);
+  pending.delete(uid);
+  await ctx.editMessageText(`Sweeping ETH + tokens from ${sources.length} wallet(s) into *${dest.name}*... this may take a moment.`, { parse_mode: 'Markdown' });
+
+  try {
+    const gasMultiplier = gasMultiplierFor(uid);
+    const lines = [];
+    for (const src of sources) {
+      const wallet = getWallet(uid, src.id);
+      if (!wallet) { lines.push(`*${src.name}*: ❌ wallet not found`); continue; }
+      const results = await performCollectCore(uid, wallet, dest.address, gasMultiplier);
+      lines.push(`*${wallet.name}*:`);
+      if (results.length === 0) {
+        lines.push('  nothing to collect');
+      } else {
+        for (const r of results) {
+          lines.push(r.ok ? `  ✅ ${r.label}: sent (tx \`${r.txHash.slice(0, 12)}...\`)` : `  ❌ ${r.label}: ${r.error}`);
+        }
+      }
+    }
+    await ctx.reply(`📥 *Batch Collect Results* → ${dest.name}\n\n${lines.join('\n')}`, { parse_mode: 'Markdown', ...mainMenu() });
+  } catch (err) {
+    console.error(err);
+    await ctx.reply(`❌ Batch collect failed: ${friendlyErrorMessage(err)}`, mainMenu());
+    await sendAdminAlert(ctx.telegram, `Batch collect failed for user ${uid}: ${err.message}`);
+  } finally {
+    fundsInFlight.delete(uid);
+  }
+});
+
 // ---------- Balance ----------
 
 bot.action('menu_balance', async (ctx) => {
   await ctx.answerCbQuery();
   const w = getActiveWallet(ctx.from.id);
   if (!w) return ctx.editMessageText('No active wallet. Add one first.', walletsMenu(ctx.from.id));
-  const bal = await balanceLines(w.address);
-  await ctx.editMessageText(`💰 *${w.name}*\n\`${w.address}\`\n\nBalance: ${bal}`, {
+  const bal = await dualEthBalanceLines(w.address);
+  await ctx.editMessageText(`💰 *${w.name}*\n\`${w.address}\`\n\nBalance:\n${bal}`, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_main')]]),
   });
