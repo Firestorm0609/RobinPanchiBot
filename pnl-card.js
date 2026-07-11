@@ -1,7 +1,7 @@
 import sharp from 'sharp';
 import path from 'path';
 import crypto from 'crypto';
-import { getActiveWallet, getPosition, getRealizedPnl } from './storage.js';
+import { getActiveWallet, getPosition, getRealizedPnl, getSettings } from './storage.js';
 import { getTokenMarketData, getEthUsdPrice, fmtUsd, fmtTokenAmount } from './price.js';
 import { shortAddr } from './wallet.js';
 
@@ -9,21 +9,34 @@ const NFT_DIR = path.join(process.cwd(), 'assets', 'nft-cards');
 const NFT_COUNT = 100;
 const CARD_SIZE = 800;
 
-/** Deterministic pick so the same user always gets the same NFT on their cards. */
-function pickNftIndex(uid) {
-  const hash = crypto.createHash('md5').update(String(uid)).digest();
-  const n = hash.readUInt32BE(0);
-  return (n % NFT_COUNT) + 1;
+/** Random NFT pick per card generation (was deterministic per-uid before — that's why it always showed #70). */
+function pickNftIndex() {
+  return (crypto.randomBytes(4).readUInt32BE(0) % NFT_COUNT) + 1;
 }
 
 function escapeXml(str) {
   return String(str).replace(/[<>&'"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' }[c]));
 }
 
+/**
+ * Builds the PnL label string according to the user's flexPnlMode setting.
+ * mode: 'eth' | 'usd' | 'hidden'
+ * Returns null if the mode is 'hidden' or the required figure isn't available.
+ */
+function formatPnlLabel(mode, { pnlEth, pnlUsd }) {
+  if (mode === 'hidden') return null;
+  if (mode === 'usd') {
+    if (pnlUsd == null) return null;
+    const sign = pnlUsd >= 0 ? '+' : '-';
+    return `${sign}${fmtUsd(Math.abs(pnlUsd))}`;
+  }
+  // default: 'eth'
+  if (pnlEth == null) return null;
+  return `${pnlEth >= 0 ? '+' : ''}${pnlEth.toFixed(3)} ETH`;
+}
+
 function buildOverlaySvg({ symbol, subtitle, pnlLabel, isWin, stats, nftLabel, footerLeft, footerRight }) {
-  const pillBg = isWin ? 'rgba(99,153,34,0.9)' : 'rgba(163,45,45,0.9)';
-  const pillText = isWin ? '#173404' : '#ffffff';
-  const pillWidth = Math.max(130, 26 + pnlLabel.length * 14);
+  const pnlColor = isWin ? '#97C459' : '#E24B4A';
 
   const colWidth = (CARD_SIZE - 64) / stats.length;
   const statCols = stats.map((s, i) => {
@@ -32,6 +45,10 @@ function buildOverlaySvg({ symbol, subtitle, pnlLabel, isWin, stats, nftLabel, f
     <text x="${x}" y="${CARD_SIZE - 118}" font-family="Arial, sans-serif" font-size="20" fill="#888780">${escapeXml(s.label)}</text>
     <text x="${x}" y="${CARD_SIZE - 88}" font-family="Arial, sans-serif" font-size="29" font-weight="bold" fill="${s.color || '#ffffff'}">${escapeXml(s.value)}</text>`;
   }).join('');
+
+  const pnlText = pnlLabel
+    ? `<text x="${CARD_SIZE - 32}" y="53" font-family="Arial, sans-serif" font-size="24" font-weight="bold" fill="${pnlColor}" text-anchor="end">${escapeXml(pnlLabel)}</text>`
+    : '';
 
   return `
   <svg width="${CARD_SIZE}" height="${CARD_SIZE}" xmlns="http://www.w3.org/2000/svg">
@@ -44,11 +61,8 @@ function buildOverlaySvg({ symbol, subtitle, pnlLabel, isWin, stats, nftLabel, f
     </defs>
     <rect width="${CARD_SIZE}" height="${CARD_SIZE}" fill="url(#fade)"/>
 
-    <rect x="28" y="28" rx="20" ry="20" width="220" height="38" fill="rgba(0,0,0,0.5)"/>
-    <text x="46" y="53" font-family="Arial, sans-serif" font-size="21" font-weight="bold" fill="#ffffff">${escapeXml(nftLabel)}</text>
-
-    <rect x="${CARD_SIZE - pillWidth - 30}" y="28" rx="20" ry="20" width="${pillWidth}" height="38" fill="${pillBg}"/>
-    <text x="${CARD_SIZE - 30 - pillWidth / 2}" y="53" font-family="Arial, sans-serif" font-size="19" font-weight="bold" fill="${pillText}" text-anchor="middle">${escapeXml(pnlLabel)}</text>
+    <text x="32" y="53" font-family="Arial, sans-serif" font-size="21" font-weight="bold" fill="#ffffff">${escapeXml(nftLabel)}</text>
+    ${pnlText}
 
     <text x="32" y="${CARD_SIZE - 190}" font-family="Arial, sans-serif" font-size="44" font-weight="bold" fill="#ffffff">${escapeXml(symbol)}</text>
     <text x="32" y="${CARD_SIZE - 158}" font-family="Arial, sans-serif" font-size="22" fill="#B4B2A9">${escapeXml(subtitle)}</text>
@@ -62,11 +76,11 @@ function buildOverlaySvg({ symbol, subtitle, pnlLabel, isWin, stats, nftLabel, f
 }
 
 /**
- * Composites the overlay onto a deterministically-picked NFT background.
+ * Composites the overlay onto a randomly-picked NFT background.
  * `stats` is up to 3 { label, value, color? } columns shown along the bottom.
  */
-async function renderCard({ uid, symbol, subtitle, pnlLabel, isWin, stats }) {
-  const idx = pickNftIndex(uid);
+async function renderCard({ symbol, subtitle, pnlLabel, isWin, stats }) {
+  const idx = pickNftIndex();
   const imgPath = path.join(NFT_DIR, `${idx}.jpg`);
   const nftLabel = `Panchi #${idx}`;
 
@@ -86,25 +100,28 @@ async function renderCard({ uid, symbol, subtitle, pnlLabel, isWin, stats }) {
 /**
  * Realized-PnL card for a completed sell. Pass everything already computed
  * by the caller (trade-core.js) — this module doesn't re-fetch trade data.
+ * Respects the user's flexPnlMode setting: 'eth' | 'usd' | 'hidden'.
  */
 export async function generateSellPnlCard({ uid, symbol, pct, pnlEth, pnlPct, entryMcap, exitMcap }) {
+  const { flexPnlMode } = getSettings(uid);
   const isWin = pnlEth >= 0;
-  const pnlLabel = `${pnlEth >= 0 ? '+' : ''}${pnlEth.toFixed(3)} ETH`;
+
+  let pnlUsd = null;
+  if (flexPnlMode === 'usd') {
+    const ethUsd = await getEthUsdPrice().catch(() => null);
+    if (ethUsd != null) pnlUsd = pnlEth * ethUsd;
+  }
+  const pnlLabel = formatPnlLabel(flexPnlMode, { pnlEth, pnlUsd });
 
   const stats = [
     { label: 'Entry mcap', value: entryMcap != null ? fmtUsd(entryMcap) : 'n/a' },
     { label: 'Exit mcap', value: exitMcap != null ? fmtUsd(exitMcap) : 'n/a' },
-    { label: 'PnL', value: `${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`, color: isWin ? '#97C459' : '#E24B4A' },
   ];
+  if (flexPnlMode !== 'hidden') {
+    stats.push({ label: 'PnL', value: `${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`, color: isWin ? '#97C459' : '#E24B4A' });
+  }
 
-  return renderCard({
-    uid,
-    symbol,
-    subtitle: `Sold ${pct}% of position`,
-    pnlLabel,
-    isWin,
-    stats,
-  });
+  return renderCard({ symbol, subtitle: `Sold ${pct}% of position`, pnlLabel, isWin, stats });
 }
 
 /**
@@ -117,21 +134,25 @@ async function generateOpenPositionFlexCard(uid, wallet, tokenAddress, pos) {
   const ethUsd = await getEthUsdPrice().catch(() => null);
   if (!market || !ethUsd) return null;
 
+  const { flexPnlMode } = getSettings(uid);
+
   const valueUsd = pos.tokenAmount * market.priceUsd;
   const costUsd = pos.costEth * ethUsd;
   const pnlUsd = valueUsd - costUsd;
+  const pnlEth = pnlUsd / ethUsd;
   const pnlPct = costUsd > 0 ? (pnlUsd / costUsd) * 100 : 0;
   const isWin = pnlUsd >= 0;
-  const pnlLabel = `${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`;
+  const pnlLabel = formatPnlLabel(flexPnlMode, { pnlEth, pnlUsd });
 
   const stats = [
     { label: 'Holding', value: fmtTokenAmount(pos.tokenAmount) },
     { label: 'Value', value: fmtUsd(valueUsd) },
-    { label: 'PnL', value: `${pnlUsd >= 0 ? '+' : ''}${fmtUsd(pnlUsd)}`, color: isWin ? '#97C459' : '#E24B4A' },
   ];
+  if (flexPnlMode !== 'hidden') {
+    stats.push({ label: 'PnL', value: `${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`, color: isWin ? '#97C459' : '#E24B4A' });
+  }
 
   return renderCard({
-    uid,
     symbol: market.symbol,
     subtitle: pos.entryMcap != null ? `Entry mcap ${fmtUsd(pos.entryMcap)}` : 'Open position',
     pnlLabel,
@@ -143,17 +164,25 @@ async function generateOpenPositionFlexCard(uid, wallet, tokenAddress, pos) {
 /**
  * Realized-PnL "flex" card for a CLOSED position — position has no live
  * tokenAmount left, so this sums the wallet's full buy/sell history for the
- * token (via getRealizedPnl) and flexes total ETH profit/loss instead.
+ * token (via getRealizedPnl) and flexes total profit/loss instead.
  */
 async function generateClosedPositionFlexCard(uid, wallet, tokenAddress) {
   const realized = getRealizedPnl(uid, wallet.id, tokenAddress);
   if (!realized || realized.totalBuyEth <= 0) return null;
 
+  const { flexPnlMode } = getSettings(uid);
+
   const { totalBuyEth, totalSellEth, entryMcap, exitMcap } = realized;
   const pnlEth = totalSellEth - totalBuyEth;
   const pnlPct = (pnlEth / totalBuyEth) * 100;
   const isWin = pnlEth >= 0;
-  const pnlLabel = `${pnlEth >= 0 ? '+' : ''}${pnlEth.toFixed(3)} ETH`;
+
+  let pnlUsd = null;
+  if (flexPnlMode === 'usd') {
+    const ethUsd = await getEthUsdPrice().catch(() => null);
+    if (ethUsd != null) pnlUsd = pnlEth * ethUsd;
+  }
+  const pnlLabel = formatPnlLabel(flexPnlMode, { pnlEth, pnlUsd });
 
   const market = await getTokenMarketData(tokenAddress).catch(() => null);
   const symbol = market?.symbol ?? shortAddr(tokenAddress);
@@ -161,17 +190,12 @@ async function generateClosedPositionFlexCard(uid, wallet, tokenAddress) {
   const stats = [
     { label: 'Entry mcap', value: entryMcap != null ? fmtUsd(entryMcap) : 'n/a' },
     { label: 'Exit mcap', value: exitMcap != null ? fmtUsd(exitMcap) : 'n/a' },
-    { label: 'PnL', value: `${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`, color: isWin ? '#97C459' : '#E24B4A' },
   ];
+  if (flexPnlMode !== 'hidden') {
+    stats.push({ label: 'PnL', value: `${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`, color: isWin ? '#97C459' : '#E24B4A' });
+  }
 
-  return renderCard({
-    uid,
-    symbol,
-    subtitle: 'Closed position',
-    pnlLabel,
-    isWin,
-    stats,
-  });
+  return renderCard({ symbol, subtitle: 'Closed position', pnlLabel, isWin, stats });
 }
 
 /**
