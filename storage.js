@@ -105,6 +105,14 @@ const DEFAULT_SETTINGS = {
   confirmTrades: true,
   maxBuyEth: 1,
   maxBridgeEth: 1, // mirrors maxBuyEth's guard, applied to bridge amounts
+  // Gas priority tier used to scale maxFeePerGas/maxPriorityFeePerGas on
+  // every trade/bridge tx. See GAS_TIER_MULTIPLIERS in bot.js.
+  gasTier: 'normal', // 'slow' | 'normal' | 'fast'
+  // Auto-buy/auto-sell (take-profit / stop-loss). Off by default — must be
+  // explicitly enabled per user before any rule can fire.
+  autoTradeEnabled: false,
+  // DM once when active wallet ETH balance drops below this. Set to 0 to disable.
+  lowBalanceThresholdEth: 0.01,
 };
 
 function ensureUserRow(uid) {
@@ -180,6 +188,19 @@ export function getWallet(uid, walletId) {
   return walletRowToObj(row, true);
 }
 
+/**
+ * Every user's currently-active wallet (uid + address only, no decrypted key).
+ * Used by the low-balance poller in bot.js so it doesn't have to decrypt
+ * every wallet's private key just to read a balance.
+ */
+export function getAllActiveWallets() {
+  return db.prepare(`
+    SELECT u.uid AS uid, w.id AS wallet_id, w.name AS name, w.address AS address
+    FROM users u
+    JOIN wallets w ON w.id = u.active_wallet_id
+  `).all();
+}
+
 // ---------- Positions / PnL ----------
 // Simple running-average cost basis per (wallet, token).
 
@@ -228,6 +249,28 @@ export function getAllPositions(uid, walletId) {
   ).all(String(uid), walletId);
   return rows.map((row) => ({
     walletId: row.wallet_id,
+    tokenAddress: row.token_address,
+    tokenAmount: row.token_amount,
+    costEth: row.cost_eth,
+  }));
+}
+
+/**
+ * All open positions for a user across EVERY wallet they own (not just the
+ * active one) — used for the portfolio-wide PnL summary. Joins in wallet
+ * name so the caller can group/label by wallet without a second query.
+ */
+export function getAllPositionsForUser(uid) {
+  const rows = db.prepare(`
+    SELECT p.*, w.name AS wallet_name, w.address AS wallet_address
+    FROM positions p
+    JOIN wallets w ON w.id = p.wallet_id
+    WHERE p.uid = ? AND p.token_amount > 0
+  `).all(String(uid));
+  return rows.map((row) => ({
+    walletId: row.wallet_id,
+    walletName: row.wallet_name,
+    walletAddress: row.wallet_address,
     tokenAddress: row.token_address,
     tokenAmount: row.token_amount,
     costEth: row.cost_eth,
@@ -421,4 +464,4 @@ export function getTicketCount(uid) {
 export function hasBeenReferred(uid) {
   const row = db.prepare('SELECT 1 FROM referrals WHERE referred_uid = ?').get(String(uid));
   return !!row;
-}
+                                    }
