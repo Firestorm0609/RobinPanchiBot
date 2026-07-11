@@ -133,8 +133,23 @@ export async function executeSell(ctx, uid, tokenAddress, pct) {
 }
 
 // ---------- Headless trade execution (poller/batch-triggered, no ctx) ----------
+//
+// IMPORTANT: these share the SAME tradesInFlight lock as executeBuy/executeSell.
+// Without this, a TP/SL or limit-order poller firing at the same moment as a
+// manual trade (or two headless calls overlapping) can fetch the same nonce
+// via signer.getNonce() and cause one transaction to silently replace/drop
+// the other. Callers (pollers.js, bot.js batch handlers) should treat a
+// `{ ok: false, error: 'locked' }`-style result as "try again next cycle",
+// not as a permanent failure.
+
+const LOCKED_ERROR = 'Another trade is already in progress for this account — will retry.';
 
 export async function performBuyCore(uid, wallet, tokenAddress, ethAmount) {
+  if (tradesInFlight.has(uid)) {
+    return { ok: false, error: LOCKED_ERROR, locked: true, walletName: wallet.name };
+  }
+  tradesInFlight.add(uid);
+
   let pendingTradeId;
   try {
     const sellAmount = ethers.parseEther(ethAmount.toString()).toString();
@@ -160,10 +175,17 @@ export async function performBuyCore(uid, wallet, tokenAddress, ethAmount) {
   } catch (err) {
     if (pendingTradeId) markPendingTradeDone(pendingTradeId, 'failed');
     return { ok: false, error: friendlyErrorMessage(err), walletName: wallet.name };
+  } finally {
+    tradesInFlight.delete(uid);
   }
 }
 
 export async function performSellCore(uid, wallet, tokenAddress, pct) {
+  if (tradesInFlight.has(uid)) {
+    return { ok: false, error: LOCKED_ERROR, locked: true, walletName: wallet.name };
+  }
+  tradesInFlight.add(uid);
+
   let pendingTradeId;
   try {
     const pos = getPosition(uid, wallet.id, tokenAddress);
@@ -204,6 +226,8 @@ export async function performSellCore(uid, wallet, tokenAddress, pct) {
   } catch (err) {
     if (pendingTradeId) markPendingTradeDone(pendingTradeId, 'failed');
     return { ok: false, error: friendlyErrorMessage(err), walletName: wallet.name };
+  } finally {
+    tradesInFlight.delete(uid);
   }
 }
 
