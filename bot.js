@@ -62,9 +62,6 @@ import {
 } from './storage.js';
 
 // ---------- Startup env validation ----------
-// Fail fast and loudly instead of silently falling back to defaults that are
-// unsafe in production (e.g. a public RPC endpoint) or that quietly break a
-// feature (e.g. missing tx explorer links).
 const REQUIRED_ENV_VARS = [
   'TELEGRAM_BOT_TOKEN',
   'RPC_URL',
@@ -74,10 +71,6 @@ const REQUIRED_ENV_VARS = [
   'AFFILIATE_FEE_BPS',
   'MASTER_KEY',
 ];
-// Required specifically for the bridge feature to be safe/complete in production.
-// Bridging still works without these (via fallback), but ETH_RPC_URL's fallback
-// (a public endpoint) is not reliable enough for real trading volume, and
-// without EXPLORER_BASE_URL users get no tx link for Robinhood-side transactions.
 const REQUIRED_FOR_BRIDGE = ['ETH_RPC_URL', 'EXPLORER_BASE_URL'];
 
 function validateEnv() {
@@ -140,26 +133,23 @@ const HELP_TEXT =
   '*Limit orders*\n' +
   'Tap ⏰ Limit Buy or ⏰ Limit Sell on a token to queue a trade that fires automatically once the price crosses your target (checked roughly every 30s). Cancel anytime is not yet exposed in-chat — contact support if you need one removed early.\n\n' +
   '*Batch Buy*\n' +
-  'Tap 📦 Batch Buy on a token to buy the same ETH amount across multiple wallets in one go — useful for spreading a position.\n\n' +
+  'Tap 📦 Batch Buy on a token to buy the same ETH or USD amount across multiple wallets in one go — useful for spreading a position.\n\n' +
+  '*Batch Sell*\n' +
+  'Tap 📦 Batch Sell on a token to sell the same percentage across every wallet that holds a position in it.\n\n' +
+  '*Batch Fund*\n' +
+  'Open 💼 Wallets → 📤 Batch Fund to send ETH from your best-funded wallet to your other wallets in one go, split evenly. If you only have one wallet, it can create new wallets for you and fund each one.\n\n' +
   '*Still stuck?*\n' +
   'Contact support: panchi.eth@gmail.com';
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL, Number(process.env.CHAIN_ID));
 
-// USDG (Paxos-issued stablecoin) — the canonical stablecoin on Robinhood Chain,
-// per official docs: https://docs.robinhood.com/chain/contracts
-// Not the same as USDC/USDT — those have no contract on Robinhood Chain.
 const USDG_ROBINHOOD_ADDRESS = '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168';
 const ERC20_BALANCE_ABI = [
   'function balanceOf(address owner) view returns (uint256)',
   'function decimals() view returns (uint8)',
 ];
 
-// Hoisted once at startup (was previously re-created on every single bridge
-// call inside executeBridge, opening a fresh RPC connection per trade).
-// Used whenever the bridge's source chain is Ethereum mainnet, since RPC_URL
-// above points at Robinhood Chain.
 const ethMainnetProvider = new ethers.JsonRpcProvider(
   process.env.ETH_RPC_URL || 'https://cloudflare-eth.com',
   ETH_CHAIN_ID
@@ -171,34 +161,29 @@ bot.telegram.getMe()
   .catch((err) => console.error('Failed to fetch bot username:', err.message));
 
 const pending = new Map(); // uid -> { type, ...context }
-const tradesInFlight = new Set(); // uid -> locked while a trade is executing (double-tap guard)
-const bridgesInFlight = new Set(); // uid -> locked while a bridge tx is being submitted
+const tradesInFlight = new Set();
+const bridgesInFlight = new Set();
+const fundsInFlight = new Set(); // uid -> locked while a batch-fund distribution is executing
 const CA_REGEX = /^0x[a-fA-F0-9]{40}$/;
-const QUOTE_STALE_MS = 15_000; // re-quote if this much time passes before sending the tx
+const QUOTE_STALE_MS = 15_000;
 const BRIDGE_POLL_INTERVAL_MS = 30_000;
-const LOW_BALANCE_POLL_INTERVAL_MS = 5 * 60_000; // check every 5 min
-const AUTO_TRADE_POLL_INTERVAL_MS = 30_000; // TP/SL check cadence
-const LIMIT_ORDER_POLL_INTERVAL_MS = 30_000; // limit order price check cadence
+const LOW_BALANCE_POLL_INTERVAL_MS = 5 * 60_000;
+const AUTO_TRADE_POLL_INTERVAL_MS = 30_000;
+const LIMIT_ORDER_POLL_INTERVAL_MS = 30_000;
 
-// ---------- Gas priority tiers ----------
-// Multiplies the network's suggested maxFeePerGas/maxPriorityFeePerGas before
-// the tx is sent. Applied in swap.js/bridge.js via the gasMultiplier option,
-// and mirrored here (fallback-gas-limit based) for pre-confirm estimates.
+const MAX_BATCH_FUND_NEW_WALLETS = 20; // sane upper bound on wallets-created-in-one-go
+
 const GAS_TIERS = ['slow', 'normal', 'fast'];
 const GAS_TIER_MULTIPLIERS = { slow: 0.85, normal: 1, fast: 1.35 };
 const FALLBACK_GAS_LIMIT_BUY = 300_000n;
 const FALLBACK_GAS_LIMIT_SELL = 280_000n;
+const FALLBACK_GAS_LIMIT_TRANSFER = 21_000n; // plain native ETH transfer
 
 function gasMultiplierFor(uid) {
   const { gasTier } = getSettings(uid);
   return GAS_TIER_MULTIPLIERS[gasTier] ?? 1;
 }
 
-// ---------- Low-balance alert state ----------
-// In-memory "already warned" set, same pattern as ratelimit.js — resets on
-// restart, which is fine since this is a convenience nudge, not a security
-// boundary. Keyed by uid so a user is only DMed once per dip below threshold,
-// and can be re-warned after balance recovers and drops again.
 const lowBalanceWarned = new Set();
 
 // ---------- Formatting ----------
@@ -212,7 +197,6 @@ function explorerTxUrl(hash) {
   return base ? `${base}/tx/${hash}` : null;
 }
 
-// Mainnet ETH txs need etherscan; Robinhood Chain txs use the configured explorer.
 function explorerTxUrlForChain(hash, chainId) {
   if (chainId === ETH_CHAIN_ID) return `https://etherscan.io/tx/${hash}`;
   return explorerTxUrl(hash);
@@ -235,12 +219,6 @@ async function balanceLines(address) {
   return `${fmtEth(ethAmount)} ETH${usdLine}`;
 }
 
-/**
- * Fetches balances relevant to bridging, for display when the user opens the
- * Bridge menu: ETH on both Ethereum mainnet and Robinhood Chain, plus USDG
- * on Robinhood Chain (its canonical stablecoin — see USDG_ROBINHOOD_ADDRESS).
- * Each fetch is independently caught so one RPC hiccup doesn't blank the rest.
- */
 async function getBridgeBalances(address) {
   const [ethMainnet, ethRobinhood, usdgRobinhood] = await Promise.all([
     ethMainnetProvider.getBalance(address).then((b) => Number(ethers.formatEther(b))).catch(() => null),
@@ -260,13 +238,6 @@ function fmtBridgeBalanceLine(label, amount, ethUsd) {
   return `${label}: ${amount.toFixed(4)}${usdLine}`;
 }
 
-/**
- * Rough pre-confirm gas estimate for buy/sell, shown on the confirm screen
- * before the user commits. Uses a fixed fallback gas limit (not a real 0x
- * quote) so this is cheap — no extra API round-trip — at the cost of some
- * precision. The user's configured gas priority tier (Settings) is applied
- * so the number shown roughly matches what sendSwapWithGasBump will pay.
- */
 async function gasEstimateLine(uid, fallbackGasLimit) {
   try {
     const mult = gasMultiplierFor(uid);
@@ -277,15 +248,10 @@ async function gasEstimateLine(uid, fallbackGasLimit) {
     const ethUsd = await getEthUsdPrice().catch(() => null);
     return `\nEst. gas: ~${gasEth.toFixed(5)} ETH${ethUsd !== null ? ` (${fmtUsd(gasEth * ethUsd)})` : ''}`;
   } catch {
-    return ''; // fee data unavailable — skip the line rather than block the confirm screen
+    return '';
   }
 }
 
-/**
- * Translates a raw ethers/RPC/LI.FI error into a short, user-facing message.
- * Raw errors (especially from ethers v6) can be enormous JSON blobs — this
- * keeps DMs clean instead of dumping that at the user.
- */
 function friendlyErrorMessage(err) {
   const code = err?.code;
   const raw = `${err?.message || ''} ${err?.shortMessage || ''} ${err?.reason || ''}`.toLowerCase();
@@ -311,25 +277,15 @@ function friendlyErrorMessage(err) {
   if (code === 'CALL_EXCEPTION' || raw.includes('execution reverted')) {
     return 'The transaction was rejected by the network. This can happen with low-liquidity tokens or expired quotes — try again.';
   }
-  // Fallback: keep it short even for unrecognized errors, no raw payloads.
   const short = (err?.shortMessage || err?.message || 'Unknown error').slice(0, 140);
   return short;
 }
 
-/** Re-fetches the quote if too much time has passed since it was first obtained. */
 async function getFreshQuote(quoteParams, quote, fetchedAt) {
   if (Date.now() - fetchedAt < QUOTE_STALE_MS) return quote;
   return getQuote(quoteParams);
 }
 
-/**
- * Parses a user-entered amount, accepting either a plain ETH figure
- * (e.g. "0.05") or a USD figure prefixed with "$" (e.g. "$100"). Returns
- * { amountEth, usdInput } or throws with a user-facing message on bad input.
- * usdInput is the raw USD number if the user entered USD, otherwise null —
- * useful for showing "≈ $100 worth" back to the user for confirmation.
- * Shared by bridge amount entry and custom buy amount entry.
- */
 async function parseEthOrUsdInput(text) {
   const trimmed = text.trim();
   const isUsd = trimmed.startsWith('$');
@@ -355,7 +311,6 @@ async function parseEthOrUsdInput(text) {
   return { amountEth: amt, usdInput: null };
 }
 
-// Kept as an alias for the bridge flow's original name, same function.
 const parseBridgeAmountInput = parseEthOrUsdInput;
 
 // ---------- Menus ----------
@@ -387,6 +342,7 @@ function walletsMenu(uid) {
     Markup.button.callback('➕ Create New', 'wallet_create'),
     Markup.button.callback('📥 Import', 'wallet_import'),
   ]);
+  rows.push([Markup.button.callback('📤 Batch Fund', 'batchfund_start')]);
   rows.push([Markup.button.callback('⬅️ Back', 'menu_main')]);
   return Markup.inlineKeyboard(rows);
 }
@@ -457,9 +413,6 @@ function tokenMenu(uid, tokenAddress, hasPosition) {
   const user = getUser(uid);
   const rows = [
     s.buyPresetsEth.map((amt) => Markup.button.callback(`Buy ${amt} ETH`, `buy_${tokenAddress}_${amt}`)),
-    // Label clarifies ETH-or-USD support up front, so users don't have to
-    // tap through to discover it (previously only revealed in the prompt
-    // shown after tapping this button).
     [Markup.button.callback('✏️ Custom Buy (ETH or $)', `custombuy_${tokenAddress}`)],
   ];
   if (hasPosition) {
@@ -473,6 +426,9 @@ function tokenMenu(uid, tokenAddress, hasPosition) {
   const bottomRow = [Markup.button.callback('⏰ Limit Buy', `limitbuy_${tokenAddress}`)];
   if (user.wallets.length > 1) bottomRow.push(Markup.button.callback('📦 Batch Buy', `batchbuy_${tokenAddress}`));
   rows.push(bottomRow);
+  if (hasPosition && user.wallets.length > 1) {
+    rows.push([Markup.button.callback('📦 Batch Sell', `batchsell_${tokenAddress}`)]);
+  }
   rows.push([
     Markup.button.callback('🔄 Refresh', `refresh_${tokenAddress}`),
     Markup.button.callback('⬅️ Back', 'menu_main'),
@@ -489,6 +445,32 @@ function batchSelectMenu(uid, selected) {
   });
   rows.push([
     Markup.button.callback(`✅ Confirm (${selected.length} selected)`, 'batchconfirm'),
+    Markup.button.callback('❌ Cancel', 'menu_main'),
+  ]);
+  return Markup.inlineKeyboard(rows);
+}
+
+/** Multi-select wallet picker used by Batch Sell — only wallets passed in `candidates`. */
+function batchSellSelectMenu(candidates, selected) {
+  const rows = candidates.map((w) => {
+    const checked = selected.includes(w.id) ? '☑️ ' : '⬜ ';
+    return [Markup.button.callback(`${checked}${w.name} (${shortAddr(w.address)})`, `bselltoggle_${w.id}`)];
+  });
+  rows.push([
+    Markup.button.callback(`✅ Confirm (${selected.length} selected)`, 'batchsellconfirm'),
+    Markup.button.callback('❌ Cancel', 'menu_main'),
+  ]);
+  return Markup.inlineKeyboard(rows);
+}
+
+/** Multi-select wallet picker used by Batch Fund — only wallets passed in `candidates` (source excluded). */
+function batchFundSelectMenu(candidates, selected) {
+  const rows = candidates.map((w) => {
+    const checked = selected.includes(w.id) ? '☑️ ' : '⬜ ';
+    return [Markup.button.callback(`${checked}${w.name} (${shortAddr(w.address)})`, `bfundtoggle_${w.id}`)];
+  });
+  rows.push([
+    Markup.button.callback(`✅ Confirm (${selected.length} selected)`, 'bfundconfirm'),
     Markup.button.callback('❌ Cancel', 'menu_main'),
   ]);
   return Markup.inlineKeyboard(rows);
@@ -615,7 +597,6 @@ async function executeSell(ctx, uid, tokenAddress, pct) {
   try {
     await ctx.reply(`Selling ${pct}%... fetching quote.`);
 
-    // Fetch the token's real decimals — do not assume 18, many tokens differ.
     const decimals = await getDecimals(provider, tokenAddress).catch(() => 18);
     const sellAmount = ethers.parseUnits(tokenAmount.toFixed(Math.min(decimals, 18)), decimals).toString();
 
@@ -630,7 +611,6 @@ async function executeSell(ctx, uid, tokenAddress, pct) {
     const quoteParams = { sellToken: tokenAddress, buyToken: 'ETH', sellAmount, taker: w.address, slippageBps };
     let quote = await getQuote(quoteParams);
     const fetchedAt = Date.now();
-    // Approval above can take a while to confirm — re-quote if price may have moved since.
     quote = await getFreshQuote(quoteParams, quote, fetchedAt);
 
     const txRequest = await buildSwapTx(signer, quote);
@@ -666,10 +646,6 @@ function confirmMenu(kind, tokenAddress, value) {
 }
 
 // ---------- Headless trade execution (poller/batch-triggered, no ctx) ----------
-// Same core steps as executeBuy/executeSell but returns a result object
-// instead of chatting through ctx.reply, and skips the tradesInFlight
-// double-tap guard (that guard exists to stop a human double-tapping a
-// button; these callers are single-shot and not user-initiated taps).
 
 async function performBuyCore(uid, wallet, tokenAddress, ethAmount) {
   let pendingTradeId;
@@ -731,14 +707,56 @@ async function performSellCore(uid, wallet, tokenAddress, pct) {
   }
 }
 
+// ---------- Headless native ETH transfer (used by Batch Fund) ----------
+// Same stuck-tx protection shape as swap.js/bridge.js: resubmit with bumped
+// fees if the network is too slow, so a batch fund run can't hang forever.
+
+async function performTransferCore(uid, sourceWallet, toAddress, amountEth, gasMultiplier) {
+  try {
+    const signer = new ethers.Wallet(sourceWallet.privateKey, provider);
+    const nonce = await signer.getNonce();
+    const feeData = await provider.getFeeData();
+    const baseMaxFee = feeData.maxFeePerGas ?? ethers.parseUnits('30', 'gwei');
+    const basePriorityFee = feeData.maxPriorityFeePerGas ?? ethers.parseUnits('1', 'gwei');
+    const multBps = BigInt(Math.round(gasMultiplier * 1000));
+    const maxFeePerGas = (baseMaxFee * multBps) / 1000n;
+    const maxPriorityFeePerGas = (basePriorityFee * multBps) / 1000n;
+
+    const txResponse = await signer.sendTransaction({
+      to: toAddress,
+      value: ethers.parseEther(amountEth.toString()),
+      nonce,
+      maxFeePerGas,
+      maxPriorityFeePerGas,
+      gasLimit: FALLBACK_GAS_LIMIT_TRANSFER,
+    });
+    await txResponse.wait(1, 60_000);
+    return { ok: true, txHash: txResponse.hash };
+  } catch (err) {
+    return { ok: false, error: friendlyErrorMessage(err) };
+  }
+}
+
+/**
+ * Sends `amountEth` from `sourceWallet` to each wallet in `targets`
+ * (sequentially, to avoid nonce collisions), returning a per-target result.
+ */
+async function distributeEth(uid, sourceWallet, targets, amountEth) {
+  const results = [];
+  const gasMultiplier = gasMultiplierFor(uid);
+  for (const target of targets) {
+    const result = await performTransferCore(uid, sourceWallet, target.address, amountEth, gasMultiplier);
+    results.push({ ...result, walletName: target.name });
+  }
+  return results;
+}
+
 // ---------- Shared bridge execution ----------
 
 async function executeBridge(ctx, uid, direction, amountEth) {
   const w = getActiveWallet(uid);
   if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
 
-  // Same guard shape as executeBuy's maxBuyEth check — belt-and-suspenders in
-  // case this got here via a route that skipped the earlier bridge_amount check.
   const { maxBridgeEth } = getSettings(uid);
   if (amountEth > maxBridgeEth) {
     return ctx.reply(`❌ ${amountEth} ETH exceeds your max bridge size (${maxBridgeEth} ETH). Adjust it in Settings if this was intentional.`, mainMenu());
@@ -759,9 +777,6 @@ async function executeBridge(ctx, uid, direction, amountEth) {
       uid, walletId: w.id, direction, amountEth, fromChain, toChain, bridgeTool: quote.tool,
     });
 
-    // Bridges can originate on either chain — use a provider pointed at the source chain
-    // for ETH_TO_ROBINHOOD; the configured RPC_URL provider is Robinhood Chain, so for
-    // that direction we use the shared mainnet provider created once at startup.
     const sourceProvider = fromChain === ETH_CHAIN_ID ? ethMainnetProvider : provider;
     const sourceSigner = new ethers.Wallet(w.privateKey, sourceProvider);
 
@@ -791,10 +806,8 @@ async function executeBridge(ctx, uid, direction, amountEth) {
 
 bot.start(async (ctx) => {
   const uid = ctx.from.id;
-  const payload = ctx.startPayload; // telegraf parses "/start ref_XXXX" into this
+  const payload = ctx.startPayload;
 
-  // Attribute referral on a user's very first /start, before the terms gate,
-  // so it works even for people who never finish onboarding.
   if (payload && payload.startsWith('ref_') && !hasBeenReferred(uid)) {
     const code = payload.slice(4);
     const referrerUid = findUidByReferralCode(code);
@@ -829,9 +842,8 @@ bot.action('agree_terms', async (ctx) => {
   });
 });
 
-// Admin-only: usage and volume snapshot
 bot.command('admin_stats', async (ctx) => {
-  if (String(ctx.from.id) !== String(process.env.ADMIN_CHAT_ID)) return; // silently ignore non-admins
+  if (String(ctx.from.id) !== String(process.env.ADMIN_CHAT_ID)) return;
   const s = getStats();
   const feeBps = Number(process.env.AFFILIATE_FEE_BPS || 0);
   const estFeesEth = (s.totalVolumeEth * feeBps) / 10000;
@@ -854,13 +866,8 @@ bot.command('admin_stats', async (ctx) => {
   );
 });
 
-// Admin-only: inspect bridges stuck in pending/submitted and force an
-// immediate LI.FI status recheck on each. Exists because the background
-// poller fails silently into console.error — this surfaces the same check
-// with its actual result/error visible in Telegram, and updates storage +
-// admin stats if it turns out to have actually completed.
 bot.command('admin_bridges', async (ctx) => {
-  if (String(ctx.from.id) !== String(process.env.ADMIN_CHAT_ID)) return; // silently ignore non-admins
+  if (String(ctx.from.id) !== String(process.env.ADMIN_CHAT_ID)) return;
 
   const stuck = getInFlightBridges();
   if (stuck.length === 0) {
@@ -959,10 +966,6 @@ bot.action(/^wallet_remove_(.+)$/, async (ctx) => {
   await ctx.editMessageText('💼 *Your Wallets*', { parse_mode: 'Markdown', ...walletsMenu(ctx.from.id) });
 });
 
-// Extra friction on top of the button tap: the user must type the wallet's
-// exact name before the key is shown. A compromised/left-open Telegram
-// session can tap a button by accident; typing the name is much less likely
-// to happen without the account owner actually meaning it.
 bot.action(/^wallet_export_confirm_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const w = getWallet(ctx.from.id, ctx.match[1]);
@@ -1035,8 +1038,6 @@ bot.action('menu_positions', async (ctx) => {
 });
 
 // ---------- Portfolio-wide PnL summary ----------
-// Same math as menu_positions but aggregated across EVERY wallet the user
-// owns, not just the active one — gives a single "how am I doing overall" view.
 
 bot.action('menu_portfolio', async (ctx) => {
   await ctx.answerCbQuery();
@@ -1128,8 +1129,6 @@ bot.action('settings_maxbridge', async (ctx) => {
   await ctx.editMessageText('Send the max ETH allowed per single bridge, e.g. `0.5`', { parse_mode: 'Markdown' });
 });
 
-// Cycles slow -> normal -> fast -> slow. A tap-to-cycle button avoids yet
-// another free-text prompt for a 3-value setting.
 bot.action('settings_gastier', async (ctx) => {
   const s = getSettings(ctx.from.id);
   const idx = GAS_TIERS.indexOf(s.gasTier);
@@ -1196,10 +1195,9 @@ bot.action('menu_bridge', async (ctx) => {
     getEthUsdPrice().catch(() => null),
   ]);
 
-  const balanceLines = [
+  const balanceLinesArr = [
     fmtBridgeBalanceLine('Ethereum — ETH', balances.ethMainnet, ethUsd),
     fmtBridgeBalanceLine('Robinhood — ETH', balances.ethRobinhood, ethUsd),
-    // USDG is a dollar-pegged stablecoin, so its own amount is ~its USD value — no ethUsd conversion needed.
     fmtBridgeBalanceLine('Robinhood — USDG', balances.usdgRobinhood, balances.usdgRobinhood !== null ? 1 : null),
   ];
 
@@ -1207,7 +1205,7 @@ bot.action('menu_bridge', async (ctx) => {
     `🌉 *Bridge ETH*\n\n` +
     `Move ETH between Ethereum mainnet and Robinhood Chain.\n` +
     `Active wallet: *${w.name}* (\`${shortAddr(w.address)}\`)\n\n` +
-    `*Your balances:*\n${balanceLines.join('\n')}\n\n` +
+    `*Your balances:*\n${balanceLinesArr.join('\n')}\n\n` +
     `You'll be able to enter the amount in ETH or USD.`,
     { parse_mode: 'Markdown', ...bridgeMenu() }
   );
@@ -1304,7 +1302,10 @@ bot.action(/^batchbuy_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
   const user = getUser(uid);
   if (user.wallets.length < 2) return ctx.reply('You need at least 2 wallets to use Batch Buy.', mainMenu());
   pending.set(uid, { type: 'batch_amount', tokenAddress: ctx.match[1] });
-  await ctx.editMessageText('Send the ETH amount to buy on EACH selected wallet, e.g. `0.02`', { parse_mode: 'Markdown' });
+  await ctx.editMessageText(
+    'Send the amount to buy on EACH selected wallet — ETH like `0.02`, or USD like `$50`:',
+    { parse_mode: 'Markdown' }
+  );
 });
 
 bot.action(/^batchtoggle_(.+)$/, async (ctx) => {
@@ -1334,7 +1335,10 @@ bot.action('batchconfirm', async (ctx) => {
   }
 
   pending.delete(uid);
-  await ctx.editMessageText(`Buying ${state.ethAmount} ETH on ${state.selected.length} wallet(s)... this may take a moment.`);
+  const label = state.usdInput !== null && state.usdInput !== undefined
+    ? `≈ ${state.ethAmount} ETH (${fmtUsd(state.usdInput)})`
+    : `${state.ethAmount} ETH`;
+  await ctx.editMessageText(`Buying ${label} on ${state.selected.length} wallet(s)... this may take a moment.`);
 
   const results = [];
   for (const walletId of state.selected) {
@@ -1347,10 +1351,143 @@ bot.action('batchconfirm', async (ctx) => {
   const lines = results.map((r) =>
     r.ok ? `✅ ${r.walletName}: bought (tx \`${r.txHash.slice(0, 12)}...\`)` : `❌ ${r.walletName}: ${r.error}`
   );
-  await ctx.reply(`📦 *Batch Buy Results* — ${state.ethAmount} ETH each\n\n${lines.join('\n')}`, {
+  await ctx.reply(`📦 *Batch Buy Results* — ${label} each\n\n${lines.join('\n')}`, {
     parse_mode: 'Markdown',
     ...mainMenu(),
   });
+});
+
+// ---------- Batch Sell ----------
+
+bot.action(/^batchsell_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  const user = getUser(uid);
+  if (user.wallets.length < 2) return ctx.reply('You need at least 2 wallets to use Batch Sell.', mainMenu());
+  pending.set(uid, { type: 'batchsell_pct', tokenAddress: ctx.match[1] });
+  await ctx.editMessageText('Send the percentage to sell on EACH wallet holding this token, e.g. `50` for 50%', { parse_mode: 'Markdown' });
+});
+
+bot.action(/^bselltoggle_(.+)$/, async (ctx) => {
+  const uid = ctx.from.id;
+  const state = pending.get(uid);
+  if (!state || state.type !== 'batchsell_select') return ctx.answerCbQuery();
+  await ctx.answerCbQuery();
+  const walletId = ctx.match[1];
+  const idx = state.selected.indexOf(walletId);
+  if (idx >= 0) state.selected.splice(idx, 1); else state.selected.push(walletId);
+  pending.set(uid, state);
+  await ctx.editMessageText(
+    'Select wallets to sell on:',
+    batchSellSelectMenu(state.candidates, state.selected)
+  ).catch(() => {});
+});
+
+bot.action('batchsellconfirm', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  const state = pending.get(uid);
+  if (!state || state.type !== 'batchsell_select') return;
+  if (state.selected.length === 0) return ctx.reply('No wallets selected — tap wallets to select, then Confirm.');
+  if (isRateLimited(uid)) return ctx.reply('⏳ Slow down a bit — too many actions in the last minute.');
+
+  pending.delete(uid);
+  await ctx.editMessageText(`Selling ${state.pct}% on ${state.selected.length} wallet(s)... this may take a moment.`);
+
+  const results = [];
+  for (const walletId of state.selected) {
+    const w = getWallet(uid, walletId);
+    if (!w) { results.push({ ok: false, walletName: walletId, error: 'Wallet not found.' }); continue; }
+    const result = await performSellCore(uid, w, state.tokenAddress, state.pct);
+    results.push(result);
+  }
+
+  const lines = results.map((r) =>
+    r.ok ? `✅ ${r.walletName}: sold (tx \`${r.txHash.slice(0, 12)}...\`)` : `❌ ${r.walletName}: ${r.error}`
+  );
+  await ctx.reply(`📦 *Batch Sell Results* — ${state.pct}% each\n\n${lines.join('\n')}`, {
+    parse_mode: 'Markdown',
+    ...mainMenu(),
+  });
+});
+
+// ---------- Batch Fund ----------
+// Identifies the best-funded wallet as the source and lets the user pick
+// which of their OTHER wallets to split ETH across equally. If the user
+// only has one wallet, offers to create N new wallets and fund each one
+// from it instead.
+
+bot.action('batchfund_start', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  const user = getUser(uid);
+
+  if (user.wallets.length === 0) {
+    return ctx.editMessageText('No wallets yet. Create one first.', walletsMenu(uid));
+  }
+
+  if (user.wallets.length === 1) {
+    pending.set(uid, { type: 'batchfund_create_count', sourceWalletId: user.wallets[0].id });
+    await ctx.editMessageText(
+      `You only have one wallet (*${user.wallets[0].name}*).\n\n` +
+      `How many new wallets would you like to create and fund from it? (max ${MAX_BATCH_FUND_NEW_WALLETS})`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
+  await ctx.editMessageText('📤 *Batch Fund*\n\nChecking wallet balances...', { parse_mode: 'Markdown' });
+
+  const balances = await Promise.all(
+    user.wallets.map(async (w) => ({
+      ...w,
+      balance: await provider.getBalance(w.address).then((b) => Number(ethers.formatEther(b))).catch(() => 0),
+    }))
+  );
+  const source = balances.reduce((a, b) => (b.balance > a.balance ? b : a));
+  const candidates = balances.filter((w) => w.id !== source.id);
+
+  pending.set(uid, { type: 'batchfund_select', sourceWalletId: source.id, candidates, selected: [] });
+
+  await ctx.editMessageText(
+    `📤 *Batch Fund*\n\n` +
+    `Source wallet: *${source.name}* — ${source.balance.toFixed(4)} ETH\n\n` +
+    `Select which wallets to fund (the ETH amount you choose next will be sent to EACH one):`,
+    { parse_mode: 'Markdown', ...batchFundSelectMenu(candidates, []) }
+  );
+});
+
+bot.action(/^bfundtoggle_(.+)$/, async (ctx) => {
+  const uid = ctx.from.id;
+  const state = pending.get(uid);
+  if (!state || state.type !== 'batchfund_select') return ctx.answerCbQuery();
+  await ctx.answerCbQuery();
+  const walletId = ctx.match[1];
+  const idx = state.selected.indexOf(walletId);
+  if (idx >= 0) state.selected.splice(idx, 1); else state.selected.push(walletId);
+  pending.set(uid, state);
+  await ctx.editMessageText(
+    'Select which wallets to fund:',
+    batchFundSelectMenu(state.candidates, state.selected)
+  ).catch(() => {});
+});
+
+bot.action('bfundconfirm', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  const state = pending.get(uid);
+  if (!state || state.type !== 'batchfund_select') return;
+  if (state.selected.length === 0) return ctx.reply('No wallets selected — tap wallets to select, then Confirm.');
+
+  pending.set(uid, {
+    type: 'batchfund_amount',
+    sourceWalletId: state.sourceWalletId,
+    targets: state.candidates.filter((w) => state.selected.includes(w.id)),
+  });
+  await ctx.editMessageText(
+    'Send the ETH (or USD) amount to send to EACH selected wallet, e.g. `0.02` or `$50`:',
+    { parse_mode: 'Markdown' }
+  );
 });
 
 // ---------- Balance ----------
@@ -1444,14 +1581,13 @@ bot.action('cancel_trade', async (ctx) => {
   await ctx.editMessageText('Trade cancelled.', mainMenu());
 });
 
-// ---------- Free-text handler (wallet setup + CA paste + bridge amount) ----------
+// ---------- Free-text handler ----------
 
 bot.on('text', async (ctx) => {
   const uid = ctx.from.id;
   const state = pending.get(uid);
   const text = ctx.message.text.trim();
 
-  // CA paste is allowed any time, not just when explicitly prompted
   if (CA_REGEX.test(text)) {
     if (!hasAgreedTerms(uid)) {
       return ctx.reply(TERMS_TEXT, {
@@ -1572,7 +1708,7 @@ bot.on('text', async (ctx) => {
       const amt = parseFloat(text);
       if (isNaN(amt) || amt < 0) return ctx.reply('Send a valid non-negative ETH amount, e.g. `0.01`, or `0` to disable.');
       updateSettings(uid, { lowBalanceThresholdEth: amt });
-      lowBalanceWarned.delete(String(uid)); // threshold changed — allow a fresh check against the new value
+      lowBalanceWarned.delete(String(uid));
       pending.delete(uid);
       await ctx.reply(
         amt === 0 ? '✅ Low balance alerts disabled.' : `✅ Low balance alert threshold set to ${amt} ETH`,
@@ -1582,8 +1718,6 @@ bot.on('text', async (ctx) => {
     }
 
     if (state.type === 'custom_buy') {
-      // Accepts either a plain ETH figure ("0.03") or a USD figure ("$100"),
-      // same parser used by the bridge amount flow.
       let val, usdInput;
       try {
         ({ amountEth: val, usdInput } = await parseEthOrUsdInput(text));
@@ -1591,9 +1725,6 @@ bot.on('text', async (ctx) => {
         return ctx.reply(err.message, { parse_mode: 'Markdown' });
       }
 
-      // Round to 6 decimals: keeps callback_data short enough for Telegram's
-      // 64-byte limit (a raw USD/price division can produce 15+ decimal
-      // digits, which overflows it and causes BUTTON_DATA_INVALID).
       val = Number(val.toFixed(6));
 
       const { maxBuyEth } = getSettings(uid);
@@ -1657,7 +1788,6 @@ bot.on('text', async (ctx) => {
 
       pending.delete(uid);
 
-      // Only one active rule per position — replace any existing one.
       const existing = getActiveAutoRuleForPosition(uid, w.id, state.tokenAddress);
       if (existing) cancelAutoRule(uid, existing.id);
 
@@ -1725,16 +1855,158 @@ bot.on('text', async (ctx) => {
     }
 
     if (state.type === 'batch_amount') {
-      const amt = parseFloat(text);
-      if (isNaN(amt) || amt <= 0) return ctx.reply('Send a valid positive ETH amount.');
-      pending.set(uid, { type: 'batch_select', tokenAddress: state.tokenAddress, ethAmount: amt, selected: [] });
+      let amt, usdInput;
+      try {
+        ({ amountEth: amt, usdInput } = await parseEthOrUsdInput(text));
+      } catch (err) {
+        return ctx.reply(err.message, { parse_mode: 'Markdown' });
+      }
+      amt = Number(amt.toFixed(6));
+      pending.set(uid, { type: 'batch_select', tokenAddress: state.tokenAddress, ethAmount: amt, usdInput, selected: [] });
       await ctx.reply('Select wallets to buy on:', batchSelectMenu(uid, []));
       return;
     }
 
+    if (state.type === 'batchsell_pct') {
+      const pct = parseFloat(text);
+      if (isNaN(pct) || pct <= 0 || pct > 100) return ctx.reply('Send a valid percentage (1-100), e.g. `50`');
+
+      const user = getUser(uid);
+      const candidates = user.wallets.filter((w) => {
+        const pos = getPosition(uid, w.id, state.tokenAddress);
+        return pos && pos.tokenAmount > 0;
+      });
+
+      if (candidates.length === 0) {
+        pending.delete(uid);
+        return ctx.reply('No wallets hold a position in this token.', mainMenu());
+      }
+
+      pending.set(uid, { type: 'batchsell_select', tokenAddress: state.tokenAddress, pct, candidates, selected: [] });
+      await ctx.reply('Select wallets to sell on:', batchSellSelectMenu(candidates, []));
+      return;
+    }
+
+    if (state.type === 'batchfund_create_count') {
+      const count = parseInt(text, 10);
+      if (isNaN(count) || count <= 0 || count > MAX_BATCH_FUND_NEW_WALLETS) {
+        return ctx.reply(`Send a valid whole number between 1 and ${MAX_BATCH_FUND_NEW_WALLETS}.`);
+      }
+      pending.set(uid, { type: 'batchfund_new_amount', sourceWalletId: state.sourceWalletId, count });
+      await ctx.reply(
+        `Send the ETH (or USD) amount to fund EACH of the ${count} new wallet(s) with, e.g. \`0.02\` or \`$50\`:`,
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+
+    if (state.type === 'batchfund_new_amount') {
+      let amt, usdInput;
+      try {
+        ({ amountEth: amt, usdInput } = await parseEthOrUsdInput(text));
+      } catch (err) {
+        return ctx.reply(err.message, { parse_mode: 'Markdown' });
+      }
+      amt = Number(amt.toFixed(6));
+
+      const source = getWallet(uid, state.sourceWalletId);
+      if (!source) { pending.delete(uid); return ctx.reply('Source wallet not found.', walletsMenu(uid)); }
+
+      const sourceBalance = await provider.getBalance(source.address).then((b) => Number(ethers.formatEther(b))).catch(() => 0);
+      const totalNeeded = amt * state.count;
+      if (totalNeeded > sourceBalance) {
+        pending.delete(uid);
+        return ctx.reply(
+          `❌ Need ~${totalNeeded.toFixed(6)} ETH total (plus gas) but *${source.name}* only has ${sourceBalance.toFixed(6)} ETH.`,
+          { parse_mode: 'Markdown', ...mainMenu() }
+        );
+      }
+
+      if (fundsInFlight.has(uid)) return ctx.reply('⏳ A batch fund run is already in progress — please wait for it to finish.');
+      if (isRateLimited(uid)) return ctx.reply('⏳ Slow down a bit — too many actions in the last minute.');
+      fundsInFlight.add(uid);
+      pending.delete(uid);
+
+      const label = usdInput !== null ? `≈ ${amt} ETH (${fmtUsd(usdInput)})` : `${amt} ETH`;
+      await ctx.reply(`Creating ${state.count} new wallet(s) and funding each with ${label}... this may take a moment.`);
+
+      try {
+        const newWallets = [];
+        for (let i = 0; i < state.count; i++) {
+          const existingCount = getUser(uid).wallets.length;
+          const w = createWallet(`Wallet ${existingCount + 1}`);
+          addWallet(uid, w);
+          newWallets.push(w);
+        }
+
+        const results = await distributeEth(uid, source, newWallets, amt);
+        const lines = results.map((r) =>
+          r.ok ? `✅ ${r.walletName}: funded (tx \`${r.txHash.slice(0, 12)}...\`)` : `❌ ${r.walletName}: ${r.error}`
+        );
+        await ctx.reply(`📤 *Batch Fund Results* — ${label} each\n\n${lines.join('\n')}`, {
+          parse_mode: 'Markdown',
+          ...mainMenu(),
+        });
+      } catch (err) {
+        console.error(err);
+        await ctx.reply(`❌ Batch fund failed: ${friendlyErrorMessage(err)}`, mainMenu());
+        await sendAdminAlert(ctx.telegram, `Batch fund (new wallets) failed for user ${uid}: ${err.message}`);
+      } finally {
+        fundsInFlight.delete(uid);
+      }
+      return;
+    }
+
+    if (state.type === 'batchfund_amount') {
+      let amt, usdInput;
+      try {
+        ({ amountEth: amt, usdInput } = await parseEthOrUsdInput(text));
+      } catch (err) {
+        return ctx.reply(err.message, { parse_mode: 'Markdown' });
+      }
+      amt = Number(amt.toFixed(6));
+
+      const source = getWallet(uid, state.sourceWalletId);
+      if (!source) { pending.delete(uid); return ctx.reply('Source wallet not found.', walletsMenu(uid)); }
+
+      const sourceBalance = await provider.getBalance(source.address).then((b) => Number(ethers.formatEther(b))).catch(() => 0);
+      const totalNeeded = amt * state.targets.length;
+      if (totalNeeded > sourceBalance) {
+        pending.delete(uid);
+        return ctx.reply(
+          `❌ Need ~${totalNeeded.toFixed(6)} ETH total (plus gas) but *${source.name}* only has ${sourceBalance.toFixed(6)} ETH.`,
+          { parse_mode: 'Markdown', ...mainMenu() }
+        );
+      }
+
+      if (fundsInFlight.has(uid)) return ctx.reply('⏳ A batch fund run is already in progress — please wait for it to finish.');
+      if (isRateLimited(uid)) return ctx.reply('⏳ Slow down a bit — too many actions in the last minute.');
+      fundsInFlight.add(uid);
+      pending.delete(uid);
+
+      const label = usdInput !== null ? `≈ ${amt} ETH (${fmtUsd(usdInput)})` : `${amt} ETH`;
+      await ctx.reply(`Funding ${state.targets.length} wallet(s) with ${label} each from *${source.name}*... this may take a moment.`, { parse_mode: 'Markdown' });
+
+      try {
+        const results = await distributeEth(uid, source, state.targets, amt);
+        const lines = results.map((r) =>
+          r.ok ? `✅ ${r.walletName}: funded (tx \`${r.txHash.slice(0, 12)}...\`)` : `❌ ${r.walletName}: ${r.error}`
+        );
+        await ctx.reply(`📤 *Batch Fund Results* — ${label} each\n\n${lines.join('\n')}`, {
+          parse_mode: 'Markdown',
+          ...mainMenu(),
+        });
+      } catch (err) {
+        console.error(err);
+        await ctx.reply(`❌ Batch fund failed: ${friendlyErrorMessage(err)}`, mainMenu());
+        await sendAdminAlert(ctx.telegram, `Batch fund failed for user ${uid}: ${err.message}`);
+      } finally {
+        fundsInFlight.delete(uid);
+      }
+      return;
+    }
+
     if (state.type === 'bridge_amount') {
-      // Accepts either a plain ETH figure ("0.05") or a USD figure ("$100"),
-      // converting USD -> ETH via the live ETH/USD price feed.
       let amt, usdInput;
       try {
         ({ amountEth: amt, usdInput } = await parseBridgeAmountInput(text));
@@ -1742,14 +2014,8 @@ bot.on('text', async (ctx) => {
         return ctx.reply(err.message, { parse_mode: 'Markdown' });
       }
 
-      // Round to 6 decimals: keeps callback_data short enough for Telegram's
-      // 64-byte limit (a raw USD/price division can produce 15+ decimal
-      // digits, which overflows it and causes BUTTON_DATA_INVALID).
       amt = Number(amt.toFixed(6));
 
-      // Guard bridge amount against the configured cap, same as buy amounts —
-      // previously this check only existed on the buy path, so a bridge could
-      // go straight to a quote (and eventual raw signer error) for any size.
       const { maxBridgeEth } = getSettings(uid);
       if (amt > maxBridgeEth) {
         pending.delete(uid);
@@ -1771,9 +2037,6 @@ bot.on('text', async (ctx) => {
         ? `Send: ≈ ${amt.toFixed(6)} ETH (${fmtUsd(usdInput)})`
         : `Send: ${amt} ETH`;
 
-      // Gas estimate uses the real quote's gas limit (LI.FI supplies one) on
-      // the actual source-chain provider, so this is more precise than the
-      // fallback-based estimate used for buy/sell.
       const { fromChain } = chainIdsForDirection(state.direction);
       const sourceProviderForEstimate = fromChain === ETH_CHAIN_ID ? ethMainnetProvider : provider;
       const gasEth = await estimateBridgeGasEth(sourceProviderForEstimate, quote, gasMultiplierFor(uid)).catch(() => null);
@@ -1816,14 +2079,6 @@ async function checkStuckTrades() {
   console.warn(`${stuck.length} pending trade(s) unresolved from before restart. See admin alert / pending_trades table.`);
 }
 
-// Bridges left "pending"/"submitted" after a restart split into two buckets:
-// - resumable: has a source_tx_hash, so the poller can keep checking LI.FI's
-//   status for it automatically.
-// - needs manual review: no source_tx_hash, meaning the process crashed
-//   before we know whether the source-chain tx was ever sent. The poller
-//   cannot recover these on its own (there's nothing to poll), so they are
-//   called out separately and explicitly so they don't get mistaken for
-//   something that will resolve itself.
 async function checkStuckBridges() {
   const stuck = getInFlightBridges();
   if (stuck.length === 0) return;
@@ -1853,10 +2108,6 @@ async function checkStuckBridges() {
   }
 }
 
-// Periodically checks LI.FI status for every bridge still pending/submitted and
-// notifies the user + updates storage once it resolves. This is what lets a
-// bridge started before a restart, or one whose status simply took a while,
-// still get tracked to completion without the user re-checking manually.
 function startBridgePoller() {
   setInterval(async () => {
     let inFlight;
@@ -1868,7 +2119,7 @@ function startBridgePoller() {
     }
 
     for (const b of inFlight) {
-      if (!b.source_tx_hash) continue; // not submitted yet, nothing to poll
+      if (!b.source_tx_hash) continue;
       try {
         const result = await checkBridgeStatusOnce({
           txHash: b.source_tx_hash,
@@ -1894,7 +2145,6 @@ function startBridgePoller() {
           ).catch((err) => console.error(`Failed to notify uid ${b.uid} of bridge failure:`, err.message));
           await sendAdminAlert(bot.telegram, `Bridge FAILED for user ${b.uid}: ${b.direction}, ${b.amount_eth} ETH, tx ${b.source_tx_hash}`);
         }
-        // PENDING: leave as-is, will be re-checked next tick.
       } catch (err) {
         console.error(`Bridge poller: status check failed for bridge ${b.id}:`, err.message);
       }
@@ -1902,12 +2152,6 @@ function startBridgePoller() {
   }, BRIDGE_POLL_INTERVAL_MS);
 }
 
-// Periodically checks every user's active wallet ETH balance and DMs a
-// one-time warning when it drops below their configured threshold (default
-// 0.01 ETH, 0 = disabled). Re-arms once the balance recovers above the
-// threshold, so a user can be warned again on a future dip. Runs on active
-// wallets only (getAllActiveWallets), not every wallet ever created, to keep
-// this cheap as the user base grows.
 function startLowBalancePoller() {
   setInterval(async () => {
     let wallets;
@@ -1937,7 +2181,7 @@ function startLowBalancePoller() {
             ).catch((err) => console.error(`Failed to send low-balance alert to uid ${w.uid}:`, err.message));
           }
         } else {
-          lowBalanceWarned.delete(key); // recovered — allow a future re-alert if it drops again
+          lowBalanceWarned.delete(key);
         }
       } catch (err) {
         console.error(`Low-balance poller: check failed for uid ${w.uid}:`, err.message);
@@ -1946,11 +2190,6 @@ function startLowBalancePoller() {
   }, LOW_BALANCE_POLL_INTERVAL_MS);
 }
 
-// Periodically checks every active auto-trade rule (TP/SL) against the
-// position's live PnL. Fires a 100% sell the first time TP or SL is crossed,
-// then marks the rule 'triggered' so it can't fire twice. Marks a rule
-// 'triggered' (i.e. retires it) instead of erroring out if the wallet or
-// position has since disappeared, since there's nothing left to protect.
 function startAutoTradePoller() {
   setInterval(async () => {
     let rules;
@@ -1971,7 +2210,7 @@ function startAutoTradePoller() {
 
         const market = await getTokenMarketData(rule.token_address).catch(() => null);
         const ethUsd = await getEthUsdPrice().catch(() => null);
-        if (!market || !ethUsd) continue; // price hiccup, re-check next tick
+        if (!market || !ethUsd) continue;
 
         const valueUsd = pos.tokenAmount * market.priceUsd;
         const costUsd = pos.costEth * ethUsd;
@@ -1983,7 +2222,7 @@ function startAutoTradePoller() {
         else if (rule.sl_pct != null && pnlPct <= -rule.sl_pct) trigger = 'stop-loss';
         if (!trigger) continue;
 
-        markAutoRuleTriggered(rule.id); // retire immediately so a slow sell can't double-fire
+        markAutoRuleTriggered(rule.id);
 
         const result = await performSellCore(rule.uid, wallet, rule.token_address, 100);
         if (result.ok) {
@@ -2009,10 +2248,6 @@ function startAutoTradePoller() {
   }, AUTO_TRADE_POLL_INTERVAL_MS);
 }
 
-// Periodically checks every open limit order against the token's live USD
-// price. Buy orders fire when price drops to/below the trigger; sell orders
-// fire when price rises to/above it. Marks the order 'filled' before
-// executing so a slow trade can't be picked up twice on the next tick.
 function startLimitOrderPoller() {
   setInterval(async () => {
     let orders;
@@ -2029,14 +2264,14 @@ function startLimitOrderPoller() {
         if (!wallet) { markLimitOrderDone(order.id, 'cancelled'); continue; }
 
         const market = await getTokenMarketData(order.token_address).catch(() => null);
-        if (!market) continue; // price hiccup, re-check next tick
+        if (!market) continue;
 
         const crossed = order.side === 'buy'
           ? market.priceUsd <= order.trigger_price
           : market.priceUsd >= order.trigger_price;
         if (!crossed) continue;
 
-        markLimitOrderDone(order.id, 'filled'); // retire immediately, avoid double-fire
+        markLimitOrderDone(order.id, 'filled');
 
         if (order.side === 'buy') {
           const result = await performBuyCore(order.uid, wallet, order.token_address, order.amount);
@@ -2055,7 +2290,7 @@ function startLimitOrderPoller() {
           }
         } else {
           const pos = getPosition(order.uid, order.wallet_id, order.token_address);
-          if (!pos || pos.tokenAmount <= 0) continue; // nothing left to sell, order just quietly stays filled
+          if (!pos || pos.tokenAmount <= 0) continue;
           const pct = Math.min((order.amount / pos.tokenAmount) * 100, 100);
           const result = await performSellCore(order.uid, wallet, order.token_address, pct);
           if (result.ok) {
@@ -2079,7 +2314,6 @@ function startLimitOrderPoller() {
   }, LIMIT_ORDER_POLL_INTERVAL_MS);
 }
 
-// Surface crashes to the admin instead of the process dying with no record anywhere.
 process.on('unhandledRejection', (err) => {
   console.error('Unhandled rejection:', err);
   sendAdminAlert(bot.telegram, `🚨 Unhandled rejection: ${err?.message || err}`).catch(() => {});
@@ -2089,7 +2323,7 @@ process.on('uncaughtException', (err) => {
   console.error('Uncaught exception:', err);
   sendAdminAlert(bot.telegram, `🚨 Uncaught exception (process will exit): ${err.message}`)
     .catch(() => {})
-    .finally(() => process.exit(1)); // an uncaught exception means state may be inconsistent — let pm2/systemd restart clean
+    .finally(() => process.exit(1));
 });
 
 bot.launch()
