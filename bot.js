@@ -6,6 +6,7 @@ import { getEthUsdPrice, getTokenMarketData, fmtUsd } from './price.js';
 import { getBridgeQuote, estimateBridgeGasEth, checkBridgeStatusOnce, BRIDGE_DIRECTION, chainIdsForDirection, ETH_CHAIN_ID } from './bridge.js';
 import { sendAdminAlert } from './alerts.js';
 import { isRateLimited } from './ratelimit.js';
+import { generateFlexCard } from './pnl-card.js';
 import {
   getUser,
   addWallet,
@@ -167,6 +168,36 @@ bot.command('help', async (ctx) => {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Main Menu', 'menu_main')]]),
   });
+});
+
+bot.command('flex', async (ctx) => {
+  const uid = ctx.from.id;
+  const arg = ctx.message.text.split(/\s+/)[1];
+
+  if (!arg || !CA_REGEX.test(arg)) {
+    return ctx.reply('Usage: `/flex <contract_address>` — paste a token CA to flex your position.', { parse_mode: 'Markdown' });
+  }
+
+  if (isRateLimited(uid)) return ctx.reply('⏳ Slow down a bit — too many actions in the last minute.');
+
+  const w = getActiveWallet(uid);
+  if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
+
+  const pos = getPosition(uid, w.id, arg);
+  if (!pos || pos.tokenAmount <= 0) {
+    return ctx.reply('No open position on that token to flex.', mainMenu());
+  }
+
+  try {
+    const cardBuffer = await generateFlexCard(uid, arg);
+    if (!cardBuffer) {
+      return ctx.reply('Could not generate a flex card right now — market data may be unavailable. Try again shortly.', mainMenu());
+    }
+    await ctx.replyWithPhoto({ source: cardBuffer });
+  } catch (err) {
+    console.error('Flex card generation failed:', err.message);
+    await ctx.reply('❌ Failed to generate flex card. Try again shortly.', mainMenu());
+  }
 });
 
 bot.action('agree_terms', async (ctx) => {
