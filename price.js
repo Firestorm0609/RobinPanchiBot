@@ -14,6 +14,16 @@ export async function getEthUsdPrice() {
 }
 
 /**
+ * Synchronous, non-blocking read of the cached ETH/USD price — for places
+ * (like sync menu builders) that want to show a USD label but can't await.
+ * Returns null if there's no fresh (<30s) cached price yet.
+ */
+export function getCachedEthUsdPrice() {
+  if (Date.now() - ethPriceCache.ts < 30_000) return ethPriceCache.value;
+  return null;
+}
+
+/**
  * Token market data (price, market cap, liquidity) via DexScreener.
  * Picks the highest-liquidity pair for the token address.
  */

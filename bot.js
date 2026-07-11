@@ -39,7 +39,7 @@ import {
 
 import { validateEnv, provider, ethMainnetProvider, CA_REGEX, FALLBACK_GAS_LIMIT_BUY, FALLBACK_GAS_LIMIT_SELL, MAX_BATCH_FUND_NEW_WALLETS, GAS_TIERS, TERMS_TEXT, HELP_TEXT, WELCOME_TEXT } from './config.js';
 import { pending, fundsInFlight, lowBalanceWarned, botIdentity, gasMultiplierFor } from './state.js';
-import { dualEthBalanceLines, getBridgeBalances, fmtBridgeBalanceLine, gasEstimateLine, friendlyErrorMessage, parseEthOrUsdInput, parseBridgeAmountInput, fmtEth } from './format.js';
+import { dualEthBalanceLines, getBridgeBalances, fmtBridgeBalanceLine, gasEstimateLine, friendlyErrorMessage, parseEthOrUsdInput, parseBridgeAmountInput, fmtEth, fmtAmountLabel } from './format.js';
 import {
   mainMenu, walletsMenu, walletDetailMenu, exportConfirmMenu, settingsMenu, rewardsMenu,
   bridgeMenu, bridgeConfirmMenu, directionLabel, tokenMenu, batchSelectMenu, batchSellSelectMenu,
@@ -364,7 +364,7 @@ bot.action('menu_settings', async (ctx) => {
 bot.action('settings_buy', async (ctx) => {
   await ctx.answerCbQuery();
   pending.set(ctx.from.id, { type: 'settings_buy' });
-  await ctx.editMessageText('Send comma-separated ETH amounts, e.g. `0.01, 0.05, 0.2`', { parse_mode: 'Markdown' });
+  await ctx.editMessageText('Send comma-separated USD amounts, e.g. `10, 50, 200`', { parse_mode: 'Markdown' });
 });
 
 bot.action('settings_sell', async (ctx) => {
@@ -382,13 +382,13 @@ bot.action('settings_slippage', async (ctx) => {
 bot.action('settings_maxbuy', async (ctx) => {
   await ctx.answerCbQuery();
   pending.set(ctx.from.id, { type: 'settings_maxbuy' });
-  await ctx.editMessageText('Send the max ETH allowed per single buy, e.g. `0.5`', { parse_mode: 'Markdown' });
+  await ctx.editMessageText('Send the max USD allowed per single buy, e.g. `500`', { parse_mode: 'Markdown' });
 });
 
 bot.action('settings_maxbridge', async (ctx) => {
   await ctx.answerCbQuery();
   pending.set(ctx.from.id, { type: 'settings_maxbridge' });
-  await ctx.editMessageText('Send the max ETH allowed per single bridge, e.g. `0.5`', { parse_mode: 'Markdown' });
+  await ctx.editMessageText('Send the max USD allowed per single bridge, e.g. `500`', { parse_mode: 'Markdown' });
 });
 
 bot.action('settings_gastier', async (ctx) => {
@@ -468,7 +468,7 @@ bot.action('menu_bridge', async (ctx) => {
     `Move ETH between Ethereum mainnet and Robinhood Chain.\n` +
     `Active wallet: *${w.name}* (\`${shortAddr(w.address)}\`)\n\n` +
     `*Your balances:*\n${balanceLinesArr.join('\n')}\n\n` +
-    `You'll be able to enter the amount in ETH or USD.`,
+    `You'll be able to enter the amount in USD or ETH.`,
     { parse_mode: 'Markdown', ...bridgeMenu() }
   );
 });
@@ -487,7 +487,7 @@ bot.action(/^bridge_dir_(eth_to_robinhood|robinhood_to_eth)$/, async (ctx) => {
   }
 
   await ctx.editMessageText(
-    `Send the amount to bridge (${directionLabel(direction)}) — ETH like \`0.05\`, or USD like \`$100\`:${sourceBalanceLine}`,
+    `Send the amount to bridge (${directionLabel(direction)}) — USD like \`100\`, or ETH like \`0.05 eth\`:${sourceBalanceLine}`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -517,7 +517,7 @@ bot.action(/^custombuy_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
   await ctx.answerCbQuery();
   pending.set(ctx.from.id, { type: 'custom_buy', tokenAddress: ctx.match[1] });
   await ctx.editMessageText(
-    'Send the amount to spend — ETH like `0.03`, or USD like `$100`:',
+    'Send the amount to spend — USD like `100`, or ETH like `0.03 eth`:',
     { parse_mode: 'Markdown' }
   );
 });
@@ -565,7 +565,7 @@ bot.action(/^batchbuy_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
   if (user.wallets.length < 2) return ctx.reply('You need at least 2 wallets to use Batch Buy.', mainMenu());
   pending.set(uid, { type: 'batch_amount', tokenAddress: ctx.match[1] });
   await ctx.editMessageText(
-    'Send the amount to buy on EACH selected wallet — ETH like `0.02`, or USD like `$50`:',
+    'Send the amount to buy on EACH selected wallet — USD like `50`, or ETH like `0.02 eth`:',
     { parse_mode: 'Markdown' }
   );
 });
@@ -593,13 +593,11 @@ bot.action('batchconfirm', async (ctx) => {
   const { maxBuyEth } = getSettings(uid);
   if (state.ethAmount > maxBuyEth) {
     pending.delete(uid);
-    return ctx.reply(`❌ ${state.ethAmount} ETH exceeds your max buy size (${maxBuyEth} ETH).`, mainMenu());
+    return ctx.reply(`❌ ${fmtAmountLabel(state.ethAmount, state.usdInput)} exceeds your max buy size.`, mainMenu());
   }
 
   pending.delete(uid);
-  const label = state.usdInput !== null && state.usdInput !== undefined
-    ? `≈ ${state.ethAmount} ETH (${fmtUsd(state.usdInput)})`
-    : `${state.ethAmount} ETH`;
+  const label = fmtAmountLabel(state.ethAmount, state.usdInput);
   await ctx.editMessageText(`Buying ${label} on ${state.selected.length} wallet(s)... this may take a moment.`);
 
   const results = [];
@@ -723,7 +721,7 @@ bot.action('batchfund_start', async (ctx) => {
   await ctx.editMessageText(
     `📤 *Batch Fund*\n\n` +
     `Source wallet: *${source.name}* — ${source.balance.toFixed(4)} ETH\n\n` +
-    `Select which wallets to fund (the ETH amount you choose next will be sent to EACH one):`,
+    `Select which wallets to fund (the amount you choose next will be sent to EACH one):`,
     { parse_mode: 'Markdown', ...batchFundSelectMenu(candidates, []) }
   );
 });
@@ -756,7 +754,7 @@ bot.action('bfundconfirm', async (ctx) => {
     targets: state.candidates.filter((w) => state.selected.includes(w.id)),
   });
   await ctx.editMessageText(
-    'Send the ETH (or USD) amount to send to EACH selected wallet, e.g. `0.02` or `$50`:',
+    'Send the amount to send to EACH selected wallet — USD like `50`, or ETH like `0.02 eth`:',
     { parse_mode: 'Markdown' }
   );
 });
@@ -889,12 +887,14 @@ bot.action(/^buy_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
   const uid = ctx.from.id;
   const { confirmTrades, maxBuyEth } = getSettings(uid);
   const ethAmount = Number(ethAmountStr);
+  const ethUsd = await getEthUsdPrice().catch(() => null);
+  const label = fmtAmountLabel(ethAmount, ethUsd ? ethAmount * ethUsd : null);
   if (ethAmount > maxBuyEth) {
-    return ctx.editMessageText(`❌ ${ethAmount} ETH exceeds your max buy size (${maxBuyEth} ETH).`, mainMenu());
+    return ctx.editMessageText(`❌ ${label} exceeds your max buy size.`, mainMenu());
   }
   if (confirmTrades) {
     const gasLine = await gasEstimateLine(uid, FALLBACK_GAS_LIMIT_BUY);
-    await ctx.editMessageText(`Confirm: buy *${ethAmountStr} ETH* worth of this token?${gasLine}`, {
+    await ctx.editMessageText(`Confirm: buy *${label}* worth of this token?${gasLine}`, {
       parse_mode: 'Markdown',
       ...confirmMenu('buy', tokenAddress, ethAmountStr),
     });
@@ -1027,11 +1027,18 @@ bot.on('text', async (ctx) => {
     }
 
     if (state.type === 'settings_buy') {
-      const amounts = text.split(',').map((s) => parseFloat(s.trim())).filter((n) => !isNaN(n) && n > 0);
-      if (amounts.length === 0) return ctx.reply('Send valid numbers, e.g. `0.01, 0.05, 0.2`', { parse_mode: 'Markdown' });
+      const usdAmounts = text.split(',').map((s) => parseFloat(s.trim().replace(/^\$/, ''))).filter((n) => !isNaN(n) && n > 0);
+      if (usdAmounts.length === 0) return ctx.reply('Send valid USD numbers, e.g. `10, 50, 200`');
+      let ethUsd;
+      try {
+        ethUsd = await getEthUsdPrice();
+      } catch {
+        return ctx.reply('Price feed is down right now — try again shortly.');
+      }
+      const amounts = usdAmounts.map((usd) => Number((usd / ethUsd).toFixed(6)));
       updateSettings(uid, { buyPresetsEth: amounts });
       pending.delete(uid);
-      await ctx.reply(`✅ Buy presets updated: ${amounts.join(', ')} ETH`, mainMenu());
+      await ctx.reply(`✅ Buy presets updated: ${usdAmounts.map((u) => fmtUsd(u)).join(', ')}`, mainMenu());
       return;
     }
 
@@ -1054,20 +1061,34 @@ bot.on('text', async (ctx) => {
     }
 
     if (state.type === 'settings_maxbuy') {
-      const amt = parseFloat(text);
-      if (isNaN(amt) || amt <= 0) return ctx.reply('Send a valid positive ETH amount, e.g. `0.5`');
+      const usd = parseFloat(text.replace(/^\$/, ''));
+      if (isNaN(usd) || usd <= 0) return ctx.reply('Send a valid positive USD amount, e.g. `500`');
+      let ethUsd;
+      try {
+        ethUsd = await getEthUsdPrice();
+      } catch {
+        return ctx.reply('Price feed is down right now — try again shortly.');
+      }
+      const amt = Number((usd / ethUsd).toFixed(6));
       updateSettings(uid, { maxBuyEth: amt });
       pending.delete(uid);
-      await ctx.reply(`✅ Max buy size set to ${amt} ETH`, mainMenu());
+      await ctx.reply(`✅ Max buy size set to ${fmtUsd(usd)}`, mainMenu());
       return;
     }
 
     if (state.type === 'settings_maxbridge') {
-      const amt = parseFloat(text);
-      if (isNaN(amt) || amt <= 0) return ctx.reply('Send a valid positive ETH amount, e.g. `0.5`');
+      const usd = parseFloat(text.replace(/^\$/, ''));
+      if (isNaN(usd) || usd <= 0) return ctx.reply('Send a valid positive USD amount, e.g. `500`');
+      let ethUsd;
+      try {
+        ethUsd = await getEthUsdPrice();
+      } catch {
+        return ctx.reply('Price feed is down right now — try again shortly.');
+      }
+      const amt = Number((usd / ethUsd).toFixed(6));
       updateSettings(uid, { maxBridgeEth: amt });
       pending.delete(uid);
-      await ctx.reply(`✅ Max bridge size set to ${amt} ETH`, mainMenu());
+      await ctx.reply(`✅ Max bridge size set to ${fmtUsd(usd)}`, mainMenu());
       return;
     }
 
@@ -1097,13 +1118,13 @@ bot.on('text', async (ctx) => {
       const { maxBuyEth } = getSettings(uid);
       if (val > maxBuyEth) {
         pending.delete(uid);
-        return ctx.reply(`❌ ${val} ETH exceeds your max buy size (${maxBuyEth} ETH). Adjust it in Settings if this was intentional.`, mainMenu());
+        return ctx.reply(`❌ ${fmtAmountLabel(val, usdInput)} exceeds your max buy size. Adjust it in Settings if this was intentional.`, mainMenu());
       }
 
       pending.delete(uid);
 
       const { confirmTrades } = getSettings(uid);
-      const label = usdInput !== null ? `≈ ${val} ETH (${fmtUsd(usdInput)})` : `${val} ETH`;
+      const label = fmtAmountLabel(val, usdInput);
       if (confirmTrades) {
         const gasLine = await gasEstimateLine(uid, FALLBACK_GAS_LIMIT_BUY);
         await ctx.reply(`Confirm: buy *${label}*?${gasLine}`, {
@@ -1261,7 +1282,7 @@ bot.on('text', async (ctx) => {
       }
       pending.set(uid, { type: 'batchfund_new_amount', sourceWalletId: state.sourceWalletId, count });
       await ctx.reply(
-        `Send the ETH (or USD) amount to fund EACH of the ${count} new wallet(s) with, e.g. \`0.02\` or \`$50\`:`,
+        `Send the amount to fund EACH of the ${count} new wallet(s) with — USD like \`50\`, or ETH like \`0.02 eth\`:`,
         { parse_mode: 'Markdown' }
       );
       return;
@@ -1295,7 +1316,7 @@ bot.on('text', async (ctx) => {
       fundsInFlight.add(uid);
       pending.delete(uid);
 
-      const label = usdInput !== null ? `≈ ${amt} ETH (${fmtUsd(usdInput)})` : `${amt} ETH`;
+      const label = fmtAmountLabel(amt, usdInput);
       await ctx.reply(`Creating ${state.count} new wallet(s) and funding each with ${label}... this may take a moment.`);
 
       try {
@@ -1353,7 +1374,7 @@ bot.on('text', async (ctx) => {
       fundsInFlight.add(uid);
       pending.delete(uid);
 
-      const label = usdInput !== null ? `≈ ${amt} ETH (${fmtUsd(usdInput)})` : `${amt} ETH`;
+      const label = fmtAmountLabel(amt, usdInput);
       await ctx.reply(`Funding ${state.targets.length} wallet(s) with ${label} each from *${source.name}*... this may take a moment.`, { parse_mode: 'Markdown' });
 
       try {
@@ -1388,7 +1409,7 @@ bot.on('text', async (ctx) => {
       const { maxBridgeEth } = getSettings(uid);
       if (amt > maxBridgeEth) {
         pending.delete(uid);
-        return ctx.reply(`❌ ${amt.toFixed(6)} ETH exceeds your max bridge size (${maxBridgeEth} ETH). Adjust it in Settings if this was intentional.`, mainMenu());
+        return ctx.reply(`❌ ${fmtAmountLabel(amt, usdInput)} exceeds your max bridge size. Adjust it in Settings if this was intentional.`, mainMenu());
       }
 
       pending.delete(uid);
@@ -1402,9 +1423,7 @@ bot.on('text', async (ctx) => {
         return ctx.reply(`❌ Couldn't get a bridge quote: ${friendlyErrorMessage(err)}`, mainMenu());
       }
 
-      const sendLine = usdInput !== null
-        ? `Send: ≈ ${amt.toFixed(6)} ETH (${fmtUsd(usdInput)})`
-        : `Send: ${amt} ETH`;
+      const sendLine = `Send: ${fmtAmountLabel(amt, usdInput)}`;
 
       const { fromChain } = chainIdsForDirection(state.direction);
       const sourceProviderForEstimate = fromChain === ETH_CHAIN_ID ? ethMainnetProvider : provider;

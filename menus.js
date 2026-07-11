@@ -1,6 +1,6 @@
 import { Markup } from 'telegraf';
 import { shortAddr } from './wallet.js';
-import { getEthUsdPrice, getTokenMarketData, fmtUsd } from './price.js';
+import { getEthUsdPrice, getTokenMarketData, fmtUsd, getCachedEthUsdPrice } from './price.js';
 import { BRIDGE_DIRECTION } from './bridge.js';
 import {
   getUser,
@@ -55,14 +55,25 @@ export function exportConfirmMenu(walletId) {
   ]);
 }
 
+/**
+ * Settings amounts (buy presets, max buy, max bridge) are stored in ETH
+ * internally, but displayed as USD (mimics FOMO-style UX). Uses the
+ * short-lived cached price since this menu builder is synchronous; falls
+ * back to a raw ETH label on the rare case there's no fresh cached price.
+ */
+function usdOrEthLabel(ethAmount) {
+  const ethUsd = getCachedEthUsdPrice();
+  return ethUsd ? fmtUsd(ethAmount * ethUsd) : `${ethAmount} ETH`;
+}
+
 export function settingsMenu(uid) {
   const s = getSettings(uid);
   return Markup.inlineKeyboard([
-    [Markup.button.callback(`Buy presets: ${s.buyPresetsEth.join(', ')} ETH`, 'settings_buy')],
+    [Markup.button.callback(`Buy presets: ${s.buyPresetsEth.map(usdOrEthLabel).join(', ')}`, 'settings_buy')],
     [Markup.button.callback(`Sell presets: ${s.sellPresetsPct.join(', ')}%`, 'settings_sell')],
     [Markup.button.callback(`Slippage: ${(s.slippageBps / 100).toFixed(2)}%`, 'settings_slippage')],
-    [Markup.button.callback(`Max buy size: ${s.maxBuyEth} ETH`, 'settings_maxbuy')],
-    [Markup.button.callback(`Max bridge size: ${s.maxBridgeEth} ETH`, 'settings_maxbridge')],
+    [Markup.button.callback(`Max buy size: ${usdOrEthLabel(s.maxBuyEth)}`, 'settings_maxbuy')],
+    [Markup.button.callback(`Max bridge size: ${usdOrEthLabel(s.maxBridgeEth)}`, 'settings_maxbridge')],
     [Markup.button.callback(`Gas priority: ${s.gasTier} (tap to cycle)`, 'settings_gastier')],
     [Markup.button.callback(`Low balance alert: ${s.lowBalanceThresholdEth} ETH`, 'settings_lowbalance')],
     [Markup.button.callback(`Confirm before trade: ${s.confirmTrades ? 'ON ✅' : 'OFF ❌'}`, 'settings_toggle_confirm')],
@@ -99,12 +110,18 @@ export function directionLabel(direction) {
   return direction === BRIDGE_DIRECTION.ETH_TO_ROBINHOOD ? 'Ethereum ➜ Robinhood' : 'Robinhood ➜ Ethereum';
 }
 
-export function tokenMenu(uid, tokenAddress, hasPosition) {
+/**
+ * `ethUsd` is passed in (fetched once by the caller, e.g. renderTokenCard)
+ * so buy preset buttons can show USD amounts, e.g. "Buy $50", while the
+ * underlying preset amount (and the buy_ callback payload) stays in ETH.
+ */
+export function tokenMenu(uid, tokenAddress, hasPosition, ethUsd) {
   const s = getSettings(uid);
   const user = getUser(uid);
+  const buyLabel = (amt) => (ethUsd ? `Buy ${fmtUsd(amt * ethUsd)}` : `Buy ${amt} ETH`);
   const rows = [
-    s.buyPresetsEth.map((amt) => Markup.button.callback(`Buy ${amt} ETH`, `buy_${tokenAddress}_${amt}`)),
-    [Markup.button.callback('✏️ Custom Buy (ETH or $)', `custombuy_${tokenAddress}`)],
+    s.buyPresetsEth.map((amt) => Markup.button.callback(buyLabel(amt), `buy_${tokenAddress}_${amt}`)),
+    [Markup.button.callback('✏️ Custom Buy (USD or ETH)', `custombuy_${tokenAddress}`)],
   ];
   if (hasPosition) {
     rows.push(s.sellPresetsPct.map((pct) => Markup.button.callback(`Sell ${pct}%`, `sell_${tokenAddress}_${pct}`)));
@@ -196,6 +213,8 @@ export async function renderTokenCard(uid, tokenAddress) {
   if (!w) return { text: 'No active wallet. Add one first.', markup: walletsMenu(uid) };
 
   const market = await getTokenMarketData(tokenAddress).catch(() => null);
+  const ethUsd = await getEthUsdPrice().catch(() => null);
+
   if (!market) {
     return {
       text: `No market data found for:\n\`${tokenAddress}\`\n\nPool may not exist yet, or DexScreener hasn't indexed it.`,
@@ -209,7 +228,6 @@ export async function renderTokenCard(uid, tokenAddress) {
   const pos = getPosition(uid, w.id, tokenAddress);
   let pnlLine = '';
   if (pos && pos.tokenAmount > 0) {
-    const ethUsd = await getEthUsdPrice().catch(() => null);
     const currentValueUsd = pos.tokenAmount * market.priceUsd;
     const costUsd = ethUsd ? pos.costEth * ethUsd : null;
     if (costUsd !== null) {
@@ -238,5 +256,5 @@ export async function renderTokenCard(uid, tokenAddress) {
     `Your balance:\n${walletBalance}` +
     pnlLine;
 
-  return { text, markup: tokenMenu(uid, tokenAddress, !!(pos && pos.tokenAmount > 0)) };
+  return { text, markup: tokenMenu(uid, tokenAddress, !!(pos && pos.tokenAmount > 0), ethUsd) };
 }

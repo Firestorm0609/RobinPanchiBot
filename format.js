@@ -110,29 +110,54 @@ export async function getFreshQuote(quoteParams, quote, fetchedAt) {
   return getQuote(quoteParams);
 }
 
+/**
+ * Parses a user-entered amount. USD is now the DEFAULT format (mimics
+ * FOMO-style UX) — a bare number like `100` or `$100` is read as USD and
+ * converted to ETH via the live price. To enter a raw ETH amount instead,
+ * suffix it with "eth", e.g. `0.05 eth`.
+ *
+ * Internally we still always resolve to an ETH amount (`amountEth`) since
+ * every trade/bridge/transfer executes in ETH — only the input/display
+ * layer is USD-first now.
+ */
 export async function parseEthOrUsdInput(text) {
   const trimmed = text.trim();
-  const isUsd = trimmed.startsWith('$');
 
-  if (isUsd) {
-    const usd = parseFloat(trimmed.slice(1).replace(/,/g, ''));
-    if (isNaN(usd) || usd <= 0) {
-      throw new Error('Send a valid positive USD amount, e.g. `$100`');
+  const ethMatch = trimmed.match(/^([\d.,]+)\s*eth$/i);
+  if (ethMatch) {
+    const amt = parseFloat(ethMatch[1].replace(/,/g, ''));
+    if (isNaN(amt) || amt <= 0) {
+      throw new Error('Send a valid positive ETH amount, e.g. `0.05 eth`');
     }
-    let ethUsd;
-    try {
-      ethUsd = await getEthUsdPrice();
-    } catch {
-      throw new Error('Price feed is down right now — send an ETH amount instead, e.g. `0.05`');
-    }
-    return { amountEth: usd / ethUsd, usdInput: usd };
+    return { amountEth: amt, usdInput: null };
   }
 
-  const amt = parseFloat(trimmed);
-  if (isNaN(amt) || amt <= 0) {
-    throw new Error('Send a valid positive ETH amount (e.g. `0.05`) or USD amount (e.g. `$100`)');
+  const usdStr = trimmed.startsWith('$') ? trimmed.slice(1) : trimmed;
+  const usd = parseFloat(usdStr.replace(/,/g, ''));
+  if (isNaN(usd) || usd <= 0) {
+    throw new Error('Send a valid USD amount, e.g. `100` — or an ETH amount like `0.05 eth`');
   }
-  return { amountEth: amt, usdInput: null };
+
+  let ethUsd;
+  try {
+    ethUsd = await getEthUsdPrice();
+  } catch {
+    throw new Error('Price feed is down right now — send an ETH amount instead, e.g. `0.05 eth`');
+  }
+  return { amountEth: usd / ethUsd, usdInput: usd };
 }
 
 export const parseBridgeAmountInput = parseEthOrUsdInput;
+
+/**
+ * Standard "amount" label used across buy/batch/bridge confirmations and
+ * results — USD-first, with the ETH equivalent shown in parentheses. Falls
+ * back to a plain ETH label if no USD figure is available (e.g. explicit
+ * `0.05 eth` input, or price feed was down at parse time).
+ */
+export function fmtAmountLabel(amountEth, usdInput) {
+  if (usdInput !== null && usdInput !== undefined) {
+    return `${fmtUsd(usdInput)} (≈ ${amountEth} ETH)`;
+  }
+  return `${amountEth} ETH`;
+}
