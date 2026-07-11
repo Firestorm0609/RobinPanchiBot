@@ -40,7 +40,7 @@ import {
 } from './storage.js';
 
 import { validateEnv, provider, ethMainnetProvider, CA_REGEX, FALLBACK_GAS_LIMIT_BUY, FALLBACK_GAS_LIMIT_SELL, MAX_BATCH_FUND_NEW_WALLETS, GAS_TIERS, TERMS_TEXT, HELP_TEXT, WELCOME_TEXT } from './config.js';
-import { pending, fundsInFlight, lowBalanceWarned, botIdentity, gasMultiplierFor } from './state.js';
+import { pending, fundsInFlight, lowBalanceWarned, botIdentity, gasMultiplierFor, autoRefreshTimers, stopAutoRefresh, stopAllAutoRefreshes } from './state.js';
 import { dualEthBalanceLines, getBridgeBalances, fmtBridgeBalanceLine, gasEstimateLine, friendlyErrorMessage, parseEthOrUsdInput, parseBridgeAmountInput, parseMcapInput, mcapToPrice, fmtEth, fmtAmountLabel } from './format.js';
 import {
   mainMenu, walletsMenu, walletDetailMenu, exportConfirmMenu, settingsMenu, rewardsMenu,
@@ -64,6 +64,35 @@ bot.telegram.getMe()
 
 function referralLink(code) {
   return `https://t.me/${botIdentity.username || 'your_bot'}?start=ref_${code}`;
+}
+
+// ---------- Token card auto-refresh (every 30s) ----------
+// Keeps the last-viewed token card (price, PnL, position) live in place
+// without the user having to tap Refresh. Only one runs per user — each
+// call clears any prior timer for that uid (see stopAutoRefresh in state.js).
+
+const AUTO_REFRESH_INTERVAL_MS = 30_000;
+
+function scheduleCardAutoRefresh(uid, tokenAddress, chatId, messageId) {
+  stopAutoRefresh(uid);
+  const key = String(uid);
+  const timer = setInterval(async () => {
+    try {
+      const { text, markup } = await renderTokenCard(uid, tokenAddress);
+      await bot.telegram.editMessageText(chatId, messageId, undefined, text, {
+        parse_mode: 'Markdown',
+        ...markup,
+      });
+    } catch (err) {
+      // "message is not modified" just means nothing changed since last
+      // tick — not an error, keep the timer running.
+      if (err.description?.includes('message is not modified')) return;
+      // Anything else (message deleted, chat gone, bot blocked, user
+      // navigated away and the message no longer exists) — stop trying.
+      stopAutoRefresh(key);
+    }
+  }, AUTO_REFRESH_INTERVAL_MS);
+  autoRefreshTimers.set(key, timer);
 }
 
 // ---------- Start / Main menu ----------
@@ -171,6 +200,7 @@ bot.command('admin_bridges', async (ctx) => {
 
 bot.action('menu_main', async (ctx) => {
   await ctx.answerCbQuery();
+  stopAutoRefresh(ctx.from.id);
   await ctx.editMessageText('🌴 *RobinPanchi Trading Bot*', { parse_mode: 'Markdown', ...mainMenu() });
 });
 
@@ -924,10 +954,13 @@ bot.action('menu_balance', async (ctx) => {
 
 bot.action(/^refresh_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
   await ctx.answerCbQuery('Refreshed');
-  const { text, markup } = await renderTokenCard(ctx.from.id, ctx.match[1]);
+  const tokenAddress = ctx.match[1];
+  const uid = ctx.from.id;
+  const { text, markup } = await renderTokenCard(uid, tokenAddress);
   await ctx.editMessageText(text, { parse_mode: 'Markdown', ...markup }).catch((err) => {
     if (!err.description?.includes('message is not modified')) throw err;
   });
+  scheduleCardAutoRefresh(uid, tokenAddress, ctx.chat.id, ctx.callbackQuery.message.message_id);
 });
 
 // ---------- Buy ----------
@@ -956,8 +989,13 @@ bot.action(/^buy_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
 });
 
 // ---------- Sell ----------
+// NOTE: percentage capture group is [\d.]+ (not \d+) so that decimal sell
+// percentages — which both `custom_sell` and `settings_sell` freely accept
+// via parseFloat — actually match here. With plain \d+, a preset or custom
+// value like "33.5" produced a callback_data with no matching handler, so
+// tapping the button silently did nothing.
 
-bot.action(/^sell_(0x[a-fA-F0-9]{40})_(\d+)$/, async (ctx) => {
+bot.action(/^sell_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   if (isRateLimited(ctx.from.id)) return ctx.reply('⏳ Slow down a bit — too many actions in the last minute.');
   const [, tokenAddress, pctStr] = ctx.match;
@@ -980,7 +1018,7 @@ bot.action(/^confirm_buy_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
   await executeBuy(ctx, ctx.from.id, ctx.match[1], Number(ctx.match[2]));
 });
 
-bot.action(/^confirm_sell_(0x[a-fA-F0-9]{40})_(\d+)$/, async (ctx) => {
+bot.action(/^confirm_sell_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   if (isRateLimited(ctx.from.id)) return ctx.reply('⏳ Slow down a bit — too many actions in the last minute.');
   await executeSell(ctx, ctx.from.id, ctx.match[1], Number(ctx.match[2]));
@@ -1017,7 +1055,8 @@ bot.on('text', async (ctx) => {
     if (isRateLimited(uid)) return ctx.reply('⏳ Slow down a bit — too many lookups in the last minute.');
     pending.delete(uid);
     const { text: cardText, markup } = await renderTokenCard(uid, text);
-    await ctx.reply(cardText, { parse_mode: 'Markdown', ...markup });
+    const sent = await ctx.reply(cardText, { parse_mode: 'Markdown', ...markup });
+    scheduleCardAutoRefresh(uid, text, sent.chat.id, sent.message_id);
     return;
   }
 
@@ -1272,6 +1311,15 @@ bot.on('text', async (ctx) => {
         return ctx.reply(err.message, { parse_mode: 'Markdown' });
       }
       amt = Number(amt.toFixed(6));
+
+      // FIX: this path previously queued a limit buy of any size, bypassing
+      // the user's configured maxBuyEth cap entirely — every other buy path
+      // (buy_ callback, custom_buy, batch buy) already enforces this.
+      const { maxBuyEth } = getSettings(uid);
+      if (amt > maxBuyEth) {
+        pending.delete(uid);
+        return ctx.reply(`❌ ${fmtAmountLabel(amt, usdInput)} exceeds your max buy size (${maxBuyEth} ETH). Adjust it in Settings if this was intentional.`, mainMenu());
+      }
 
       const w = getActiveWallet(uid);
       if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
@@ -1563,5 +1611,5 @@ bot.launch()
 
 console.log('Panchi trading bot running.');
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+process.once('SIGINT', () => { stopAllAutoRefreshes(); bot.stop('SIGINT'); });
+process.once('SIGTERM', () => { stopAllAutoRefreshes(); bot.stop('SIGTERM'); });
