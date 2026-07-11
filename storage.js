@@ -94,7 +94,8 @@ CREATE TABLE IF NOT EXISTS limit_orders (
   wallet_id TEXT NOT NULL,
   token_address TEXT NOT NULL,
   side TEXT NOT NULL, -- 'buy' | 'sell'
-  trigger_price REAL NOT NULL, -- USD price
+  trigger_price REAL NOT NULL, -- USD price (per-token), what the poller actually checks
+  target_mcap REAL, -- USD market cap the user actually typed in — display only
   amount REAL NOT NULL, -- ETH amount for buy side, token amount for sell side
   status TEXT NOT NULL, -- 'open' | 'filled' | 'cancelled' | 'failed'
   created_at INTEGER NOT NULL,
@@ -138,6 +139,13 @@ if (!positionCols.includes('entry_mcap')) {
 const tradeLogCols = db.prepare("PRAGMA table_info(trade_log)").all().map((c) => c.name);
 if (!tradeLogCols.includes('mcap_usd')) {
   db.exec('ALTER TABLE trade_log ADD COLUMN mcap_usd REAL');
+}
+
+// Migration: add target_mcap to limit_orders (existing open orders, created
+// before this update, get NULL — they'll display their raw trigger price instead).
+const limitOrderCols = db.prepare("PRAGMA table_info(limit_orders)").all().map((c) => c.name);
+if (!limitOrderCols.includes('target_mcap')) {
+  db.exec('ALTER TABLE limit_orders ADD COLUMN target_mcap REAL');
 }
 
 const DEFAULT_SETTINGS = {
@@ -484,23 +492,29 @@ export function getActiveAutoRulesForUser(uid) {
 }
 
 // ---------- Limit orders ----------
-// trigger_price is a USD price. side='buy' fires when market price drops to
-// or below trigger_price; side='sell' fires when it rises to or above it.
+// trigger_price is a USD price (per token) — this is what the background
+// poller actually compares against live market data. target_mcap is the
+// user-facing figure they typed in (e.g. "50k") and is stored purely for
+// display in the order list / confirmations; it's derived to trigger_price
+// at creation time via mcapToPrice() in format.js.
+// side='buy' fires when market price drops to or below trigger_price;
+// side='sell' fires when it rises to or above it.
 // amount is an ETH amount for buy orders, a token amount for sell orders.
 
-export function createLimitOrder({ uid, walletId, tokenAddress, side, triggerPrice, amount }) {
+export function createLimitOrder({ uid, walletId, tokenAddress, side, triggerPrice, amount, targetMcap = null }) {
   const id = `lo_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const now = Date.now();
   db.prepare(`
-    INSERT INTO limit_orders (id, uid, wallet_id, token_address, side, trigger_price, amount, status, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
-  `).run(id, String(uid), walletId, tokenAddress.toLowerCase(), side, triggerPrice, amount, now, now);
+    INSERT INTO limit_orders (id, uid, wallet_id, token_address, side, trigger_price, target_mcap, amount, status, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
+  `).run(id, String(uid), walletId, tokenAddress.toLowerCase(), side, triggerPrice, targetMcap, amount, now, now);
   return id;
 }
 
 export function cancelLimitOrder(uid, id) {
-  db.prepare(`UPDATE limit_orders SET status = 'cancelled', updated_at = ? WHERE id = ? AND uid = ? AND status = 'open'`)
+  const result = db.prepare(`UPDATE limit_orders SET status = 'cancelled', updated_at = ? WHERE id = ? AND uid = ? AND status = 'open'`)
     .run(Date.now(), id, String(uid));
+  return result.changes > 0;
 }
 
 export function markLimitOrderDone(id, status) {
@@ -516,6 +530,10 @@ export function getOpenLimitOrders() {
 export function getOpenLimitOrdersForUser(uid) {
   return db.prepare(`SELECT * FROM limit_orders WHERE uid = ? AND status = 'open' ORDER BY created_at DESC`)
     .all(String(uid));
+}
+
+export function getLimitOrder(uid, id) {
+  return db.prepare(`SELECT * FROM limit_orders WHERE id = ? AND uid = ?`).get(id, String(uid));
 }
 
 // ---------- Admin stats ----------
