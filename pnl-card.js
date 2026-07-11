@@ -23,14 +23,14 @@ function escapeXml(str) {
 function buildOverlaySvg({ symbol, subtitle, pnlLabel, isWin, stats, nftLabel, footerLeft, footerRight }) {
   const pillBg = isWin ? 'rgba(99,153,34,0.9)' : 'rgba(163,45,45,0.9)';
   const pillText = isWin ? '#173404' : '#ffffff';
-  const pillWidth = Math.max(120, 24 + pnlLabel.length * 13);
+  const pillWidth = Math.max(130, 26 + pnlLabel.length * 14);
 
   const colWidth = (CARD_SIZE - 64) / stats.length;
   const statCols = stats.map((s, i) => {
     const x = 32 + i * colWidth;
     return `
-    <text x="${x}" y="${CARD_SIZE - 118}" font-family="Arial, sans-serif" font-size="18" fill="#888780">${escapeXml(s.label)}</text>
-    <text x="${x}" y="${CARD_SIZE - 90}" font-family="Arial, sans-serif" font-size="25" font-weight="bold" fill="${s.color || '#ffffff'}">${escapeXml(s.value)}</text>`;
+    <text x="${x}" y="${CARD_SIZE - 118}" font-family="Arial, sans-serif" font-size="20" fill="#888780">${escapeXml(s.label)}</text>
+    <text x="${x}" y="${CARD_SIZE - 88}" font-family="Arial, sans-serif" font-size="29" font-weight="bold" fill="${s.color || '#ffffff'}">${escapeXml(s.value)}</text>`;
   }).join('');
 
   return `
@@ -44,20 +44,20 @@ function buildOverlaySvg({ symbol, subtitle, pnlLabel, isWin, stats, nftLabel, f
     </defs>
     <rect width="${CARD_SIZE}" height="${CARD_SIZE}" fill="url(#fade)"/>
 
-    <rect x="28" y="28" rx="20" ry="20" width="210" height="36" fill="rgba(0,0,0,0.5)"/>
-    <text x="46" y="52" font-family="Arial, sans-serif" font-size="20" font-weight="bold" fill="#ffffff">${escapeXml(nftLabel)}</text>
+    <rect x="28" y="28" rx="20" ry="20" width="220" height="38" fill="rgba(0,0,0,0.5)"/>
+    <text x="46" y="53" font-family="Arial, sans-serif" font-size="21" font-weight="bold" fill="#ffffff">${escapeXml(nftLabel)}</text>
 
-    <rect x="${CARD_SIZE - pillWidth - 30}" y="28" rx="20" ry="20" width="${pillWidth}" height="36" fill="${pillBg}"/>
-    <text x="${CARD_SIZE - 30 - pillWidth / 2}" y="52" font-family="Arial, sans-serif" font-size="18" font-weight="bold" fill="${pillText}" text-anchor="middle">${escapeXml(pnlLabel)}</text>
+    <rect x="${CARD_SIZE - pillWidth - 30}" y="28" rx="20" ry="20" width="${pillWidth}" height="38" fill="${pillBg}"/>
+    <text x="${CARD_SIZE - 30 - pillWidth / 2}" y="53" font-family="Arial, sans-serif" font-size="19" font-weight="bold" fill="${pillText}" text-anchor="middle">${escapeXml(pnlLabel)}</text>
 
-    <text x="32" y="${CARD_SIZE - 190}" font-family="Arial, sans-serif" font-size="40" font-weight="bold" fill="#ffffff">${escapeXml(symbol)}</text>
-    <text x="32" y="${CARD_SIZE - 160}" font-family="Arial, sans-serif" font-size="20" fill="#B4B2A9">${escapeXml(subtitle)}</text>
+    <text x="32" y="${CARD_SIZE - 190}" font-family="Arial, sans-serif" font-size="44" font-weight="bold" fill="#ffffff">${escapeXml(symbol)}</text>
+    <text x="32" y="${CARD_SIZE - 158}" font-family="Arial, sans-serif" font-size="22" fill="#B4B2A9">${escapeXml(subtitle)}</text>
 
     ${statCols}
 
     <line x1="32" y1="${CARD_SIZE - 56}" x2="${CARD_SIZE - 32}" y2="${CARD_SIZE - 56}" stroke="rgba(255,255,255,0.15)" stroke-width="1"/>
-    <text x="32" y="${CARD_SIZE - 28}" font-family="Arial, sans-serif" font-size="16" fill="#5f5e5a">${escapeXml(footerLeft)}</text>
-    <text x="${CARD_SIZE - 32}" y="${CARD_SIZE - 28}" font-family="Arial, sans-serif" font-size="16" fill="#5f5e5a" text-anchor="end">${escapeXml(footerRight)}</text>
+    <text x="32" y="${CARD_SIZE - 27}" font-family="Arial, sans-serif" font-size="17" fill="#5f5e5a">${escapeXml(footerLeft)}</text>
+    <text x="${CARD_SIZE - 32}" y="${CARD_SIZE - 27}" font-family="Arial, sans-serif" font-size="17" fill="#5f5e5a" text-anchor="end">${escapeXml(footerRight)}</text>
   </svg>`;
 }
 
@@ -72,7 +72,7 @@ async function renderCard({ uid, symbol, subtitle, pnlLabel, isWin, stats }) {
 
   const overlay = Buffer.from(buildOverlaySvg({
     symbol, subtitle, pnlLabel, isWin, stats, nftLabel,
-    footerLeft: 't.me/robinpanchi_bot',
+    footerLeft: 't.me/panchitradingbot',
     footerRight: '@robinpanchi',
   }));
 
