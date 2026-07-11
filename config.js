@@ -96,7 +96,7 @@ export const HELP_TEXT =
   '*Auto TP/SL*\n' +
   'On any open position, tap 🎯 Set TP/SL to have the bot automatically sell 100% of that position once it hits your target gain (take-profit) or loss (stop-loss). One active rule per position — setting a new one replaces the old.\n\n' +
   '*Limit orders*\n' +
-  'Tap ⏰ Limit Buy or ⏰ Limit Sell on a token to queue a trade that fires automatically once the price crosses your target (checked roughly every 30s). Cancel anytime is not yet exposed in-chat — contact support if you need one removed early.\n\n' +
+  'Tap ⏰ Limit Buy or ⏰ Limit Sell on a token to queue a trade that fires automatically once the price crosses your target. Cancel anytime under ⏰ Limit Orders in the main menu.\n\n' +
   '*Batch Buy*\n' +
   'Tap 📦 Batch Buy on a token to buy the same ETH or USD amount across multiple wallets in one go — useful for spreading a position.\n\n' +
   '*Batch Sell*\n' +
