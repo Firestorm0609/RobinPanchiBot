@@ -1236,7 +1236,7 @@ bot.on('text', async (ctx) => {
       if (tpPct !== null) parts2.push(`TP +${tpPct}%`);
       if (slPct !== null) parts2.push(`SL -${slPct}%`);
       await ctx.reply(
-        `✅ Auto-sell rule set: ${parts2.join(' / ')}. I'll sell 100% of this position automatically (checked ~every 30s) and DM you when it fires.`,
+        `✅ Auto-sell rule set: ${parts2.join(' / ')}. I'll sell 100% of this position automatically and DM you when it fires.`,
         mainMenu()
       );
       return;
@@ -1278,7 +1278,7 @@ bot.on('text', async (ctx) => {
       pending.delete(uid);
       createLimitOrder({ uid, walletId: w.id, tokenAddress: state.tokenAddress, side: 'buy', triggerPrice: state.triggerPrice, amount: amt, targetMcap: state.targetMcap });
       await ctx.reply(
-        `✅ Limit buy queued: ${fmtAmountLabel(amt, usdInput)} when mcap ≤ ${fmtUsd(state.targetMcap)} (checked ~every 30s). I'll DM you when it fills.`,
+        `✅ Limit buy queued: ${fmtAmountLabel(amt, usdInput)} when mcap ≤ ${fmtUsd(state.targetMcap)}. I'll DM you when it fills.`,
         mainMenu()
       );
       return;
@@ -1320,7 +1320,7 @@ bot.on('text', async (ctx) => {
       const clamped = Math.min(amt, state.maxAmount);
       createLimitOrder({ uid, walletId: w.id, tokenAddress: state.tokenAddress, side: 'sell', triggerPrice: state.triggerPrice, amount: clamped, targetMcap: state.targetMcap });
       await ctx.reply(
-        `✅ Limit sell queued: ${clamped.toFixed(4)} tokens when mcap ≥ ${fmtUsd(state.targetMcap)} (checked ~every 30s). I'll DM you when it fills.`,
+        `✅ Limit sell queued: ${clamped.toFixed(4)} tokens when mcap ≥ ${fmtUsd(state.targetMcap)}. I'll DM you when it fills.`,
         mainMenu()
       );
       return;
