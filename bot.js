@@ -40,12 +40,19 @@ import {
 } from './storage.js';
 
 import { validateEnv, provider, ethMainnetProvider, CA_REGEX, FALLBACK_GAS_LIMIT_BUY, FALLBACK_GAS_LIMIT_SELL, MAX_BATCH_FUND_NEW_WALLETS, GAS_TIERS, TERMS_TEXT, HELP_TEXT, WELCOME_TEXT } from './config.js';
-import { pending, fundsInFlight, lowBalanceWarned, botIdentity, gasMultiplierFor, autoRefreshTimers, stopAutoRefresh, stopAllAutoRefreshes } from './state.js';
+import {
+  pending, fundsInFlight, lowBalanceWarned, botIdentity, gasMultiplierFor,
+  autoRefreshTimers, stopAutoRefresh,
+  positionsRefreshTimers, stopPositionsRefresh,
+  portfolioRefreshTimers, stopPortfolioRefresh,
+  stopAllViewRefreshes, stopAllAutoRefreshes,
+} from './state.js';
 import { dualEthBalanceLines, getBridgeBalances, fmtBridgeBalanceLine, gasEstimateLine, friendlyErrorMessage, parseEthOrUsdInput, parseBridgeAmountInput, parseMcapInput, mcapToPrice, fmtEth, fmtAmountLabel } from './format.js';
 import {
   mainMenu, walletsMenu, walletDetailMenu, exportConfirmMenu, settingsMenu, rewardsMenu,
   bridgeMenu, bridgeConfirmMenu, directionLabel, tokenMenu, batchSelectMenu, batchSellSelectMenu,
   batchFundSelectMenu, collectSelectMenu, confirmMenu, renderTokenCard, limitOrdersText, limitOrdersMenu,
+  renderPositionsView, renderPortfolioView,
 } from './menus.js';
 import { executeBuy, executeSell, performBuyCore, performSellCore, estimateTransferGasReserve, distributeEth, performCollectCore } from './trade-core.js';
 import { executeBridge } from './bridge-actions.js';
@@ -66,10 +73,10 @@ function referralLink(code) {
   return `https://t.me/${botIdentity.username || 'your_bot'}?start=ref_${code}`;
 }
 
-// ---------- Token card auto-refresh (every 30s) ----------
-// Keeps the last-viewed token card (price, PnL, position) live in place
-// without the user having to tap Refresh. Only one runs per user — each
-// call clears any prior timer for that uid (see stopAutoRefresh in state.js).
+// ---------- Live-view auto-refresh (every 30s) ----------
+// Keeps the last-viewed token card / positions list / portfolio summary live
+// in place without the user having to tap Refresh. Only one of each runs per
+// user — each call clears any prior timer of that kind for that uid.
 
 const AUTO_REFRESH_INTERVAL_MS = 30_000;
 
@@ -93,6 +100,42 @@ function scheduleCardAutoRefresh(uid, tokenAddress, chatId, messageId) {
     }
   }, AUTO_REFRESH_INTERVAL_MS);
   autoRefreshTimers.set(key, timer);
+}
+
+function schedulePositionsAutoRefresh(uid, chatId, messageId) {
+  stopPositionsRefresh(uid);
+  const key = String(uid);
+  const timer = setInterval(async () => {
+    try {
+      const { text, markup } = await renderPositionsView(uid);
+      await bot.telegram.editMessageText(chatId, messageId, undefined, text, {
+        parse_mode: 'Markdown',
+        ...markup,
+      });
+    } catch (err) {
+      if (err.description?.includes('message is not modified')) return;
+      stopPositionsRefresh(key);
+    }
+  }, AUTO_REFRESH_INTERVAL_MS);
+  positionsRefreshTimers.set(key, timer);
+}
+
+function schedulePortfolioAutoRefresh(uid, chatId, messageId) {
+  stopPortfolioRefresh(uid);
+  const key = String(uid);
+  const timer = setInterval(async () => {
+    try {
+      const { text, markup } = await renderPortfolioView(uid);
+      await bot.telegram.editMessageText(chatId, messageId, undefined, text, {
+        parse_mode: 'Markdown',
+        ...markup,
+      });
+    } catch (err) {
+      if (err.description?.includes('message is not modified')) return;
+      stopPortfolioRefresh(key);
+    }
+  }, AUTO_REFRESH_INTERVAL_MS);
+  portfolioRefreshTimers.set(key, timer);
 }
 
 // ---------- Start / Main menu ----------
@@ -200,18 +243,20 @@ bot.command('admin_bridges', async (ctx) => {
 
 bot.action('menu_main', async (ctx) => {
   await ctx.answerCbQuery();
-  stopAutoRefresh(ctx.from.id);
+  stopAllViewRefreshes(ctx.from.id);
   await ctx.editMessageText('🌴 *RobinPanchi Trading Bot*', { parse_mode: 'Markdown', ...mainMenu() });
 });
 
 bot.action('menu_trade', async (ctx) => {
   await ctx.answerCbQuery();
+  stopAllViewRefreshes(ctx.from.id);
   pending.set(ctx.from.id, { type: 'awaiting_ca' });
   await ctx.editMessageText('Paste the token contract address:');
 });
 
 bot.action('menu_help', async (ctx) => {
   await ctx.answerCbQuery();
+  stopAllViewRefreshes(ctx.from.id);
   await ctx.editMessageText(HELP_TEXT, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_main')]]),
@@ -222,6 +267,7 @@ bot.action('menu_help', async (ctx) => {
 
 bot.action('menu_wallets', async (ctx) => {
   await ctx.answerCbQuery();
+  stopAllViewRefreshes(ctx.from.id);
   const uid = ctx.from.id;
   const user = getUser(uid);
   const header = user.wallets.length === 0
@@ -297,41 +343,27 @@ bot.action(/^wallet_(?!create|import|activate|rename|remove|export)(.+)$/, async
 bot.action('menu_positions', async (ctx) => {
   await ctx.answerCbQuery();
   const uid = ctx.from.id;
-  const w = getActiveWallet(uid);
-  if (!w) return ctx.editMessageText('No active wallet. Add one first.', walletsMenu(uid));
+  stopAutoRefresh(uid);
+  stopPortfolioRefresh(uid);
 
-  const positions = getAllPositions(uid, w.id);
-  if (positions.length === 0) {
-    return ctx.editMessageText('📊 No positions yet. Trade a token to open one.', {
-      ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_main')]]),
-    });
+  const { text, markup } = await renderPositionsView(uid);
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...markup });
+
+  if (ctx.callbackQuery?.message?.message_id) {
+    schedulePositionsAutoRefresh(uid, ctx.chat.id, ctx.callbackQuery.message.message_id);
   }
+});
 
-  const ethUsd = await getEthUsdPrice().catch(() => null);
-  const rows = [];
-  let text = `📊 *Positions* — ${w.name}\n`;
-
-  for (const pos of positions) {
-    const market = await getTokenMarketData(pos.tokenAddress).catch(() => null);
-    const symbol = market?.symbol ?? shortAddr(pos.tokenAddress);
-    if (market && ethUsd) {
-      const valueUsd = pos.tokenAmount * market.priceUsd;
-      const costUsd = pos.costEth * ethUsd;
-      const pnlUsd = valueUsd - costUsd;
-      const pnlPct = costUsd > 0 ? (pnlUsd / costUsd) * 100 : 0;
-      const emoji = pnlUsd >= 0 ? '🟢' : '🔴';
-      text += `\n*${symbol}*: ${pos.tokenAmount.toFixed(4)} — ${fmtUsd(valueUsd)} (${emoji} ${pnlPct.toFixed(1)}%)`;
-      if (pos.entryMcap != null) {
-        text += `\n  Entry mcap: ${fmtUsd(pos.entryMcap)}`;
-      }
-    } else {
-      text += `\n*${symbol}*: ${pos.tokenAmount.toFixed(4)} — price unavailable`;
-    }
-    rows.push([Markup.button.callback(`View ${symbol}`, `refresh_${pos.tokenAddress}`)]);
+bot.action('menu_positions_refresh', async (ctx) => {
+  await ctx.answerCbQuery('Refreshed');
+  const uid = ctx.from.id;
+  const { text, markup } = await renderPositionsView(uid);
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...markup }).catch((err) => {
+    if (!err.description?.includes('message is not modified')) throw err;
+  });
+  if (ctx.callbackQuery?.message?.message_id) {
+    schedulePositionsAutoRefresh(uid, ctx.chat.id, ctx.callbackQuery.message.message_id);
   }
-
-  rows.push([Markup.button.callback('⬅️ Back', 'menu_main')]);
-  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(rows) });
 });
 
 // ---------- Portfolio-wide PnL summary ----------
@@ -339,62 +371,34 @@ bot.action('menu_positions', async (ctx) => {
 bot.action('menu_portfolio', async (ctx) => {
   await ctx.answerCbQuery();
   const uid = ctx.from.id;
-  const positions = getAllPositionsForUser(uid);
+  stopAutoRefresh(uid);
+  stopPositionsRefresh(uid);
 
-  if (positions.length === 0) {
-    return ctx.editMessageText('📈 No open positions across any wallet yet.', {
-      ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_main')]]),
-    });
+  const { text, markup } = await renderPortfolioView(uid);
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...markup });
+
+  if (ctx.callbackQuery?.message?.message_id) {
+    schedulePortfolioAutoRefresh(uid, ctx.chat.id, ctx.callbackQuery.message.message_id);
   }
+});
 
-  const ethUsd = await getEthUsdPrice().catch(() => null);
-  const lines = [];
-  let totalValueUsd = 0;
-  let totalCostUsd = 0;
-  let anyPriceUnavailable = false;
-
-  for (const pos of positions) {
-    const market = await getTokenMarketData(pos.tokenAddress).catch(() => null);
-    const symbol = market?.symbol ?? shortAddr(pos.tokenAddress);
-    if (market && ethUsd) {
-      const valueUsd = pos.tokenAmount * market.priceUsd;
-      const costUsd = pos.costEth * ethUsd;
-      totalValueUsd += valueUsd;
-      totalCostUsd += costUsd;
-      const pnlUsd = valueUsd - costUsd;
-      const pnlPct = costUsd > 0 ? (pnlUsd / costUsd) * 100 : 0;
-      const emoji = pnlUsd >= 0 ? '🟢' : '🔴';
-      let line = `*${symbol}* (${pos.walletName}): ${fmtUsd(valueUsd)} (${emoji} ${pnlPct.toFixed(1)}%)`;
-      if (pos.entryMcap != null) line += `\n  Entry mcap: ${fmtUsd(pos.entryMcap)}`;
-      lines.push(line);
-    } else {
-      anyPriceUnavailable = true;
-      lines.push(`*${symbol}* (${pos.walletName}): price unavailable`);
-    }
-  }
-
-  const totalPnlUsd = totalValueUsd - totalCostUsd;
-  const totalPnlPct = totalCostUsd > 0 ? (totalPnlUsd / totalCostUsd) * 100 : 0;
-  const totalEmoji = totalPnlUsd >= 0 ? '🟢' : '🔴';
-  const disclaimer = anyPriceUnavailable ? '\n_Totals exclude positions with unavailable pricing._' : '';
-
-  const text =
-    `📈 *Portfolio Summary* — all wallets\n\n` +
-    `Total value: ${fmtUsd(totalValueUsd)}\n` +
-    `Total cost: ${fmtUsd(totalCostUsd)}\n` +
-    `Total PnL: ${totalEmoji} ${fmtUsd(totalPnlUsd)} (${totalPnlPct.toFixed(1)}%)${disclaimer}\n\n` +
-    `*Positions:*\n${lines.join('\n')}`;
-
-  await ctx.editMessageText(text, {
-    parse_mode: 'Markdown',
-    ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_main')]]),
+bot.action('menu_portfolio_refresh', async (ctx) => {
+  await ctx.answerCbQuery('Refreshed');
+  const uid = ctx.from.id;
+  const { text, markup } = await renderPortfolioView(uid);
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...markup }).catch((err) => {
+    if (!err.description?.includes('message is not modified')) throw err;
   });
+  if (ctx.callbackQuery?.message?.message_id) {
+    schedulePortfolioAutoRefresh(uid, ctx.chat.id, ctx.callbackQuery.message.message_id);
+  }
 });
 
 // ---------- Settings ----------
 
 bot.action('menu_settings', async (ctx) => {
   await ctx.answerCbQuery();
+  stopAllViewRefreshes(ctx.from.id);
   await ctx.editMessageText('⚙️ *Settings*', { parse_mode: 'Markdown', ...settingsMenu(ctx.from.id) });
 });
 
@@ -457,6 +461,7 @@ bot.action('settings_toggle_confirm', async (ctx) => {
 
 bot.action('menu_rewards', async (ctx) => {
   await ctx.answerCbQuery();
+  stopAllViewRefreshes(ctx.from.id);
   const uid = ctx.from.id;
   const tickets = getTicketCount(uid);
   await ctx.editMessageText(
@@ -484,6 +489,7 @@ bot.action('rewards_link', async (ctx) => {
 
 bot.action('menu_bridge', async (ctx) => {
   await ctx.answerCbQuery();
+  stopAllViewRefreshes(ctx.from.id);
   const w = getActiveWallet(ctx.from.id);
   if (!w) return ctx.editMessageText('No active wallet. Add one first.', walletsMenu(ctx.from.id));
 
@@ -605,6 +611,7 @@ bot.action(/^limitsell_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
 
 bot.action('menu_limitorders', async (ctx) => {
   await ctx.answerCbQuery();
+  stopAllViewRefreshes(ctx.from.id);
   const uid = ctx.from.id;
   const orders = getOpenLimitOrdersForUser(uid);
 
@@ -941,6 +948,7 @@ bot.action('collectconfirm', async (ctx) => {
 
 bot.action('menu_balance', async (ctx) => {
   await ctx.answerCbQuery();
+  stopAllViewRefreshes(ctx.from.id);
   const w = getActiveWallet(ctx.from.id);
   if (!w) return ctx.editMessageText('No active wallet. Add one first.', walletsMenu(ctx.from.id));
   const bal = await dualEthBalanceLines(w.address);
@@ -956,6 +964,8 @@ bot.action(/^refresh_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
   await ctx.answerCbQuery('Refreshed');
   const tokenAddress = ctx.match[1];
   const uid = ctx.from.id;
+  stopPositionsRefresh(uid);
+  stopPortfolioRefresh(uid);
   const { text, markup } = await renderTokenCard(uid, tokenAddress);
   await ctx.editMessageText(text, { parse_mode: 'Markdown', ...markup }).catch((err) => {
     if (!err.description?.includes('message is not modified')) throw err;
@@ -1054,6 +1064,8 @@ bot.on('text', async (ctx) => {
     }
     if (isRateLimited(uid)) return ctx.reply('⏳ Slow down a bit — too many lookups in the last minute.');
     pending.delete(uid);
+    stopPositionsRefresh(uid);
+    stopPortfolioRefresh(uid);
     const { text: cardText, markup } = await renderTokenCard(uid, text);
     const sent = await ctx.reply(cardText, { parse_mode: 'Markdown', ...markup });
     scheduleCardAutoRefresh(uid, text, sent.chat.id, sent.message_id);
