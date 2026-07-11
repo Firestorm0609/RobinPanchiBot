@@ -78,6 +78,7 @@ export function settingsMenu(uid) {
     [Markup.button.callback(`Gas priority: ${s.gasTier} (tap to cycle)`, 'settings_gastier')],
     [Markup.button.callback(`Low balance alert: ${s.lowBalanceThresholdEth} ETH`, 'settings_lowbalance')],
     [Markup.button.callback(`Confirm before trade: ${s.confirmTrades ? 'ON ✅' : 'OFF ❌'}`, 'settings_toggle_confirm')],
+    [Markup.button.callback(`Flex card PnL: ${s.flexPnlMode.toUpperCase()} (tap to cycle)`, 'settings_flexpnl')],
     [Markup.button.callback('⬅️ Back', 'menu_main')],
   ]);
 }
