@@ -8,6 +8,7 @@ import {
   markPendingBridgeDone,
   getAllActiveWallets,
   getSettings,
+  updateSettings,
   getActiveAutoRules,
   getWallet,
   getPosition,
@@ -22,7 +23,7 @@ import {
   AUTO_TRADE_POLL_INTERVAL_MS,
   LIMIT_ORDER_POLL_INTERVAL_MS,
 } from './config.js';
-import { lowBalanceWarned } from './state.js';
+import { tradesInFlight } from './state.js';
 import { explorerTxUrl, explorerTxUrlForChain } from './format.js';
 import { directionLabel } from './menus.js';
 import { performSellCore, performBuyCore } from './trade-core.js';
@@ -127,15 +128,18 @@ export function startLowBalancePoller(bot) {
 
     for (const w of wallets) {
       try {
-        const { lowBalanceThresholdEth } = getSettings(w.uid);
+        const settings = getSettings(w.uid);
+        const { lowBalanceThresholdEth } = settings;
         if (!lowBalanceThresholdEth || lowBalanceThresholdEth <= 0) continue;
 
         const bal = await provider.getBalance(w.address).then((b) => Number(ethers.formatEther(b)));
-        const key = String(w.uid);
 
+        // Persisted in DB settings (not an in-memory Set) so this dedupe
+        // survives a bot restart — otherwise every restart while a wallet
+        // is still low re-sends the alert.
         if (bal < lowBalanceThresholdEth) {
-          if (!lowBalanceWarned.has(key)) {
-            lowBalanceWarned.add(key);
+          if (!settings.lowBalanceWarned) {
+            updateSettings(w.uid, { lowBalanceWarned: true });
             await bot.telegram.sendMessage(
               w.uid,
               `⚠️ Low balance: *${w.name}* has ${bal.toFixed(4)} ETH, below your alert threshold of ${lowBalanceThresholdEth} ETH.\n` +
@@ -143,8 +147,8 @@ export function startLowBalancePoller(bot) {
               { parse_mode: 'Markdown' }
             ).catch((err) => console.error(`Failed to send low-balance alert to uid ${w.uid}:`, err.message));
           }
-        } else {
-          lowBalanceWarned.delete(key);
+        } else if (settings.lowBalanceWarned) {
+          updateSettings(w.uid, { lowBalanceWarned: false });
         }
       } catch (err) {
         console.error(`Low-balance poller: check failed for uid ${w.uid}:`, err.message);
@@ -184,6 +188,10 @@ export function startAutoTradePoller(bot) {
         if (rule.tp_pct != null && pnlPct >= rule.tp_pct) trigger = 'take-profit';
         else if (rule.sl_pct != null && pnlPct <= -rule.sl_pct) trigger = 'stop-loss';
         if (!trigger) continue;
+
+        // Wallet is mid-trade (manual, batch, or another poller) — skip this
+        // cycle and retry next tick rather than retiring the rule outright.
+        if (tradesInFlight.has(rule.uid)) continue;
 
         markAutoRuleTriggered(rule.id);
 
@@ -233,6 +241,10 @@ export function startLimitOrderPoller(bot) {
           ? market.priceUsd <= order.trigger_price
           : market.priceUsd >= order.trigger_price;
         if (!crossed) continue;
+
+        // Wallet is mid-trade elsewhere — skip this cycle and retry next
+        // tick rather than marking the order filled/failed prematurely.
+        if (tradesInFlight.has(order.uid)) continue;
 
         markLimitOrderDone(order.id, 'filled');
 
