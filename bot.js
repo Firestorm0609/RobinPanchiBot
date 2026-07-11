@@ -711,7 +711,7 @@ async function performSellCore(uid, wallet, tokenAddress, pct) {
 // Same stuck-tx protection shape as swap.js/bridge.js: resubmit with bumped
 // fees if the network is too slow, so a batch fund run can't hang forever.
 
-async function performTransferCore(uid, sourceWallet, toAddress, amountEth, gasMultiplier) {
+async function performTransferCore(uid, sourceWallet, toAddress, amountEth, gasMultiplier, { timeoutMs = 45_000, bumpPct = 20, maxAttempts = 4 } = {}) {
   try {
     const signer = new ethers.Wallet(sourceWallet.privateKey, provider);
     const nonce = await signer.getNonce();
@@ -719,19 +719,34 @@ async function performTransferCore(uid, sourceWallet, toAddress, amountEth, gasM
     const baseMaxFee = feeData.maxFeePerGas ?? ethers.parseUnits('30', 'gwei');
     const basePriorityFee = feeData.maxPriorityFeePerGas ?? ethers.parseUnits('1', 'gwei');
     const multBps = BigInt(Math.round(gasMultiplier * 1000));
-    const maxFeePerGas = (baseMaxFee * multBps) / 1000n;
-    const maxPriorityFeePerGas = (basePriorityFee * multBps) / 1000n;
+    let maxFeePerGas = (baseMaxFee * multBps) / 1000n;
+    let maxPriorityFeePerGas = (basePriorityFee * multBps) / 1000n;
+    const value = ethers.parseEther(amountEth.toString());
 
-    const txResponse = await signer.sendTransaction({
-      to: toAddress,
-      value: ethers.parseEther(amountEth.toString()),
-      nonce,
-      maxFeePerGas,
-      maxPriorityFeePerGas,
-      gasLimit: FALLBACK_GAS_LIMIT_TRANSFER,
-    });
-    await txResponse.wait(1, 60_000);
-    return { ok: true, txHash: txResponse.hash };
+    // Same stuck-tx protection as swap.js/bridge.js: resubmit the same nonce
+    // with bumped fees if it doesn't confirm in time, instead of reporting a
+    // false "failed" for a transfer that may still land later.
+    let lastTxResponse;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      lastTxResponse = await signer.sendTransaction({
+        to: toAddress,
+        value,
+        nonce,
+        maxFeePerGas,
+        maxPriorityFeePerGas,
+        gasLimit: FALLBACK_GAS_LIMIT_TRANSFER,
+      });
+      try {
+        await lastTxResponse.wait(1, timeoutMs);
+        return { ok: true, txHash: lastTxResponse.hash, bumped: attempt > 1 };
+      } catch (err) {
+        const timedOut = err.code === 'TIMEOUT' || err.message?.toLowerCase().includes('timeout');
+        if (!timedOut || attempt === maxAttempts) throw err;
+        maxFeePerGas = (maxFeePerGas * BigInt(100 + bumpPct)) / 100n;
+        maxPriorityFeePerGas = (maxPriorityFeePerGas * BigInt(100 + bumpPct)) / 100n;
+      }
+    }
+    throw new Error('performTransferCore: exhausted attempts'); // unreachable
   } catch (err) {
     return { ok: false, error: friendlyErrorMessage(err) };
   }
@@ -741,6 +756,25 @@ async function performTransferCore(uid, sourceWallet, toAddress, amountEth, gasM
  * Sends `amountEth` from `sourceWallet` to each wallet in `targets`
  * (sequentially, to avoid nonce collisions), returning a per-target result.
  */
+/**
+ * Estimated ETH to reserve for gas across `count` sequential native transfers,
+ * so a batch fund run doesn't spend the whole source balance on principal and
+ * leave nothing for the transactions themselves (which would fail the later
+ * transfers in the loop after gas was already burned on earlier ones).
+ */
+async function estimateTransferGasReserve(uid, count) {
+  try {
+    const mult = gasMultiplierFor(uid);
+    const feeData = await provider.getFeeData();
+    const baseFee = feeData.maxFeePerGas ?? ethers.parseUnits('30', 'gwei');
+    const maxFee = (baseFee * BigInt(Math.round(mult * 1000))) / 1000n;
+    const perTxWei = FALLBACK_GAS_LIMIT_TRANSFER * maxFee;
+    return Number(ethers.formatEther(perTxWei * BigInt(count)));
+  } catch {
+    return 0; // fee data unavailable — fall back to no reserve rather than blocking the flow
+  }
+}
+
 async function distributeEth(uid, sourceWallet, targets, amountEth) {
   const results = [];
   const gasMultiplier = gasMultiplierFor(uid);
@@ -1445,6 +1479,15 @@ bot.action('batchfund_start', async (ctx) => {
     }))
   );
   const source = balances.reduce((a, b) => (b.balance > a.balance ? b : a));
+
+  if (source.balance <= 0) {
+    pending.delete(uid);
+    return ctx.editMessageText(
+      '📤 *Batch Fund*\n\nNone of your wallets have an ETH balance to fund others with. Add funds to a wallet first.',
+      { parse_mode: 'Markdown', ...walletsMenu(uid) }
+    );
+  }
+
   const candidates = balances.filter((w) => w.id !== source.id);
 
   pending.set(uid, { type: 'batchfund_select', sourceWalletId: source.id, candidates, selected: [] });
@@ -1913,11 +1956,12 @@ bot.on('text', async (ctx) => {
       if (!source) { pending.delete(uid); return ctx.reply('Source wallet not found.', walletsMenu(uid)); }
 
       const sourceBalance = await provider.getBalance(source.address).then((b) => Number(ethers.formatEther(b))).catch(() => 0);
-      const totalNeeded = amt * state.count;
+      const gasReserve = await estimateTransferGasReserve(uid, state.count);
+      const totalNeeded = amt * state.count + gasReserve;
       if (totalNeeded > sourceBalance) {
         pending.delete(uid);
         return ctx.reply(
-          `❌ Need ~${totalNeeded.toFixed(6)} ETH total (plus gas) but *${source.name}* only has ${sourceBalance.toFixed(6)} ETH.`,
+          `❌ Need ~${totalNeeded.toFixed(6)} ETH total (${(amt * state.count).toFixed(6)} + ~${gasReserve.toFixed(6)} est. gas) but *${source.name}* only has ${sourceBalance.toFixed(6)} ETH.`,
           { parse_mode: 'Markdown', ...mainMenu() }
         );
       }
@@ -1970,11 +2014,12 @@ bot.on('text', async (ctx) => {
       if (!source) { pending.delete(uid); return ctx.reply('Source wallet not found.', walletsMenu(uid)); }
 
       const sourceBalance = await provider.getBalance(source.address).then((b) => Number(ethers.formatEther(b))).catch(() => 0);
-      const totalNeeded = amt * state.targets.length;
+      const gasReserve = await estimateTransferGasReserve(uid, state.targets.length);
+      const totalNeeded = amt * state.targets.length + gasReserve;
       if (totalNeeded > sourceBalance) {
         pending.delete(uid);
         return ctx.reply(
-          `❌ Need ~${totalNeeded.toFixed(6)} ETH total (plus gas) but *${source.name}* only has ${sourceBalance.toFixed(6)} ETH.`,
+          `❌ Need ~${totalNeeded.toFixed(6)} ETH total (${(amt * state.targets.length).toFixed(6)} + ~${gasReserve.toFixed(6)} est. gas) but *${source.name}* only has ${sourceBalance.toFixed(6)} ETH.`,
           { parse_mode: 'Markdown', ...mainMenu() }
         );
       }
