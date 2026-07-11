@@ -78,6 +78,23 @@ export async function getBridgeQuote({ direction, amountEth, fromAddress, toAddr
 }
 
 /**
+ * Estimates the ETH gas cost of a bridge's source-chain tx BEFORE it's sent,
+ * for display on the confirm screen. Mirrors estimateSwapGasEth in swap.js —
+ * uses the quote's own gas limit (if LI.FI supplied one) times the source
+ * chain's current fee estimate, scaled by gasMultiplier so the number shown
+ * matches what will actually be applied at send time.
+ */
+export async function estimateBridgeGasEth(provider, quote, gasMultiplier = 1) {
+  const tx = quote.transactionRequest;
+  const feeData = await provider.getFeeData();
+  const baseFee = tx.maxFeePerGas ? BigInt(tx.maxFeePerGas) : (feeData.maxFeePerGas ?? ethers.parseUnits('30', 'gwei'));
+  const maxFeePerGas = (baseFee * BigInt(Math.round(gasMultiplier * 1000))) / 1000n;
+  const gasLimit = tx.gasLimit ? BigInt(tx.gasLimit) : 250_000n;
+  const costWei = gasLimit * maxFeePerGas;
+  return Number(ethers.formatEther(costWei));
+}
+
+/**
  * Sends the bridge transaction on the source chain. Does not wait for the
  * destination-side delivery — call checkBridgeStatusOnce / the bot.js poller for that.
  *
@@ -88,15 +105,21 @@ export async function getBridgeQuote({ direction, amountEth, fromAddress, toAddr
  * for bot.js means the per-user bridgesInFlight lock never releases and the
  * user is silently stuck.
  *
+ * `gasMultiplier` scales the INITIAL fee estimate before any congestion
+ * bumps are applied — same gas priority tier mechanism as swap.js.
+ *
  * Returns { txResponse, receipt, bumped } for the transaction that actually
  * confirmed (the last resubmission, if any bumps happened).
  */
-export async function sendBridgeTx(signer, quote, { timeoutMs = 45_000, bumpPct = 20, maxAttempts = 4 } = {}) {
+export async function sendBridgeTx(signer, quote, { timeoutMs = 45_000, bumpPct = 20, maxAttempts = 4, gasMultiplier = 1 } = {}) {
   const tx = quote.transactionRequest;
   const nonce = await signer.getNonce();
   const feeData = await signer.provider.getFeeData();
-  let maxFeePerGas = tx.maxFeePerGas ? BigInt(tx.maxFeePerGas) : (feeData.maxFeePerGas ?? ethers.parseUnits('30', 'gwei'));
-  let maxPriorityFeePerGas = tx.maxPriorityFeePerGas ? BigInt(tx.maxPriorityFeePerGas) : (feeData.maxPriorityFeePerGas ?? ethers.parseUnits('1', 'gwei'));
+  const baseMaxFee = tx.maxFeePerGas ? BigInt(tx.maxFeePerGas) : (feeData.maxFeePerGas ?? ethers.parseUnits('30', 'gwei'));
+  const basePriorityFee = tx.maxPriorityFeePerGas ? BigInt(tx.maxPriorityFeePerGas) : (feeData.maxPriorityFeePerGas ?? ethers.parseUnits('1', 'gwei'));
+  const multBps = BigInt(Math.round(gasMultiplier * 1000));
+  let maxFeePerGas = (baseMaxFee * multBps) / 1000n;
+  let maxPriorityFeePerGas = (basePriorityFee * multBps) / 1000n;
 
   const baseTxRequest = {
     to: tx.to,
