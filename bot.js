@@ -48,6 +48,17 @@ import {
   markPendingBridgeDone,
   getInFlightBridges,
   getBridgeHistory,
+  createAutoRule,
+  cancelAutoRule,
+  markAutoRuleTriggered,
+  getActiveAutoRules,
+  getActiveAutoRuleForPosition,
+  getActiveAutoRulesForUser,
+  createLimitOrder,
+  cancelLimitOrder,
+  markLimitOrderDone,
+  getOpenLimitOrders,
+  getOpenLimitOrdersForUser,
 } from './storage.js';
 
 // ---------- Startup env validation ----------
@@ -124,6 +135,12 @@ const HELP_TEXT =
   'Use 📈 Portfolio from the main menu for a combined PnL view across every wallet you own, not just the active one.\n\n' +
   '*Low balance alerts*\n' +
   'The bot will DM you once if your active wallet\'s ETH balance drops below the threshold set in Settings (default 0.01 ETH). Set it to 0 to disable.\n\n' +
+  '*Auto TP/SL*\n' +
+  'On any open position, tap 🎯 Set TP/SL to have the bot automatically sell 100% of that position once it hits your target gain (take-profit) or loss (stop-loss). One active rule per position — setting a new one replaces the old.\n\n' +
+  '*Limit orders*\n' +
+  'Tap ⏰ Limit Buy or ⏰ Limit Sell on a token to queue a trade that fires automatically once the price crosses your target (checked roughly every 30s). Cancel anytime is not yet exposed in-chat — contact support if you need one removed early.\n\n' +
+  '*Batch Buy*\n' +
+  'Tap 📦 Batch Buy on a token to buy the same ETH amount across multiple wallets in one go — useful for spreading a position.\n\n' +
   '*Still stuck?*\n' +
   'Contact support: panchi.eth@gmail.com';
 
@@ -160,6 +177,8 @@ const CA_REGEX = /^0x[a-fA-F0-9]{40}$/;
 const QUOTE_STALE_MS = 15_000; // re-quote if this much time passes before sending the tx
 const BRIDGE_POLL_INTERVAL_MS = 30_000;
 const LOW_BALANCE_POLL_INTERVAL_MS = 5 * 60_000; // check every 5 min
+const AUTO_TRADE_POLL_INTERVAL_MS = 30_000; // TP/SL check cadence
+const LIMIT_ORDER_POLL_INTERVAL_MS = 30_000; // limit order price check cadence
 
 // ---------- Gas priority tiers ----------
 // Multiplies the network's suggested maxFeePerGas/maxPriorityFeePerGas before
@@ -435,6 +454,7 @@ function directionLabel(direction) {
 
 function tokenMenu(uid, tokenAddress, hasPosition) {
   const s = getSettings(uid);
+  const user = getUser(uid);
   const rows = [
     s.buyPresetsEth.map((amt) => Markup.button.callback(`Buy ${amt} ETH`, `buy_${tokenAddress}_${amt}`)),
     // Label clarifies ETH-or-USD support up front, so users don't have to
@@ -445,10 +465,31 @@ function tokenMenu(uid, tokenAddress, hasPosition) {
   if (hasPosition) {
     rows.push(s.sellPresetsPct.map((pct) => Markup.button.callback(`Sell ${pct}%`, `sell_${tokenAddress}_${pct}`)));
     rows.push([Markup.button.callback('✏️ Custom Sell', `customsell_${tokenAddress}`)]);
+    rows.push([
+      Markup.button.callback('🎯 Set TP/SL', `tpsl_${tokenAddress}`),
+      Markup.button.callback('⏰ Limit Sell', `limitsell_${tokenAddress}`),
+    ]);
   }
+  const bottomRow = [Markup.button.callback('⏰ Limit Buy', `limitbuy_${tokenAddress}`)];
+  if (user.wallets.length > 1) bottomRow.push(Markup.button.callback('📦 Batch Buy', `batchbuy_${tokenAddress}`));
+  rows.push(bottomRow);
   rows.push([
     Markup.button.callback('🔄 Refresh', `refresh_${tokenAddress}`),
     Markup.button.callback('⬅️ Back', 'menu_main'),
+  ]);
+  return Markup.inlineKeyboard(rows);
+}
+
+/** Multi-select wallet picker used by Batch Buy. */
+function batchSelectMenu(uid, selected) {
+  const user = getUser(uid);
+  const rows = user.wallets.map((w) => {
+    const checked = selected.includes(w.id) ? '☑️ ' : '⬜ ';
+    return [Markup.button.callback(`${checked}${w.name} (${shortAddr(w.address)})`, `batchtoggle_${w.id}`)];
+  });
+  rows.push([
+    Markup.button.callback(`✅ Confirm (${selected.length} selected)`, 'batchconfirm'),
+    Markup.button.callback('❌ Cancel', 'menu_main'),
   ]);
   return Markup.inlineKeyboard(rows);
 }
@@ -482,6 +523,13 @@ async function renderTokenCard(uid, tokenAddress) {
       const emoji = pnlUsd >= 0 ? '🟢' : '🔴';
       pnlLine = `\n\n*Your position:*\n${pos.tokenAmount.toFixed(4)} ${market.symbol}\nCost: ${fmtUsd(costUsd)} | Value: ${fmtUsd(currentValueUsd)}\nPnL: ${emoji} ${fmtUsd(pnlUsd)} (${pnlPct.toFixed(1)}%)`;
     }
+    const rule = getActiveAutoRuleForPosition(uid, w.id, tokenAddress);
+    if (rule) {
+      const parts = [];
+      if (rule.tp_pct != null) parts.push(`TP +${rule.tp_pct}%`);
+      if (rule.sl_pct != null) parts.push(`SL -${rule.sl_pct}%`);
+      pnlLine += `\n🎯 Active rule: ${parts.join(' / ')}`;
+    }
   }
 
   const changeLine = market.priceChange24h !== null ? ` (${market.priceChange24h >= 0 ? '+' : ''}${market.priceChange24h.toFixed(1)}%)` : '';
@@ -498,7 +546,7 @@ async function renderTokenCard(uid, tokenAddress) {
   return { text, markup: tokenMenu(uid, tokenAddress, !!(pos && pos.tokenAmount > 0)) };
 }
 
-// ---------- Shared trade execution ----------
+// ---------- Shared trade execution (interactive, ctx-based) ----------
 
 async function executeBuy(ctx, uid, tokenAddress, ethAmount) {
   const w = getActiveWallet(uid);
@@ -617,6 +665,72 @@ function confirmMenu(kind, tokenAddress, value) {
   ]);
 }
 
+// ---------- Headless trade execution (poller/batch-triggered, no ctx) ----------
+// Same core steps as executeBuy/executeSell but returns a result object
+// instead of chatting through ctx.reply, and skips the tradesInFlight
+// double-tap guard (that guard exists to stop a human double-tapping a
+// button; these callers are single-shot and not user-initiated taps).
+
+async function performBuyCore(uid, wallet, tokenAddress, ethAmount) {
+  let pendingTradeId;
+  try {
+    const sellAmount = ethers.parseEther(ethAmount.toString()).toString();
+    const { slippageBps } = getSettings(uid);
+    const quoteParams = { sellToken: 'ETH', buyToken: tokenAddress, sellAmount, taker: wallet.address, slippageBps };
+
+    pendingTradeId = createPendingTrade({ uid, walletId: wallet.id, tokenAddress, side: 'buy', amount: ethAmount });
+
+    let quote = await getQuote(quoteParams);
+    const fetchedAt = Date.now();
+    const signer = new ethers.Wallet(wallet.privateKey, provider);
+    quote = await getFreshQuote(quoteParams, quote, fetchedAt);
+
+    const txRequest = await buildSwapTx(signer, quote);
+    const { txResponse } = await sendSwapWithGasBump(signer, txRequest, { gasMultiplier: gasMultiplierFor(uid) });
+    markPendingTradeSubmitted(pendingTradeId, txResponse.hash);
+    markPendingTradeDone(pendingTradeId, 'confirmed');
+    recordTrade(uid, wallet.id, tokenAddress, 'buy', Number(quote.buyAmountFormatted), ethAmount);
+    return { ok: true, txHash: txResponse.hash, walletName: wallet.name };
+  } catch (err) {
+    if (pendingTradeId) markPendingTradeDone(pendingTradeId, 'failed');
+    return { ok: false, error: friendlyErrorMessage(err), walletName: wallet.name };
+  }
+}
+
+async function performSellCore(uid, wallet, tokenAddress, pct) {
+  let pendingTradeId;
+  try {
+    const pos = getPosition(uid, wallet.id, tokenAddress);
+    if (!pos || pos.tokenAmount <= 0) return { ok: false, error: 'No position to sell.', walletName: wallet.name };
+
+    const tokenAmount = pos.tokenAmount * (pct / 100);
+    const decimals = await getDecimals(provider, tokenAddress).catch(() => 18);
+    const sellAmount = ethers.parseUnits(tokenAmount.toFixed(Math.min(decimals, 18)), decimals).toString();
+
+    const { slippageBps } = getSettings(uid);
+    const signer = new ethers.Wallet(wallet.privateKey, provider);
+
+    pendingTradeId = createPendingTrade({ uid, walletId: wallet.id, tokenAddress, side: 'sell', amount: tokenAmount });
+
+    await ensureAllowance(signer, tokenAddress, BigInt(sellAmount));
+
+    const quoteParams = { sellToken: tokenAddress, buyToken: 'ETH', sellAmount, taker: wallet.address, slippageBps };
+    let quote = await getQuote(quoteParams);
+    const fetchedAt = Date.now();
+    quote = await getFreshQuote(quoteParams, quote, fetchedAt);
+
+    const txRequest = await buildSwapTx(signer, quote);
+    const { txResponse } = await sendSwapWithGasBump(signer, txRequest, { gasMultiplier: gasMultiplierFor(uid) });
+    markPendingTradeSubmitted(pendingTradeId, txResponse.hash);
+    markPendingTradeDone(pendingTradeId, 'confirmed');
+    recordTrade(uid, wallet.id, tokenAddress, 'sell', tokenAmount, Number(quote.buyAmountFormatted));
+    return { ok: true, txHash: txResponse.hash, walletName: wallet.name, ethReceived: Number(quote.buyAmountFormatted) };
+  } catch (err) {
+    if (pendingTradeId) markPendingTradeDone(pendingTradeId, 'failed');
+    return { ok: false, error: friendlyErrorMessage(err), walletName: wallet.name };
+  }
+}
+
 // ---------- Shared bridge execution ----------
 
 async function executeBridge(ctx, uid, direction, amountEth) {
@@ -730,7 +844,9 @@ bot.command('admin_stats', async (ctx) => {
     `Total volume: ${s.totalVolumeEth.toFixed(4)} ETH\n` +
     `Est. fees earned: ${estFeesEth.toFixed(4)} ETH\n` +
     `Total referrals: ${s.totalReferrals}\n` +
-    `Total bridges: ${s.totalBridges} (completed volume: ${s.totalBridgeVolumeEth.toFixed(4)} ETH)\n\n` +
+    `Total bridges: ${s.totalBridges} (completed volume: ${s.totalBridgeVolumeEth.toFixed(4)} ETH)\n` +
+    `Active TP/SL rules: ${s.activeAutoRules}\n` +
+    `Open limit orders: ${s.openLimitOrders}\n\n` +
     `Last 24h:\n` +
     `Active users: ${s.activeUsers24h}\n` +
     `Volume: ${s.volume24hEth.toFixed(4)} ETH`,
@@ -1152,6 +1268,91 @@ bot.action(/^customsell_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
   await ctx.editMessageText('Send the percentage to sell, e.g. `40` for 40%');
 });
 
+// ---------- Auto TP/SL ----------
+
+bot.action(/^tpsl_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  pending.set(ctx.from.id, { type: 'tpsl_input', tokenAddress: ctx.match[1] });
+  await ctx.editMessageText(
+    'Send take-profit and stop-loss as percentages, comma-separated: `TP,SL`\n' +
+    'e.g. `50,20` = sell 100% at +50% gain OR -20% loss, whichever hits first.\n' +
+    'Send `0` for a side to skip it, e.g. `50,0` for TP-only.\n\n' +
+    'This replaces any existing rule on this position.',
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// ---------- Limit orders ----------
+
+bot.action(/^limitbuy_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  pending.set(ctx.from.id, { type: 'limitbuy_price', tokenAddress: ctx.match[1] });
+  await ctx.editMessageText('Send the target price in USD to buy at (fires when price drops to or below this), e.g. `0.002`', { parse_mode: 'Markdown' });
+});
+
+bot.action(/^limitsell_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  pending.set(ctx.from.id, { type: 'limitsell_price', tokenAddress: ctx.match[1] });
+  await ctx.editMessageText('Send the target price in USD to sell at (fires when price rises to or above this), e.g. `0.01`', { parse_mode: 'Markdown' });
+});
+
+// ---------- Batch Buy ----------
+
+bot.action(/^batchbuy_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  const user = getUser(uid);
+  if (user.wallets.length < 2) return ctx.reply('You need at least 2 wallets to use Batch Buy.', mainMenu());
+  pending.set(uid, { type: 'batch_amount', tokenAddress: ctx.match[1] });
+  await ctx.editMessageText('Send the ETH amount to buy on EACH selected wallet, e.g. `0.02`', { parse_mode: 'Markdown' });
+});
+
+bot.action(/^batchtoggle_(.+)$/, async (ctx) => {
+  const uid = ctx.from.id;
+  const state = pending.get(uid);
+  if (!state || state.type !== 'batch_select') return ctx.answerCbQuery();
+  await ctx.answerCbQuery();
+  const walletId = ctx.match[1];
+  const idx = state.selected.indexOf(walletId);
+  if (idx >= 0) state.selected.splice(idx, 1); else state.selected.push(walletId);
+  pending.set(uid, state);
+  await ctx.editMessageText('Select wallets to buy on:', batchSelectMenu(uid, state.selected)).catch(() => {});
+});
+
+bot.action('batchconfirm', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  const state = pending.get(uid);
+  if (!state || state.type !== 'batch_select') return;
+  if (state.selected.length === 0) return ctx.reply('No wallets selected — tap wallets to select, then Confirm.');
+  if (isRateLimited(uid)) return ctx.reply('⏳ Slow down a bit — too many actions in the last minute.');
+
+  const { maxBuyEth } = getSettings(uid);
+  if (state.ethAmount > maxBuyEth) {
+    pending.delete(uid);
+    return ctx.reply(`❌ ${state.ethAmount} ETH exceeds your max buy size (${maxBuyEth} ETH).`, mainMenu());
+  }
+
+  pending.delete(uid);
+  await ctx.editMessageText(`Buying ${state.ethAmount} ETH on ${state.selected.length} wallet(s)... this may take a moment.`);
+
+  const results = [];
+  for (const walletId of state.selected) {
+    const w = getWallet(uid, walletId);
+    if (!w) { results.push({ ok: false, walletName: walletId, error: 'Wallet not found.' }); continue; }
+    const result = await performBuyCore(uid, w, state.tokenAddress, state.ethAmount);
+    results.push(result);
+  }
+
+  const lines = results.map((r) =>
+    r.ok ? `✅ ${r.walletName}: bought (tx \`${r.txHash.slice(0, 12)}...\`)` : `❌ ${r.walletName}: ${r.error}`
+  );
+  await ctx.reply(`📦 *Batch Buy Results* — ${state.ethAmount} ETH each\n\n${lines.join('\n')}`, {
+    parse_mode: 'Markdown',
+    ...mainMenu(),
+  });
+});
+
 // ---------- Balance ----------
 
 bot.action('menu_balance', async (ctx) => {
@@ -1436,6 +1637,101 @@ bot.on('text', async (ctx) => {
       return;
     }
 
+    if (state.type === 'tpsl_input') {
+      const parts = text.split(',').map((s) => parseFloat(s.trim()));
+      if (parts.length !== 2 || parts.some((n) => isNaN(n) || n < 0)) {
+        return ctx.reply('Send two non-negative numbers separated by a comma, e.g. `50,20`');
+      }
+      const [tpRaw, slRaw] = parts;
+      const tpPct = tpRaw > 0 ? tpRaw : null;
+      const slPct = slRaw > 0 ? slRaw : null;
+      if (tpPct === null && slPct === null) return ctx.reply('At least one of TP or SL must be non-zero.');
+
+      const w = getActiveWallet(uid);
+      if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
+      const pos = getPosition(uid, w.id, state.tokenAddress);
+      if (!pos || pos.tokenAmount <= 0) {
+        pending.delete(uid);
+        return ctx.reply('No open position on this token to set a rule for.', mainMenu());
+      }
+
+      pending.delete(uid);
+
+      // Only one active rule per position — replace any existing one.
+      const existing = getActiveAutoRuleForPosition(uid, w.id, state.tokenAddress);
+      if (existing) cancelAutoRule(uid, existing.id);
+
+      createAutoRule({ uid, walletId: w.id, tokenAddress: state.tokenAddress, tpPct, slPct });
+      const parts2 = [];
+      if (tpPct !== null) parts2.push(`TP +${tpPct}%`);
+      if (slPct !== null) parts2.push(`SL -${slPct}%`);
+      await ctx.reply(
+        `✅ Auto-sell rule set: ${parts2.join(' / ')}. I'll sell 100% of this position automatically (checked ~every 30s) and DM you when it fires.`,
+        mainMenu()
+      );
+      return;
+    }
+
+    if (state.type === 'limitbuy_price') {
+      const price = parseFloat(text);
+      if (isNaN(price) || price <= 0) return ctx.reply('Send a valid positive price, e.g. `0.002`');
+      pending.set(uid, { type: 'limitbuy_amount', tokenAddress: state.tokenAddress, triggerPrice: price });
+      await ctx.reply('Send the ETH amount to spend when triggered, e.g. `0.05`');
+      return;
+    }
+
+    if (state.type === 'limitbuy_amount') {
+      const amt = parseFloat(text);
+      if (isNaN(amt) || amt <= 0) return ctx.reply('Send a valid positive ETH amount.');
+      const w = getActiveWallet(uid);
+      if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
+      pending.delete(uid);
+      createLimitOrder({ uid, walletId: w.id, tokenAddress: state.tokenAddress, side: 'buy', triggerPrice: state.triggerPrice, amount: amt });
+      await ctx.reply(
+        `✅ Limit buy queued: ${amt} ETH when price ≤ $${state.triggerPrice} (checked ~every 30s). I'll DM you when it fills.`,
+        mainMenu()
+      );
+      return;
+    }
+
+    if (state.type === 'limitsell_price') {
+      const price = parseFloat(text);
+      if (isNaN(price) || price <= 0) return ctx.reply('Send a valid positive price, e.g. `0.01`');
+      const w = getActiveWallet(uid);
+      if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
+      const pos = getPosition(uid, w.id, state.tokenAddress);
+      if (!pos || pos.tokenAmount <= 0) {
+        pending.delete(uid);
+        return ctx.reply('No open position on this token to sell.', mainMenu());
+      }
+      pending.set(uid, { type: 'limitsell_amount', tokenAddress: state.tokenAddress, triggerPrice: price, maxAmount: pos.tokenAmount });
+      await ctx.reply(`Send the token amount to sell when triggered (you hold ${pos.tokenAmount.toFixed(4)}):`);
+      return;
+    }
+
+    if (state.type === 'limitsell_amount') {
+      const amt = parseFloat(text);
+      if (isNaN(amt) || amt <= 0) return ctx.reply('Send a valid positive token amount.');
+      pending.delete(uid);
+      const w = getActiveWallet(uid);
+      if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
+      const clamped = Math.min(amt, state.maxAmount);
+      createLimitOrder({ uid, walletId: w.id, tokenAddress: state.tokenAddress, side: 'sell', triggerPrice: state.triggerPrice, amount: clamped });
+      await ctx.reply(
+        `✅ Limit sell queued: ${clamped.toFixed(4)} tokens when price ≥ $${state.triggerPrice} (checked ~every 30s). I'll DM you when it fills.`,
+        mainMenu()
+      );
+      return;
+    }
+
+    if (state.type === 'batch_amount') {
+      const amt = parseFloat(text);
+      if (isNaN(amt) || amt <= 0) return ctx.reply('Send a valid positive ETH amount.');
+      pending.set(uid, { type: 'batch_select', tokenAddress: state.tokenAddress, ethAmount: amt, selected: [] });
+      await ctx.reply('Select wallets to buy on:', batchSelectMenu(uid, []));
+      return;
+    }
+
     if (state.type === 'bridge_amount') {
       // Accepts either a plain ETH figure ("0.05") or a USD figure ("$100"),
       // converting USD -> ETH via the live ETH/USD price feed.
@@ -1650,6 +1946,139 @@ function startLowBalancePoller() {
   }, LOW_BALANCE_POLL_INTERVAL_MS);
 }
 
+// Periodically checks every active auto-trade rule (TP/SL) against the
+// position's live PnL. Fires a 100% sell the first time TP or SL is crossed,
+// then marks the rule 'triggered' so it can't fire twice. Marks a rule
+// 'triggered' (i.e. retires it) instead of erroring out if the wallet or
+// position has since disappeared, since there's nothing left to protect.
+function startAutoTradePoller() {
+  setInterval(async () => {
+    let rules;
+    try {
+      rules = getActiveAutoRules();
+    } catch (err) {
+      console.error('Auto-trade poller: failed to read active rules:', err.message);
+      return;
+    }
+
+    for (const rule of rules) {
+      try {
+        const wallet = getWallet(rule.uid, rule.wallet_id);
+        if (!wallet) { markAutoRuleTriggered(rule.id); continue; }
+
+        const pos = getPosition(rule.uid, rule.wallet_id, rule.token_address);
+        if (!pos || pos.tokenAmount <= 0) { markAutoRuleTriggered(rule.id); continue; }
+
+        const market = await getTokenMarketData(rule.token_address).catch(() => null);
+        const ethUsd = await getEthUsdPrice().catch(() => null);
+        if (!market || !ethUsd) continue; // price hiccup, re-check next tick
+
+        const valueUsd = pos.tokenAmount * market.priceUsd;
+        const costUsd = pos.costEth * ethUsd;
+        if (costUsd <= 0) continue;
+        const pnlPct = ((valueUsd - costUsd) / costUsd) * 100;
+
+        let trigger = null;
+        if (rule.tp_pct != null && pnlPct >= rule.tp_pct) trigger = 'take-profit';
+        else if (rule.sl_pct != null && pnlPct <= -rule.sl_pct) trigger = 'stop-loss';
+        if (!trigger) continue;
+
+        markAutoRuleTriggered(rule.id); // retire immediately so a slow sell can't double-fire
+
+        const result = await performSellCore(rule.uid, wallet, rule.token_address, 100);
+        if (result.ok) {
+          const txLink = explorerTxUrl(result.txHash);
+          await bot.telegram.sendMessage(
+            rule.uid,
+            `🎯 ${trigger === 'take-profit' ? 'Take-profit' : 'Stop-loss'} triggered on *${wallet.name}* (${pnlPct.toFixed(1)}%) — sold 100% of your ${market.symbol} position.` +
+            (txLink ? `\n[View transaction](${txLink})` : ''),
+            { parse_mode: 'Markdown' }
+          ).catch((err) => console.error(`Failed to notify uid ${rule.uid} of auto-trade:`, err.message));
+        } else {
+          await bot.telegram.sendMessage(
+            rule.uid,
+            `⚠️ ${trigger === 'take-profit' ? 'Take-profit' : 'Stop-loss'} triggered on *${wallet.name}* but the sell failed: ${result.error}\nYour rule has been retired — set a new one if you'd like to try again.`,
+            { parse_mode: 'Markdown' }
+          ).catch(() => {});
+          await sendAdminAlert(bot.telegram, `Auto-trade sell failed for uid ${rule.uid} on ${rule.token_address}: ${result.error}`);
+        }
+      } catch (err) {
+        console.error(`Auto-trade poller: rule ${rule.id} failed:`, err.message);
+      }
+    }
+  }, AUTO_TRADE_POLL_INTERVAL_MS);
+}
+
+// Periodically checks every open limit order against the token's live USD
+// price. Buy orders fire when price drops to/below the trigger; sell orders
+// fire when price rises to/above it. Marks the order 'filled' before
+// executing so a slow trade can't be picked up twice on the next tick.
+function startLimitOrderPoller() {
+  setInterval(async () => {
+    let orders;
+    try {
+      orders = getOpenLimitOrders();
+    } catch (err) {
+      console.error('Limit order poller: failed to read open orders:', err.message);
+      return;
+    }
+
+    for (const order of orders) {
+      try {
+        const wallet = getWallet(order.uid, order.wallet_id);
+        if (!wallet) { markLimitOrderDone(order.id, 'cancelled'); continue; }
+
+        const market = await getTokenMarketData(order.token_address).catch(() => null);
+        if (!market) continue; // price hiccup, re-check next tick
+
+        const crossed = order.side === 'buy'
+          ? market.priceUsd <= order.trigger_price
+          : market.priceUsd >= order.trigger_price;
+        if (!crossed) continue;
+
+        markLimitOrderDone(order.id, 'filled'); // retire immediately, avoid double-fire
+
+        if (order.side === 'buy') {
+          const result = await performBuyCore(order.uid, wallet, order.token_address, order.amount);
+          if (result.ok) {
+            const txLink = explorerTxUrl(result.txHash);
+            await bot.telegram.sendMessage(
+              order.uid,
+              `⏰ Limit buy filled on *${wallet.name}*: ${order.amount} ETH of ${market.symbol} @ ~$${market.priceUsd.toPrecision(4)}` +
+              (txLink ? `\n[View transaction](${txLink})` : ''),
+              { parse_mode: 'Markdown' }
+            ).catch(() => {});
+          } else {
+            markLimitOrderDone(order.id, 'failed');
+            await bot.telegram.sendMessage(order.uid, `⚠️ Limit buy triggered on *${wallet.name}* but failed: ${result.error}`, { parse_mode: 'Markdown' }).catch(() => {});
+            await sendAdminAlert(bot.telegram, `Limit buy failed for uid ${order.uid} on ${order.token_address}: ${result.error}`);
+          }
+        } else {
+          const pos = getPosition(order.uid, order.wallet_id, order.token_address);
+          if (!pos || pos.tokenAmount <= 0) continue; // nothing left to sell, order just quietly stays filled
+          const pct = Math.min((order.amount / pos.tokenAmount) * 100, 100);
+          const result = await performSellCore(order.uid, wallet, order.token_address, pct);
+          if (result.ok) {
+            const txLink = explorerTxUrl(result.txHash);
+            await bot.telegram.sendMessage(
+              order.uid,
+              `⏰ Limit sell filled on *${wallet.name}*: ${order.amount.toFixed(4)} ${market.symbol} @ ~$${market.priceUsd.toPrecision(4)}` +
+              (txLink ? `\n[View transaction](${txLink})` : ''),
+              { parse_mode: 'Markdown' }
+            ).catch(() => {});
+          } else {
+            markLimitOrderDone(order.id, 'failed');
+            await bot.telegram.sendMessage(order.uid, `⚠️ Limit sell triggered on *${wallet.name}* but failed: ${result.error}`, { parse_mode: 'Markdown' }).catch(() => {});
+            await sendAdminAlert(bot.telegram, `Limit sell failed for uid ${order.uid} on ${order.token_address}: ${result.error}`);
+          }
+        }
+      } catch (err) {
+        console.error(`Limit order poller: order ${order.id} failed:`, err.message);
+      }
+    }
+  }, LIMIT_ORDER_POLL_INTERVAL_MS);
+}
+
 // Surface crashes to the admin instead of the process dying with no record anywhere.
 process.on('unhandledRejection', (err) => {
   console.error('Unhandled rejection:', err);
@@ -1668,6 +2097,8 @@ bot.launch()
   .then(checkStuckBridges)
   .then(startBridgePoller)
   .then(startLowBalancePoller)
+  .then(startAutoTradePoller)
+  .then(startLimitOrderPoller)
   .then(() => sendAdminAlert(bot.telegram, '✅ Bot started.'))
   .catch((err) => {
     console.error('Failed to launch bot:', err);
