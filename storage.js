@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS positions (
   token_address TEXT NOT NULL,
   token_amount REAL NOT NULL,
   cost_eth REAL NOT NULL,
+  entry_mcap REAL,
   PRIMARY KEY (uid, wallet_id, token_address)
 );
 CREATE TABLE IF NOT EXISTS pending_trades (
@@ -52,6 +53,7 @@ CREATE TABLE IF NOT EXISTS trade_log (
   token_address TEXT NOT NULL,
   side TEXT NOT NULL,
   eth_amount REAL NOT NULL,
+  mcap_usd REAL,
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS referrals (
@@ -124,6 +126,19 @@ if (!userCols.includes('referral_code')) {
   }
 }
 db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code ON users(referral_code)');
+
+// Migration: add entry_mcap to positions (existing open positions get NULL —
+// we have no historical mcap for them, display will just omit the line).
+const positionCols = db.prepare("PRAGMA table_info(positions)").all().map((c) => c.name);
+if (!positionCols.includes('entry_mcap')) {
+  db.exec('ALTER TABLE positions ADD COLUMN entry_mcap REAL');
+}
+
+// Migration: add mcap_usd to trade_log (historical rows get NULL).
+const tradeLogCols = db.prepare("PRAGMA table_info(trade_log)").all().map((c) => c.name);
+if (!tradeLogCols.includes('mcap_usd')) {
+  db.exec('ALTER TABLE trade_log ADD COLUMN mcap_usd REAL');
+}
 
 const DEFAULT_SETTINGS = {
   buyPresetsEth: [0.01, 0.05, 0.1],
@@ -229,37 +244,59 @@ export function getAllActiveWallets() {
 }
 
 // ---------- Positions / PnL ----------
-// Simple running-average cost basis per (wallet, token).
+// Simple running-average cost basis per (wallet, token). entry_mcap tracks
+// the token's market cap (USD) at the time of entry, weighted by ETH spent
+// across buys (same weighting model as cost_eth). It is NOT adjusted on
+// sells — it represents "what mcap you got in at", not a live figure.
 
-export function recordTrade(uid, walletId, tokenAddress, side, tokenAmount, ethAmount) {
+/**
+ * @param {number|null} mcapUsd - token's market cap (USD) at the moment of
+ *   this trade. Pass null if unavailable (e.g. price feed down) — entry_mcap
+ *   will simply stay whatever it was (or remain null on a fresh position).
+ */
+export function recordTrade(uid, walletId, tokenAddress, side, tokenAmount, ethAmount, mcapUsd = null) {
   uid = String(uid);
   const key = tokenAddress.toLowerCase();
   const existing = db.prepare(
     'SELECT * FROM positions WHERE uid = ? AND wallet_id = ? AND token_address = ?'
   ).get(uid, walletId, key);
 
-  let pos = existing ? { token_amount: existing.token_amount, cost_eth: existing.cost_eth } : { token_amount: 0, cost_eth: 0 };
+  let pos = existing
+    ? { token_amount: existing.token_amount, cost_eth: existing.cost_eth, entry_mcap: existing.entry_mcap }
+    : { token_amount: 0, cost_eth: 0, entry_mcap: null };
 
   if (side === 'buy') {
+    if (mcapUsd != null) {
+      if (pos.cost_eth > 0 && pos.entry_mcap != null) {
+        // Weighted average entry mcap, weighted by ETH spent (mirrors cost basis math).
+        pos.entry_mcap = (pos.entry_mcap * pos.cost_eth + mcapUsd * ethAmount) / (pos.cost_eth + ethAmount);
+      } else {
+        pos.entry_mcap = mcapUsd;
+      }
+    }
     pos.token_amount += tokenAmount;
     pos.cost_eth += ethAmount;
   } else {
     const fraction = pos.token_amount > 0 ? Math.min(tokenAmount / pos.token_amount, 1) : 0;
     pos.cost_eth -= pos.cost_eth * fraction;
     pos.token_amount = Math.max(pos.token_amount - tokenAmount, 0);
+    if (pos.token_amount <= 0) pos.entry_mcap = null; // position closed — clear entry mcap
   }
 
   db.prepare(`
-    INSERT INTO positions (uid, wallet_id, token_address, token_amount, cost_eth)
-    VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(uid, wallet_id, token_address) DO UPDATE SET token_amount = excluded.token_amount, cost_eth = excluded.cost_eth
-  `).run(uid, walletId, key, pos.token_amount, pos.cost_eth);
+    INSERT INTO positions (uid, wallet_id, token_address, token_amount, cost_eth, entry_mcap)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(uid, wallet_id, token_address) DO UPDATE SET
+      token_amount = excluded.token_amount,
+      cost_eth = excluded.cost_eth,
+      entry_mcap = excluded.entry_mcap
+  `).run(uid, walletId, key, pos.token_amount, pos.cost_eth, pos.entry_mcap);
 
   // ethAmount is always the ETH-side value of the trade (spent on buy, received on sell)
   db.prepare(`
-    INSERT INTO trade_log (uid, wallet_id, token_address, side, eth_amount, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(uid, walletId, key, side, ethAmount, Date.now());
+    INSERT INTO trade_log (uid, wallet_id, token_address, side, eth_amount, mcap_usd, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(uid, walletId, key, side, ethAmount, mcapUsd, Date.now());
 }
 
 export function getPosition(uid, walletId, tokenAddress) {
@@ -267,7 +304,13 @@ export function getPosition(uid, walletId, tokenAddress) {
     'SELECT * FROM positions WHERE uid = ? AND wallet_id = ? AND token_address = ?'
   ).get(String(uid), walletId, tokenAddress.toLowerCase());
   if (!row) return null;
-  return { walletId: row.wallet_id, tokenAddress: row.token_address, tokenAmount: row.token_amount, costEth: row.cost_eth };
+  return {
+    walletId: row.wallet_id,
+    tokenAddress: row.token_address,
+    tokenAmount: row.token_amount,
+    costEth: row.cost_eth,
+    entryMcap: row.entry_mcap,
+  };
 }
 
 export function getAllPositions(uid, walletId) {
@@ -279,6 +322,7 @@ export function getAllPositions(uid, walletId) {
     tokenAddress: row.token_address,
     tokenAmount: row.token_amount,
     costEth: row.cost_eth,
+    entryMcap: row.entry_mcap,
   }));
 }
 
@@ -301,6 +345,7 @@ export function getAllPositionsForUser(uid) {
     tokenAddress: row.token_address,
     tokenAmount: row.token_amount,
     costEth: row.cost_eth,
+    entryMcap: row.entry_mcap,
   }));
 }
 
