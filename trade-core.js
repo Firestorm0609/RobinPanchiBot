@@ -148,6 +148,21 @@ export async function performBuyCore(uid, wallet, tokenAddress, ethAmount) {
   if (tradesInFlight.has(uid)) {
     return { ok: false, error: LOCKED_ERROR, locked: true, walletName: wallet.name };
   }
+
+  // Re-check maxBuyEth here too (not just at order-creation time) — settings
+  // may have been lowered between when a limit order / batch buy was queued
+  // and when this actually fires. Without this, headless callers (the limit
+  // order poller in pollers.js) could execute a buy that bypasses the user's
+  // configured spend cap entirely.
+  const { maxBuyEth } = getSettings(uid);
+  if (ethAmount > maxBuyEth) {
+    return {
+      ok: false,
+      error: `Buy of ${ethAmount} ETH exceeds max buy size (${maxBuyEth} ETH).`,
+      walletName: wallet.name,
+    };
+  }
+
   tradesInFlight.add(uid);
 
   let pendingTradeId;
