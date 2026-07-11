@@ -10,6 +10,7 @@ import { explorerTxUrl, friendlyErrorMessage, getFreshQuote } from './format.js'
 import { mainMenu, walletsMenu, renderTokenCard } from './menus.js';
 import { getActiveWallet } from './storage.js';
 import { getTokenMarketData, fmtUsd } from './price.js';
+import { generateSellPnlCard } from './pnl-card.js';
 
 // ---------- Shared trade execution (interactive, ctx-based) ----------
 
@@ -81,6 +82,9 @@ export async function executeSell(ctx, uid, tokenAddress, pct) {
 
   const tokenAmount = pos.tokenAmount * (pct / 100);
   const entryMcap = pos.entryMcap;
+  // Proportional cost basis for the slice being sold — used both for the
+  // text PnL block and for the realized-PnL flex card below.
+  const costBasisSold = pos.costEth * (pct / 100);
   let pendingTradeId;
   try {
     await ctx.reply(`Selling ${pct}%... fetching quote.`);
@@ -109,7 +113,8 @@ export async function executeSell(ctx, uid, tokenAddress, pct) {
     markPendingTradeDone(pendingTradeId, 'confirmed');
 
     const exitMarket = await getTokenMarketData(tokenAddress).catch(() => null);
-    recordTrade(uid, w.id, tokenAddress, 'sell', tokenAmount, Number(quote.buyAmountFormatted), exitMarket?.marketCap ?? null);
+    const ethReceived = Number(quote.buyAmountFormatted);
+    recordTrade(uid, w.id, tokenAddress, 'sell', tokenAmount, ethReceived, exitMarket?.marketCap ?? null);
 
     const mcapLines = [];
     if (entryMcap != null) mcapLines.push(`Entry mcap: ${fmtUsd(entryMcap)}`);
@@ -120,6 +125,25 @@ export async function executeSell(ctx, uid, tokenAddress, pct) {
       (txLink ? `✅ Confirmed — [view transaction](${txLink})` : `✅ Confirmed in block ${receipt.blockNumber}`) + mcapBlock,
       { parse_mode: 'Markdown' }
     );
+
+    // ---- PnL flex card ----
+    // Best-effort: a card-generation failure (missing NFT asset, sharp
+    // error, etc.) should never block the trade confirmation the user
+    // actually cares about.
+    try {
+      const pnlEth = ethReceived - costBasisSold;
+      const pnlPct = costBasisSold > 0 ? (pnlEth / costBasisSold) * 100 : 0;
+      const symbol = exitMarket?.symbol ?? shortAddr(tokenAddress);
+      const cardBuffer = await generateSellPnlCard({
+        uid, symbol, pct, pnlEth, pnlPct,
+        entryMcap: entryMcap ?? null,
+        exitMcap: exitMarket?.marketCap ?? null,
+      });
+      await ctx.replyWithPhoto({ source: cardBuffer });
+    } catch (cardErr) {
+      console.error('PnL card generation failed:', cardErr.message);
+    }
+
     const { text, markup } = await renderTokenCard(uid, tokenAddress);
     await ctx.reply(text, { parse_mode: 'Markdown', ...markup });
   } catch (err) {
@@ -141,6 +165,10 @@ export async function executeSell(ctx, uid, tokenAddress, pct) {
 // the other. Callers (pollers.js, bot.js batch handlers) should treat a
 // `{ ok: false, error: 'locked' }`-style result as "try again next cycle",
 // not as a permanent failure.
+//
+// NOTE: headless sells (batch sell, TP/SL, limit orders) intentionally do
+// NOT generate a PnL card — only the interactive executeSell path does, to
+// keep this in scope. Revisit if you want cards on those too.
 
 const LOCKED_ERROR = 'Another trade is already in progress for this account — will retry.';
 
