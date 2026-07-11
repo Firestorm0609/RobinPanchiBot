@@ -383,7 +383,10 @@ function tokenMenu(uid, tokenAddress, hasPosition) {
   const s = getSettings(uid);
   const rows = [
     s.buyPresetsEth.map((amt) => Markup.button.callback(`Buy ${amt} ETH`, `buy_${tokenAddress}_${amt}`)),
-    [Markup.button.callback('✏️ Custom Buy', `custombuy_${tokenAddress}`)],
+    // Label clarifies ETH-or-USD support up front, so users don't have to
+    // tap through to discover it (previously only revealed in the prompt
+    // shown after tapping this button).
+    [Markup.button.callback('✏️ Custom Buy (ETH or $)', `custombuy_${tokenAddress}`)],
   ];
   if (hasPosition) {
     rows.push(s.sellPresetsPct.map((pct) => Markup.button.callback(`Sell ${pct}%`, `sell_${tokenAddress}_${pct}`)));
