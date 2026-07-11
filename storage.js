@@ -111,6 +111,7 @@ CREATE INDEX IF NOT EXISTS idx_auto_rules_status ON auto_rules(status);
 CREATE INDEX IF NOT EXISTS idx_auto_rules_uid ON auto_rules(uid);
 CREATE INDEX IF NOT EXISTS idx_limit_orders_status ON limit_orders(status);
 CREATE INDEX IF NOT EXISTS idx_limit_orders_uid ON limit_orders(uid);
+CREATE INDEX IF NOT EXISTS idx_trade_log_uid_wallet_token ON trade_log(uid, wallet_id, token_address);
 `);
 
 // Migration: move referral_code from settings JSON (old location) to an indexed column.
@@ -355,6 +356,46 @@ export function getAllPositionsForUser(uid) {
     costEth: row.cost_eth,
     entryMcap: row.entry_mcap,
   }));
+}
+
+/**
+ * Realized PnL for a (uid, wallet, token) from the full trade_log history —
+ * used for /flex on CLOSED positions, where the live `positions` row has
+ * token_amount = 0 and entry_mcap cleared (recordTrade wipes it on close),
+ * so there's nothing left to compute unrealized PnL from. This instead sums
+ * every buy/sell ever logged for that pair.
+ *
+ * entryMcap/exitMcap are the mcap_usd of the FIRST buy and LAST sell with a
+ * non-null mcap_usd respectively (display only, not used in the PnL math).
+ * Returns null if there's no trade history at all for this pair.
+ */
+export function getRealizedPnl(uid, walletId, tokenAddress) {
+  const key = tokenAddress.toLowerCase();
+  const rows = db.prepare(`
+    SELECT side, eth_amount, mcap_usd, created_at
+    FROM trade_log
+    WHERE uid = ? AND wallet_id = ? AND token_address = ?
+    ORDER BY created_at ASC
+  `).all(String(uid), walletId, key);
+
+  if (rows.length === 0) return null;
+
+  let totalBuyEth = 0;
+  let totalSellEth = 0;
+  let entryMcap = null;
+  let exitMcap = null;
+
+  for (const row of rows) {
+    if (row.side === 'buy') {
+      totalBuyEth += row.eth_amount;
+      if (entryMcap === null && row.mcap_usd != null) entryMcap = row.mcap_usd;
+    } else {
+      totalSellEth += row.eth_amount;
+      if (row.mcap_usd != null) exitMcap = row.mcap_usd; // last non-null sell mcap wins
+    }
+  }
+
+  return { totalBuyEth, totalSellEth, entryMcap, exitMcap };
 }
 
 // ---------- Settings ----------
