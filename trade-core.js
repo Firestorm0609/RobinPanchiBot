@@ -9,6 +9,7 @@ import { gasMultiplierFor, tradesInFlight } from './state.js';
 import { explorerTxUrl, friendlyErrorMessage, getFreshQuote } from './format.js';
 import { mainMenu, walletsMenu, renderTokenCard } from './menus.js';
 import { getActiveWallet } from './storage.js';
+import { getTokenMarketData, fmtUsd } from './price.js';
 
 // ---------- Shared trade execution (interactive, ctx-based) ----------
 
@@ -46,9 +47,13 @@ export async function executeBuy(ctx, uid, tokenAddress, ethAmount) {
     const txLink = explorerTxUrl(txResponse.hash);
     if (bumped) await ctx.reply('⛽ Network was congested — resubmitted with higher gas.');
     markPendingTradeDone(pendingTradeId, 'confirmed');
-    recordTrade(uid, w.id, tokenAddress, 'buy', Number(quote.buyAmountFormatted), ethAmount);
+
+    const entryMarket = await getTokenMarketData(tokenAddress).catch(() => null);
+    recordTrade(uid, w.id, tokenAddress, 'buy', Number(quote.buyAmountFormatted), ethAmount, entryMarket?.marketCap ?? null);
+
+    const mcapLine = entryMarket?.marketCap != null ? `\nEntry mcap: ${fmtUsd(entryMarket.marketCap)}` : '';
     await ctx.reply(
-      txLink ? `✅ Confirmed — [view transaction](${txLink})` : `✅ Confirmed in block ${receipt.blockNumber}`,
+      (txLink ? `✅ Confirmed — [view transaction](${txLink})` : `✅ Confirmed in block ${receipt.blockNumber}`) + mcapLine,
       { parse_mode: 'Markdown' }
     );
     const { text, markup } = await renderTokenCard(uid, tokenAddress);
@@ -75,6 +80,7 @@ export async function executeSell(ctx, uid, tokenAddress, pct) {
   tradesInFlight.add(uid);
 
   const tokenAmount = pos.tokenAmount * (pct / 100);
+  const entryMcap = pos.entryMcap;
   let pendingTradeId;
   try {
     await ctx.reply(`Selling ${pct}%... fetching quote.`);
@@ -101,9 +107,17 @@ export async function executeSell(ctx, uid, tokenAddress, pct) {
     const txLink = explorerTxUrl(txResponse.hash);
     if (bumped) await ctx.reply('⛽ Network was congested — resubmitted with higher gas.');
     markPendingTradeDone(pendingTradeId, 'confirmed');
-    recordTrade(uid, w.id, tokenAddress, 'sell', tokenAmount, Number(quote.buyAmountFormatted));
+
+    const exitMarket = await getTokenMarketData(tokenAddress).catch(() => null);
+    recordTrade(uid, w.id, tokenAddress, 'sell', tokenAmount, Number(quote.buyAmountFormatted), exitMarket?.marketCap ?? null);
+
+    const mcapLines = [];
+    if (entryMcap != null) mcapLines.push(`Entry mcap: ${fmtUsd(entryMcap)}`);
+    if (exitMarket?.marketCap != null) mcapLines.push(`Exit mcap: ${fmtUsd(exitMarket.marketCap)}`);
+    const mcapBlock = mcapLines.length ? `\n${mcapLines.join('\n')}` : '';
+
     await ctx.reply(
-      txLink ? `✅ Confirmed — [view transaction](${txLink})` : `✅ Confirmed in block ${receipt.blockNumber}`,
+      (txLink ? `✅ Confirmed — [view transaction](${txLink})` : `✅ Confirmed in block ${receipt.blockNumber}`) + mcapBlock,
       { parse_mode: 'Markdown' }
     );
     const { text, markup } = await renderTokenCard(uid, tokenAddress);
@@ -138,8 +152,11 @@ export async function performBuyCore(uid, wallet, tokenAddress, ethAmount) {
     const { txResponse } = await sendSwapWithGasBump(signer, txRequest, { gasMultiplier: gasMultiplierFor(uid) });
     markPendingTradeSubmitted(pendingTradeId, txResponse.hash);
     markPendingTradeDone(pendingTradeId, 'confirmed');
-    recordTrade(uid, wallet.id, tokenAddress, 'buy', Number(quote.buyAmountFormatted), ethAmount);
-    return { ok: true, txHash: txResponse.hash, walletName: wallet.name };
+
+    const entryMarket = await getTokenMarketData(tokenAddress).catch(() => null);
+    recordTrade(uid, wallet.id, tokenAddress, 'buy', Number(quote.buyAmountFormatted), ethAmount, entryMarket?.marketCap ?? null);
+
+    return { ok: true, txHash: txResponse.hash, walletName: wallet.name, entryMcap: entryMarket?.marketCap ?? null };
   } catch (err) {
     if (pendingTradeId) markPendingTradeDone(pendingTradeId, 'failed');
     return { ok: false, error: friendlyErrorMessage(err), walletName: wallet.name };
@@ -172,8 +189,18 @@ export async function performSellCore(uid, wallet, tokenAddress, pct) {
     const { txResponse } = await sendSwapWithGasBump(signer, txRequest, { gasMultiplier: gasMultiplierFor(uid) });
     markPendingTradeSubmitted(pendingTradeId, txResponse.hash);
     markPendingTradeDone(pendingTradeId, 'confirmed');
-    recordTrade(uid, wallet.id, tokenAddress, 'sell', tokenAmount, Number(quote.buyAmountFormatted));
-    return { ok: true, txHash: txResponse.hash, walletName: wallet.name, ethReceived: Number(quote.buyAmountFormatted) };
+
+    const exitMarket = await getTokenMarketData(tokenAddress).catch(() => null);
+    recordTrade(uid, wallet.id, tokenAddress, 'sell', tokenAmount, Number(quote.buyAmountFormatted), exitMarket?.marketCap ?? null);
+
+    return {
+      ok: true,
+      txHash: txResponse.hash,
+      walletName: wallet.name,
+      ethReceived: Number(quote.buyAmountFormatted),
+      entryMcap: pos.entryMcap ?? null,
+      exitMcap: exitMarket?.marketCap ?? null,
+    };
   } catch (err) {
     if (pendingTradeId) markPendingTradeDone(pendingTradeId, 'failed');
     return { ok: false, error: friendlyErrorMessage(err), walletName: wallet.name };
