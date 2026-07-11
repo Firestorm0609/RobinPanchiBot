@@ -16,8 +16,9 @@ export function mainMenu() {
     [Markup.button.callback('🔍 Trade Token', 'menu_trade')],
     [Markup.button.callback('📊 Positions', 'menu_positions'), Markup.button.callback('📈 Portfolio', 'menu_portfolio')],
     [Markup.button.callback('💼 Wallets', 'menu_wallets'), Markup.button.callback('💰 Balance', 'menu_balance')],
-    [Markup.button.callback('🌉 Bridge', 'menu_bridge'), Markup.button.callback('🎟 Rewards', 'menu_rewards')],
-    [Markup.button.callback('❓ Help', 'menu_help'), Markup.button.callback('⚙️ Settings', 'menu_settings')],
+    [Markup.button.callback('🌉 Bridge', 'menu_bridge'), Markup.button.callback('⏰ Limit Orders', 'menu_limitorders')],
+    [Markup.button.callback('🎟 Rewards', 'menu_rewards'), Markup.button.callback('⚙️ Settings', 'menu_settings')],
+    [Markup.button.callback('❓ Help', 'menu_help')],
     [Markup.button.url('🐦 X', 'https://x.com/robinpanchi'), Markup.button.url('🖼 OpenSea', 'https://opensea.io/collection/robinpanchi')],
   ]);
 }
@@ -204,6 +205,40 @@ export function confirmMenu(kind, tokenAddress, value) {
       Markup.button.callback('❌ Cancel', 'cancel_trade'),
     ],
   ]);
+}
+
+// ---------- Limit orders: list + cancel ----------
+
+/**
+ * Renders the user's open limit orders as text + one cancel button per
+ * order. `market` is an optional Map<tokenAddress, marketData> the caller
+ * can pre-fetch so symbols show up instead of raw addresses — falls back
+ * to a shortened address if not supplied or lookup failed for that token.
+ */
+export function limitOrdersText(orders, marketByToken = new Map()) {
+  if (orders.length === 0) {
+    return '⏰ *Limit Orders*\n\nNo open limit orders.';
+  }
+  const lines = orders.map((o) => {
+    const market = marketByToken.get(o.token_address);
+    const label = market?.symbol ?? shortAddr(o.token_address);
+    const mcapLabel = o.target_mcap != null
+      ? fmtUsd(o.target_mcap)
+      : `$${Number(o.trigger_price).toPrecision(4)} (price)`;
+    const amountLabel = o.side === 'buy' ? `${o.amount} ETH` : `${Number(o.amount).toFixed(4)} tokens`;
+    const dir = o.side === 'buy' ? '≤' : '≥';
+    return `*${label}* — ${o.side.toUpperCase()} ${amountLabel} @ mcap ${dir} ${mcapLabel}`;
+  });
+  return `⏰ *Limit Orders*\n\n${lines.join('\n')}`;
+}
+
+export function limitOrdersMenu(orders) {
+  const rows = orders.map((o) => {
+    const market = o._symbol || shortAddr(o.token_address);
+    return [Markup.button.callback(`❌ Cancel ${o.side.toUpperCase()} ${market}`, `limitordercancel_${o.id}`)];
+  });
+  rows.push([Markup.button.callback('⬅️ Back', 'menu_main')]);
+  return Markup.inlineKeyboard(rows);
 }
 
 // ---------- Token info + PnL rendering ----------
