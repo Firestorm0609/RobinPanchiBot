@@ -37,7 +37,42 @@ export function stopAutoRefresh(uid) {
   }
 }
 
+// ---------- Positions view auto-refresh ----------
+export const positionsRefreshTimers = new Map();
+
+export function stopPositionsRefresh(uid) {
+  uid = String(uid);
+  const timer = positionsRefreshTimers.get(uid);
+  if (timer) {
+    clearInterval(timer);
+    positionsRefreshTimers.delete(uid);
+  }
+}
+
+// ---------- Portfolio view auto-refresh ----------
+export const portfolioRefreshTimers = new Map();
+
+export function stopPortfolioRefresh(uid) {
+  uid = String(uid);
+  const timer = portfolioRefreshTimers.get(uid);
+  if (timer) {
+    clearInterval(timer);
+    portfolioRefreshTimers.delete(uid);
+  }
+}
+
+/** Stops every kind of live-updating view (token card, positions, portfolio) for a user. */
+export function stopAllViewRefreshes(uid) {
+  stopAutoRefresh(uid);
+  stopPositionsRefresh(uid);
+  stopPortfolioRefresh(uid);
+}
+
 export function stopAllAutoRefreshes() {
   for (const timer of autoRefreshTimers.values()) clearInterval(timer);
   autoRefreshTimers.clear();
+  for (const timer of positionsRefreshTimers.values()) clearInterval(timer);
+  positionsRefreshTimers.clear();
+  for (const timer of portfolioRefreshTimers.values()) clearInterval(timer);
+  portfolioRefreshTimers.clear();
 }
