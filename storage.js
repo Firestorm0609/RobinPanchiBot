@@ -164,6 +164,8 @@ const DEFAULT_SETTINGS = {
   autoTradeEnabled: false,
   // DM once when active wallet ETH balance drops below this. Set to 0 to disable.
   lowBalanceThresholdEth: 0.01,
+  // How PnL cards (sell card, /flex) display profit/loss: 'eth' | 'usd' | 'hidden'
+  flexPnlMode: 'eth',
 };
 
 function ensureUserRow(uid) {
