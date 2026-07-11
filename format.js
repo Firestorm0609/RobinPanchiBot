@@ -150,6 +150,45 @@ export async function parseEthOrUsdInput(text) {
 export const parseBridgeAmountInput = parseEthOrUsdInput;
 
 /**
+ * Parses a market-cap shorthand input into a raw USD number.
+ * Accepts: `50k` -> 50,000 | `2.5m` -> 2,500,000 | `1b` -> 1,000,000,000
+ * Also accepts a plain number (`500000`) or `$`-prefixed, comma-separated input.
+ * Case-insensitive suffix. Throws with a user-facing message on invalid input.
+ */
+export function parseMcapInput(text) {
+  const trimmed = text.trim().replace(/^\$/, '').replace(/,/g, '');
+  const match = trimmed.match(/^([\d.]+)\s*([kKmMbB])?$/);
+  if (!match) {
+    throw new Error('Send a valid market cap, e.g. `50k`, `2.5m`, `1b`, or a plain number like `500000`');
+  }
+  let num = parseFloat(match[1]);
+  const suffix = (match[2] || '').toLowerCase();
+  if (suffix === 'k') num *= 1_000;
+  else if (suffix === 'm') num *= 1_000_000;
+  else if (suffix === 'b') num *= 1_000_000_000;
+
+  if (isNaN(num) || num <= 0) {
+    throw new Error('Send a valid positive market cap, e.g. `50k`, `2.5m`, `1b`');
+  }
+  return num;
+}
+
+/**
+ * Converts a target market cap (USD) into an equivalent per-token USD price,
+ * using a live market snapshot's price/marketCap ratio (i.e. circulating
+ * supply = marketCap / priceUsd). This is what lets users set limit orders
+ * in mcap terms while the poller keeps comparing against live token price
+ * under the hood (price is what DexScreener actually reports in real time).
+ * Returns null if the snapshot doesn't have enough data to compute a ratio.
+ */
+export function mcapToPrice(targetMcap, market) {
+  if (!market || !market.marketCap || !market.priceUsd || market.marketCap <= 0) return null;
+  const impliedSupply = market.marketCap / market.priceUsd;
+  if (!impliedSupply || impliedSupply <= 0) return null;
+  return targetMcap / impliedSupply;
+}
+
+/**
  * Standard "amount" label used across buy/batch/bridge confirmations and
  * results — USD-first, with the ETH equivalent shown in parentheses. Falls
  * back to a plain ETH label if no USD figure is available (e.g. explicit
