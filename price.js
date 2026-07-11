@@ -48,3 +48,22 @@ export function fmtUsd(n) {
   if (n >= 1_000) return `$${(n / 1_000).toFixed(2)}K`;
   return `$${n.toFixed(2)}`;
 }
+
+/**
+ * Formats a raw token amount (e.g. from a memecoin balance/position) using
+ * K/M/B shorthand once it gets large — mirrors fmtUsd's style. A bare
+ * `.toFixed(4)` on something like 10,604,832 tokens is unreadable; this
+ * shows "10.60M" instead.
+ *
+ * Small amounts (<1000) still show with enough precision to be meaningful
+ * for low-decimal or low-supply tokens.
+ */
+export function fmtTokenAmount(n) {
+  if (n === null || n === undefined || Number.isNaN(n)) return 'n/a';
+  const abs = Math.abs(n);
+  if (abs >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(2)}B`;
+  if (abs >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (abs >= 1_000) return `${(n / 1_000).toFixed(2)}K`;
+  if (abs >= 1) return n.toFixed(4);
+  return n.toFixed(6);
+}
