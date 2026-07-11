@@ -179,13 +179,18 @@ export function parseMcapInput(text) {
  * supply = marketCap / priceUsd). This is what lets users set limit orders
  * in mcap terms while the poller keeps comparing against live token price
  * under the hood (price is what DexScreener actually reports in real time).
- * Returns null if the snapshot doesn't have enough data to compute a ratio.
+ * Returns null if the snapshot doesn't have enough data to compute a ratio,
+ * or if the computed price isn't a finite positive number (guards against a
+ * malformed/stale market snapshot producing a NaN/Infinity trigger price
+ * that would silently never fire, or fire immediately, once stored).
  */
 export function mcapToPrice(targetMcap, market) {
-  if (!market || !market.marketCap || !market.priceUsd || market.marketCap <= 0) return null;
+  if (!market || !market.marketCap || !market.priceUsd || market.marketCap <= 0 || market.priceUsd <= 0) return null;
   const impliedSupply = market.marketCap / market.priceUsd;
-  if (!impliedSupply || impliedSupply <= 0) return null;
-  return targetMcap / impliedSupply;
+  if (!impliedSupply || impliedSupply <= 0 || !Number.isFinite(impliedSupply)) return null;
+  const price = targetMcap / impliedSupply;
+  if (!Number.isFinite(price) || price <= 0) return null;
+  return price;
 }
 
 /**
