@@ -1,8 +1,9 @@
 import sharp from 'sharp';
 import path from 'path';
 import crypto from 'crypto';
-import { getActiveWallet, getPosition } from './storage.js';
+import { getActiveWallet, getPosition, getRealizedPnl } from './storage.js';
 import { getTokenMarketData, getEthUsdPrice, fmtUsd, fmtTokenAmount } from './price.js';
+import { shortAddr } from './wallet.js';
 
 const NFT_DIR = path.join(process.cwd(), 'assets', 'nft-cards');
 const NFT_COUNT = 100;
@@ -107,17 +108,11 @@ export async function generateSellPnlCard({ uid, symbol, pct, pnlEth, pnlPct, en
 }
 
 /**
- * Unrealized-PnL "flex" card for /flex — looks up the user's live position
- * on the given token itself, so callers just pass uid + tokenAddress.
- * Returns null if there's no active wallet, no open position, or no market data.
+ * Unrealized-PnL "flex" card for /flex on an OPEN position — looks up the
+ * user's live position on the given token itself, so callers just pass
+ * uid + tokenAddress.
  */
-export async function generateFlexCard(uid, tokenAddress) {
-  const w = getActiveWallet(uid);
-  if (!w) return null;
-
-  const pos = getPosition(uid, w.id, tokenAddress);
-  if (!pos || pos.tokenAmount <= 0) return null;
-
+async function generateOpenPositionFlexCard(uid, wallet, tokenAddress, pos) {
   const market = await getTokenMarketData(tokenAddress).catch(() => null);
   const ethUsd = await getEthUsdPrice().catch(() => null);
   if (!market || !ethUsd) return null;
@@ -143,4 +138,57 @@ export async function generateFlexCard(uid, tokenAddress) {
     isWin,
     stats,
   });
+}
+
+/**
+ * Realized-PnL "flex" card for a CLOSED position — position has no live
+ * tokenAmount left, so this sums the wallet's full buy/sell history for the
+ * token (via getRealizedPnl) and flexes total ETH profit/loss instead.
+ */
+async function generateClosedPositionFlexCard(uid, wallet, tokenAddress) {
+  const realized = getRealizedPnl(uid, wallet.id, tokenAddress);
+  if (!realized || realized.totalBuyEth <= 0) return null;
+
+  const { totalBuyEth, totalSellEth, entryMcap, exitMcap } = realized;
+  const pnlEth = totalSellEth - totalBuyEth;
+  const pnlPct = (pnlEth / totalBuyEth) * 100;
+  const isWin = pnlEth >= 0;
+  const pnlLabel = `${pnlEth >= 0 ? '+' : ''}${pnlEth.toFixed(3)} ETH`;
+
+  const market = await getTokenMarketData(tokenAddress).catch(() => null);
+  const symbol = market?.symbol ?? shortAddr(tokenAddress);
+
+  const stats = [
+    { label: 'Entry mcap', value: entryMcap != null ? fmtUsd(entryMcap) : 'n/a' },
+    { label: 'Exit mcap', value: exitMcap != null ? fmtUsd(exitMcap) : 'n/a' },
+    { label: 'PnL', value: `${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`, color: isWin ? '#97C459' : '#E24B4A' },
+  ];
+
+  return renderCard({
+    uid,
+    symbol,
+    subtitle: 'Closed position',
+    pnlLabel,
+    isWin,
+    stats,
+  });
+}
+
+/**
+ * Entry point used by /flex. Works for BOTH an open position (live
+ * unrealized PnL vs. current price) and a fully closed one (realized PnL
+ * summed from trade history). Returns null if there's no active wallet, or
+ * no trade history at all for this token — the caller shows a "no position"
+ * message in that case.
+ */
+export async function generateFlexCard(uid, tokenAddress) {
+  const w = getActiveWallet(uid);
+  if (!w) return null;
+
+  const pos = getPosition(uid, w.id, tokenAddress);
+  if (pos && pos.tokenAmount > 0) {
+    return generateOpenPositionFlexCard(uid, w, tokenAddress, pos);
+  }
+
+  return generateClosedPositionFlexCard(uid, w, tokenAddress);
 }
