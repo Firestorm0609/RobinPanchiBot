@@ -9,7 +9,8 @@ import {
   getPosition,
   getActiveAutoRuleForPosition,
 } from './storage.js';
-import { dualEthBalanceLines } from './format.js';
+import { dualEthBalanceLines, gasEstimateLine } from './format.js';
+import { FALLBACK_GAS_LIMIT_BUY } from './config.js';
 
 export function mainMenu() {
   return Markup.inlineKeyboard([
@@ -298,6 +299,10 @@ export async function renderTokenCard(uid, tokenAddress) {
 
   const changeLine = market.priceChange24h !== null ? ` (${market.priceChange24h >= 0 ? '+' : ''}${market.priceChange24h.toFixed(1)}%)` : '';
   const walletBalance = await dualEthBalanceLines(w.address).catch(() => 'unavailable');
+  // Est. network fee for a trade on this token — same estimate shown on the
+  // buy/sell confirm screens, surfaced here too so it's visible before the
+  // user even taps Buy/Sell.
+  const gasLine = await gasEstimateLine(uid, FALLBACK_GAS_LIMIT_BUY).catch(() => '');
 
   const text =
     `*${market.symbol}*\n\`${tokenAddress}\`\n\n` +
@@ -305,6 +310,7 @@ export async function renderTokenCard(uid, tokenAddress) {
     `Market Cap: ${fmtUsd(market.marketCap)}\n` +
     `Liquidity: ${fmtUsd(market.liquidityUsd)}\n` +
     `Your balance:\n${walletBalance}` +
+    gasLine +
     pnlLine;
 
   return { text, markup: tokenMenu(uid, tokenAddress, !!(pos && pos.tokenAmount > 0), ethUsd) };
