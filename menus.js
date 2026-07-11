@@ -1,6 +1,6 @@
 import { Markup } from 'telegraf';
 import { shortAddr } from './wallet.js';
-import { getEthUsdPrice, getTokenMarketData, fmtUsd, getCachedEthUsdPrice } from './price.js';
+import { getEthUsdPrice, getTokenMarketData, fmtUsd, getCachedEthUsdPrice, fmtTokenAmount } from './price.js';
 import { BRIDGE_DIRECTION } from './bridge.js';
 import {
   getUser,
@@ -207,6 +207,13 @@ export function confirmMenu(kind, tokenAddress, value) {
   ]);
 }
 
+/** "⬅️ Back" plus a "🔄 Refresh" button — used by Positions and Portfolio views. */
+export function refreshBackMenu(refreshAction) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('🔄 Refresh', refreshAction), Markup.button.callback('⬅️ Back', 'menu_main')],
+  ]);
+}
+
 // ---------- Limit orders: list + cancel ----------
 
 /**
@@ -225,7 +232,7 @@ export function limitOrdersText(orders, marketByToken = new Map()) {
     const mcapLabel = o.target_mcap != null
       ? fmtUsd(o.target_mcap)
       : `$${Number(o.trigger_price).toPrecision(4)} (price)`;
-    const amountLabel = o.side === 'buy' ? `${o.amount} ETH` : `${Number(o.amount).toFixed(4)} tokens`;
+    const amountLabel = o.side === 'buy' ? `${o.amount} ETH` : `${fmtTokenAmount(Number(o.amount))} tokens`;
     const dir = o.side === 'buy' ? '≤' : '≥';
     return `*${label}* — ${o.side.toUpperCase()} ${amountLabel} @ mcap ${dir} ${mcapLabel}`;
   });
@@ -269,7 +276,7 @@ export async function renderTokenCard(uid, tokenAddress) {
       const pnlUsd = currentValueUsd - costUsd;
       const pnlPct = costUsd > 0 ? (pnlUsd / costUsd) * 100 : 0;
       const emoji = pnlUsd >= 0 ? '🟢' : '🔴';
-      pnlLine = `\n\n*Your position:*\n${pos.tokenAmount.toFixed(4)} ${market.symbol}\nCost: ${fmtUsd(costUsd)} | Value: ${fmtUsd(currentValueUsd)}\nPnL: ${emoji} ${fmtUsd(pnlUsd)} (${pnlPct.toFixed(1)}%)`;
+      pnlLine = `\n\n*Your position:*\n${fmtTokenAmount(pos.tokenAmount)} ${market.symbol}\nCost: ${fmtUsd(costUsd)} | Value: ${fmtUsd(currentValueUsd)}\nPnL: ${emoji} ${fmtUsd(pnlUsd)} (${pnlPct.toFixed(1)}%)`;
     }
     if (pos.entryMcap != null) {
       pnlLine += `\nEntry mcap: ${fmtUsd(pos.entryMcap)}`;
@@ -300,4 +307,101 @@ export async function renderTokenCard(uid, tokenAddress) {
     pnlLine;
 
   return { text, markup: tokenMenu(uid, tokenAddress, !!(pos && pos.tokenAmount > 0), ethUsd) };
+}
+
+// ---------- Positions list + Portfolio summary rendering ----------
+// Pulled out into standalone builders (rather than left inline in bot.js)
+// so both the manual "🔄 Refresh" button and the 30s auto-refresh timer can
+// call the exact same rendering logic and stay in sync.
+
+export async function renderPositionsView(uid) {
+  const w = getActiveWallet(uid);
+  if (!w) return { text: 'No active wallet. Add one first.', markup: walletsMenu(uid) };
+
+  const { getAllPositions } = await import('./storage.js');
+  const positions = getAllPositions(uid, w.id);
+  if (positions.length === 0) {
+    return {
+      text: '📊 No positions yet. Trade a token to open one.',
+      markup: Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_main')]]),
+    };
+  }
+
+  const ethUsd = await getEthUsdPrice().catch(() => null);
+  const rows = [];
+  let text = `📊 *Positions* — ${w.name}\n`;
+
+  for (const pos of positions) {
+    const market = await getTokenMarketData(pos.tokenAddress).catch(() => null);
+    const symbol = market?.symbol ?? shortAddr(pos.tokenAddress);
+    if (market && ethUsd) {
+      const valueUsd = pos.tokenAmount * market.priceUsd;
+      const costUsd = pos.costEth * ethUsd;
+      const pnlUsd = valueUsd - costUsd;
+      const pnlPct = costUsd > 0 ? (pnlUsd / costUsd) * 100 : 0;
+      const emoji = pnlUsd >= 0 ? '🟢' : '🔴';
+      text += `\n*${symbol}*: ${fmtTokenAmount(pos.tokenAmount)} — ${fmtUsd(valueUsd)} (${emoji} ${pnlPct.toFixed(1)}%)`;
+      if (pos.entryMcap != null) {
+        text += `\n  Entry mcap: ${fmtUsd(pos.entryMcap)}`;
+      }
+    } else {
+      text += `\n*${symbol}*: ${fmtTokenAmount(pos.tokenAmount)} — price unavailable`;
+    }
+    rows.push([Markup.button.callback(`View ${symbol}`, `refresh_${pos.tokenAddress}`)]);
+  }
+
+  rows.push([Markup.button.callback('🔄 Refresh', 'menu_positions_refresh'), Markup.button.callback('⬅️ Back', 'menu_main')]);
+  return { text, markup: Markup.inlineKeyboard(rows) };
+}
+
+export async function renderPortfolioView(uid) {
+  const { getAllPositionsForUser } = await import('./storage.js');
+  const positions = getAllPositionsForUser(uid);
+
+  if (positions.length === 0) {
+    return {
+      text: '📈 No open positions across any wallet yet.',
+      markup: Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_main')]]),
+    };
+  }
+
+  const ethUsd = await getEthUsdPrice().catch(() => null);
+  const lines = [];
+  let totalValueUsd = 0;
+  let totalCostUsd = 0;
+  let anyPriceUnavailable = false;
+
+  for (const pos of positions) {
+    const market = await getTokenMarketData(pos.tokenAddress).catch(() => null);
+    const symbol = market?.symbol ?? shortAddr(pos.tokenAddress);
+    if (market && ethUsd) {
+      const valueUsd = pos.tokenAmount * market.priceUsd;
+      const costUsd = pos.costEth * ethUsd;
+      totalValueUsd += valueUsd;
+      totalCostUsd += costUsd;
+      const pnlUsd = valueUsd - costUsd;
+      const pnlPct = costUsd > 0 ? (pnlUsd / costUsd) * 100 : 0;
+      const emoji = pnlUsd >= 0 ? '🟢' : '🔴';
+      let line = `*${symbol}* (${pos.walletName}): ${fmtUsd(valueUsd)} (${emoji} ${pnlPct.toFixed(1)}%)`;
+      if (pos.entryMcap != null) line += `\n  Entry mcap: ${fmtUsd(pos.entryMcap)}`;
+      lines.push(line);
+    } else {
+      anyPriceUnavailable = true;
+      lines.push(`*${symbol}* (${pos.walletName}): price unavailable`);
+    }
+  }
+
+  const totalPnlUsd = totalValueUsd - totalCostUsd;
+  const totalPnlPct = totalCostUsd > 0 ? (totalPnlUsd / totalCostUsd) * 100 : 0;
+  const totalEmoji = totalPnlUsd >= 0 ? '🟢' : '🔴';
+  const disclaimer = anyPriceUnavailable ? '\n_Totals exclude positions with unavailable pricing._' : '';
+
+  const text =
+    `📈 *Portfolio Summary* — all wallets\n\n` +
+    `Total value: ${fmtUsd(totalValueUsd)}\n` +
+    `Total cost: ${fmtUsd(totalCostUsd)}\n` +
+    `Total PnL: ${totalEmoji} ${fmtUsd(totalPnlUsd)} (${totalPnlPct.toFixed(1)}%)${disclaimer}\n\n` +
+    `*Positions:*\n${lines.join('\n')}`;
+
+  return { text, markup: refreshBackMenu('menu_portfolio_refresh') };
 }
