@@ -20,6 +20,12 @@ export function getCachedEthUsdPrice() {
   return null;
 }
 
+// Same base58 sanity check used elsewhere (config.js's SOLANA_ADDRESS_REGEX)
+// — duplicated here (not imported) to keep price.js dependency-free of
+// config.js and avoid a circular import risk. Kept in sync manually; if you
+// change one, change both.
+const SOLANA_ADDRESS_REGEX = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
 // DexScreener's chainId slugs for the `chainId` field in its API responses —
 // used to confirm a pair result actually belongs to the chain we asked about
 // (DexScreener's /tokens/ endpoint searches across ALL chains it indexes).
@@ -57,11 +63,19 @@ async function getDexScreenerMarketData(tokenAddress, chainKey) {
 // guarantee it stays free/unauthenticated/stable. If it starts returning
 // 401/403/empty, this function just fails closed and the caller falls back
 // to DexScreener automatically — no other code needs to change.
+//
+// IMPORTANT: the endpoint does NOT reliably reject malformed/non-Solana
+// input (observed returning an unrelated match for a plain EVM 0x address)
+// — so every caller MUST validate the address looks like a real Solana
+// mint (base58, no 0/O/I/l) before calling this, which is why this function
+// checks SOLANA_ADDRESS_REGEX itself rather than trusting callers.
 // ---------------------------------------------------------------------------
 
 const PUMPFUN_COIN_URL = 'https://frontend-api-v3.pump.fun/coins';
 
 async function getPumpFunMarketData(mintAddress) {
+  if (!SOLANA_ADDRESS_REGEX.test(mintAddress)) return null;
+
   let res;
   try {
     res = await axios.get(`${PUMPFUN_COIN_URL}/${mintAddress}`, { timeout: 8000 });
@@ -71,6 +85,10 @@ async function getPumpFunMarketData(mintAddress) {
 
   const d = res.data;
   if (!d || d.is_banned) return null;
+
+  // Defense in depth: confirm the response actually echoes back the mint we
+  // asked for, in case the endpoint ever does fuzzy/partial matching again.
+  if (d.mint && d.mint !== mintAddress) return null;
 
   const decimals = d.base_decimals ?? 6;
   const totalSupply = Number(d.total_supply_str ?? d.total_supply ?? 0) / 10 ** decimals;
@@ -222,10 +240,12 @@ export async function getTokenMarketData(tokenAddress, chainKey) {
  * live market data, ranked by liquidity. This is what lets a pasted CA
  * "just work" without the user picking a chain first.
  *
- * For a Solana mint, pump.fun is checked first (same as getTokenMarketData)
- * since it's the more reliable source for pump.fun-launched tokens; its
- * result is merged into the same ranked list DexScreener produces for every
- * other chain. Uniswap's per-chain fallback is NOT used here — it needs one
+ * pump.fun is only consulted when `tokenAddress` actually looks like a
+ * Solana mint (base58, 32-44 chars) — an EVM 0x... address is never passed
+ * to it. This matters because pump.fun's endpoint has been observed
+ * returning an unrelated match for malformed/non-Solana input rather than a
+ * clean 404, which previously caused plain EVM tokens to get mislabeled as
+ * Solana. Uniswap's per-chain fallback is NOT used here — it needs one
  * specific chain to quote against, so it can't cheaply probe "every EVM
  * chain at once" the way DexScreener's cross-chain search can. That
  * fallback still applies once a chain is actually selected (see
@@ -236,9 +256,11 @@ export async function getTokenMarketData(tokenAddress, chainKey) {
  * Empty array if the address has no market data on any supported chain.
  */
 export async function findTokenAcrossChains(tokenAddress) {
+  const looksLikeSolanaMint = SOLANA_ADDRESS_REGEX.test(tokenAddress);
+
   const [dexRes, pumpMarket] = await Promise.all([
     axios.get(`https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`).catch(() => null),
-    getPumpFunMarketData(tokenAddress).catch(() => null),
+    looksLikeSolanaMint ? getPumpFunMarketData(tokenAddress).catch(() => null) : Promise.resolve(null),
   ]);
 
   const allPairs = dexRes?.data?.pairs || [];
