@@ -34,12 +34,6 @@ bot.action('settings_maxbuy', async (ctx) => {
   await ctx.editMessageText('Send the max USD allowed per single buy, e.g. `500`', { parse_mode: 'Markdown' });
 });
 
-bot.action('settings_maxbridge', async (ctx) => {
-  await ctx.answerCbQuery();
-  pending.set(ctx.from.id, { type: 'settings_maxbridge' });
-  await ctx.editMessageText('Send the max USD allowed per single bridge, e.g. `500`', { parse_mode: 'Markdown' });
-});
-
 bot.action('settings_gastier', async (ctx) => {
   const s = getSettings(ctx.from.id);
   const idx = GAS_TIERS.indexOf(s.gasTier);
@@ -53,7 +47,7 @@ bot.action('settings_lowbalance', async (ctx) => {
   await ctx.answerCbQuery();
   pending.set(ctx.from.id, { type: 'settings_lowbalance' });
   await ctx.editMessageText(
-    'Send the ETH balance threshold to alert on, e.g. `0.01`. Send `0` to disable low-balance alerts.',
+    'Send the native-gas-token balance threshold to alert on for your active chain, e.g. `0.01`. Send `0` to disable.',
     { parse_mode: 'Markdown' }
   );
 });
@@ -65,10 +59,6 @@ bot.action('settings_toggle_confirm', async (ctx) => {
   await ctx.editMessageText('⚙️ *Settings*', { parse_mode: 'Markdown', ...settingsMenu(ctx.from.id) });
 });
 
-// Cycles usdc -> hidden. 'usdc' shows the exact $ PnL on flex/sell cards;
-// 'hidden' shows only the % return. (Previously cycled eth -> usd -> hidden
-// from back when trades were ETH-denominated — simplified now that trades
-// are USDC-denominated directly, see pnl-card.js.)
 bot.action('settings_flexpnl', async (ctx) => {
   const FLEX_PNL_MODES = ['usdc', 'hidden'];
   const s = getSettings(ctx.from.id);

@@ -1,18 +1,18 @@
 import { Markup } from 'telegraf';
-import { ethers } from 'ethers';
 import { bot } from '../bot-instance.js';
-import { createWallet, importWallet } from '../wallet.js';
-import { getEthUsdPrice, getTokenMarketData, fmtUsd } from '../price.js';
-import { getBridgeQuote, estimateBridgeGasEth, BRIDGE_DIRECTION, chainIdsForDirection, ETH_CHAIN_ID } from '../bridge.js';
+import { createWallet, importWallet, shortAddr } from '../wallet.js';
+import { getTokenMarketData, findTokenAcrossChains, fmtUsd } from '../price.js';
 import { sendAdminAlert } from '../alerts.js';
 import { isRateLimited } from '../ratelimit.js';
-import { getUsdcBalance } from '../erc20.js';
+import { getChain, isSolanaChain } from '../chains.js';
 import {
   getUser,
   addWallet,
   renameWallet,
   getWallet,
   getActiveWallet,
+  getActiveChain,
+  setActiveChain,
   getPosition,
   getSettings,
   updateSettings,
@@ -23,27 +23,30 @@ import {
   createLimitOrder,
 } from '../storage.js';
 import {
-  provider, ethMainnetProvider, CA_REGEX, FALLBACK_GAS_LIMIT_BUY, FALLBACK_GAS_LIMIT_SELL,
-  MAX_BATCH_FUND_NEW_WALLETS, MIN_BRIDGE_ETH, TERMS_TEXT, USDC_DECIMALS,
+  CA_REGEX, SOLANA_ADDRESS_REGEX, FALLBACK_GAS_LIMIT_BUY, FALLBACK_GAS_LIMIT_SELL,
+  MAX_BATCH_FUND_NEW_WALLETS, TERMS_TEXT,
 } from '../config.js';
-import { pending, fundsInFlight, lowBalanceWarned, gasMultiplierFor, stopPositionsRefresh } from '../state.js';
+import { pending, fundsInFlight, gasMultiplierFor, stopPositionsRefresh } from '../state.js';
 import {
-  dualEthBalanceLines, gasEstimateLine, friendlyErrorMessage, parseUsdcAmountInput, parseBridgeAmountInput,
-  parseMcapInput, mcapToPrice, fmtAmountLabel,
+  gasEstimateLine, friendlyErrorMessage, parseUsdcAmountInput, parseMcapInput, mcapToPrice, getChainUsdcBalance,
 } from '../format.js';
 import {
-  mainMenu, walletsMenu, bridgeConfirmMenu, directionLabel, batchSelectMenu, batchSellSelectMenu, confirmMenu,
-  renderTokenCard,
+  mainMenu, walletsMenu, batchSelectMenu, batchSellSelectMenu, confirmMenu, renderTokenCard,
 } from '../menus.js';
 import { executeBuy, executeSell, estimateTransferGasReserve, distributeUsdc } from '../trade-core.js';
 import { scheduleCardAutoRefresh } from '../autorefresh.js';
+
+/** True if `text` looks like an EVM address or a Solana mint. */
+function isContractAddress(text) {
+  return CA_REGEX.test(text) || SOLANA_ADDRESS_REGEX.test(text);
+}
 
 bot.on('text', async (ctx) => {
   const uid = ctx.from.id;
   const state = pending.get(uid);
   const text = ctx.message.text.trim();
 
-  if (CA_REGEX.test(text)) {
+  if (isContractAddress(text)) {
     if (!hasAgreedTerms(uid)) {
       return ctx.reply(TERMS_TEXT, {
         parse_mode: 'Markdown',
@@ -53,6 +56,21 @@ bot.on('text', async (ctx) => {
     if (isRateLimited(uid)) return ctx.reply('⏳ Slow down a bit — too many lookups in the last minute.');
     pending.delete(uid);
     stopPositionsRefresh(uid);
+
+    // If the pasted address has no data on the user's currently active
+    // chain, auto-detect which supported chain it DOES live on (by
+    // liquidity) and switch the user there — this is what makes "just
+    // paste a CA" work without making the user pick a chain first.
+    const activeChain = getActiveChain(uid);
+    const activeMarket = await getTokenMarketData(text, activeChain).catch(() => null);
+    if (!activeMarket) {
+      const matches = await findTokenAcrossChains(text);
+      if (matches.length > 0 && matches[0].chainKey !== activeChain) {
+        setActiveChain(uid, matches[0].chainKey);
+        await ctx.reply(`ℹ️ No liquidity for that token on ${getChain(activeChain).name} — switched you to *${getChain(matches[0].chainKey).name}*, where it does.`, { parse_mode: 'Markdown' });
+      }
+    }
+
     const { text: cardText, markup } = await renderTokenCard(uid, text);
     const sent = await ctx.reply(cardText, { parse_mode: 'Markdown', ...markup });
     scheduleCardAutoRefresh(uid, text, sent.chat.id, sent.message_id);
@@ -63,7 +81,7 @@ bot.on('text', async (ctx) => {
 
   try {
     if (state.type === 'awaiting_ca') {
-      await ctx.reply('That doesn\'t look like a valid contract address. Paste a valid 0x... address.');
+      await ctx.reply('That doesn\'t look like a valid address. Paste a valid EVM (0x...) address or a Solana mint.');
       return;
     }
 
@@ -71,24 +89,30 @@ bot.on('text', async (ctx) => {
       const w = createWallet(text);
       addWallet(uid, w);
       pending.delete(uid);
-      await ctx.reply(`✅ Wallet *${text}* created:\n\`${w.address}\`\n\nFund it with USDC on Robinhood Chain to trade.`, {
-        parse_mode: 'Markdown',
-        ...mainMenu(),
-      });
+      await ctx.reply(
+        `✅ Wallet *${text}* created:\nEVM: \`${w.evmAddress}\`\nSolana: \`${w.solAddress}\`\n\nDeposit native USDC on any supported chain to trade there — no bridging needed.`,
+        { parse_mode: 'Markdown', ...mainMenu() }
+      );
       return;
     }
 
     if (state.type === 'import_name') {
       pending.set(uid, { type: 'import_key', name: text });
-      await ctx.reply('Now send the private key for this wallet:');
+      await ctx.reply('Now send the private key for this wallet (EVM `0x...` key, or a Solana base58 secret key):');
       return;
     }
 
     if (state.type === 'import_key') {
-      const w = importWallet(state.name, text);
+      const { wallet: w, generatedSide } = importWallet(state.name, text);
       addWallet(uid, w);
       pending.delete(uid);
-      await ctx.reply(`✅ Wallet *${state.name}* imported:\n\`${w.address}\``, { parse_mode: 'Markdown', ...mainMenu() });
+      const genNote = generatedSide === 'solana'
+        ? `\n\n_A new Solana address was generated for this wallet — fund it separately to trade on Solana._`
+        : `\n\n_A new EVM address was generated for this wallet — fund it separately to trade on EVM chains._`;
+      await ctx.reply(
+        `✅ Wallet *${state.name}* imported:\nEVM: \`${w.evmAddress}\`\nSolana: \`${w.solAddress}\`${genNote}`,
+        { parse_mode: 'Markdown', ...mainMenu() }
+      );
       ctx.deleteMessage(ctx.message.message_id).catch(() => {});
       return;
     }
@@ -102,8 +126,8 @@ bot.on('text', async (ctx) => {
       const w = getWallet(uid, state.walletId);
       if (!w) return ctx.reply('Wallet not found.', walletsMenu(uid));
       await ctx.reply(
-        `🔑 *${w.name}* private key:\n\`${w.privateKey}\`\n\n` +
-        'Save this somewhere safe, then delete this message. Anyone with this key can drain the wallet.',
+        `🔑 *${w.name}* private keys:\nEVM: \`${w.privateKey}\`\nSolana: \`${w.solPrivateKey}\`\n\n` +
+        'Save these somewhere safe, then delete this message. Anyone with these keys can drain the wallet.',
         { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_wallets')]]) }
       );
       return;
@@ -152,32 +176,13 @@ bot.on('text', async (ctx) => {
       return;
     }
 
-    if (state.type === 'settings_maxbridge') {
-      // Bridging stays ETH-denominated (separate from USDC trading), so
-      // this is still stored/converted in ETH.
-      const usd = parseFloat(text.replace(/^\$/, ''));
-      if (isNaN(usd) || usd <= 0) return ctx.reply('Send a valid positive USD amount, e.g. `500`');
-      let ethUsd;
-      try {
-        ethUsd = await getEthUsdPrice();
-      } catch {
-        return ctx.reply('Price feed is down right now — try again shortly.');
-      }
-      const amt = Number((usd / ethUsd).toFixed(6));
-      updateSettings(uid, { maxBridgeEth: amt });
-      pending.delete(uid);
-      await ctx.reply(`✅ Max bridge size set to ${fmtUsd(usd)}`, mainMenu());
-      return;
-    }
-
     if (state.type === 'settings_lowbalance') {
       const amt = parseFloat(text);
-      if (isNaN(amt) || amt < 0) return ctx.reply('Send a valid non-negative ETH amount, e.g. `0.01`, or `0` to disable.');
+      if (isNaN(amt) || amt < 0) return ctx.reply('Send a valid non-negative amount (native gas token), e.g. `0.01`, or `0` to disable.');
       updateSettings(uid, { lowBalanceThresholdEth: amt });
-      lowBalanceWarned.delete(String(uid));
       pending.delete(uid);
       await ctx.reply(
-        amt === 0 ? '✅ Low balance alerts disabled.' : `✅ Low balance alert threshold set to ${amt} ETH`,
+        amt === 0 ? '✅ Low balance alerts disabled.' : `✅ Low balance alert threshold set to ${amt} (native token)`,
         mainMenu()
       );
       return;
@@ -201,8 +206,9 @@ bot.on('text', async (ctx) => {
 
       const { confirmTrades } = getSettings(uid);
       if (confirmTrades) {
-        const gasLine = await gasEstimateLine(uid, FALLBACK_GAS_LIMIT_BUY);
-        await ctx.reply(`Confirm: buy *${fmtUsd(val)}*?${gasLine}`, {
+        const chainKey = getActiveChain(uid);
+        const gasLine = await gasEstimateLine(chainKey, uid, FALLBACK_GAS_LIMIT_BUY);
+        await ctx.reply(`Confirm: buy *${fmtUsd(val)}* on ${getChain(chainKey).name}?${gasLine}`, {
           parse_mode: 'Markdown',
           ...confirmMenu('buy', state.tokenAddress, val),
         });
@@ -220,7 +226,8 @@ bot.on('text', async (ctx) => {
 
       const { confirmTrades } = getSettings(uid);
       if (confirmTrades) {
-        const gasLine = await gasEstimateLine(uid, FALLBACK_GAS_LIMIT_SELL);
+        const chainKey = getActiveChain(uid);
+        const gasLine = await gasEstimateLine(chainKey, uid, FALLBACK_GAS_LIMIT_SELL);
         await ctx.reply(`Confirm: sell *${val}%*?${gasLine}`, {
           parse_mode: 'Markdown',
           ...confirmMenu('sell', state.tokenAddress, val),
@@ -243,7 +250,8 @@ bot.on('text', async (ctx) => {
 
       const w = getActiveWallet(uid);
       if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
-      const pos = getPosition(uid, w.id, state.tokenAddress);
+      const chainKey = getActiveChain(uid);
+      const pos = getPosition(uid, w.id, chainKey, state.tokenAddress);
       if (!pos || pos.tokenAmount <= 0) {
         pending.delete(uid);
         return ctx.reply('No open position on this token to set a rule for.', mainMenu());
@@ -251,10 +259,10 @@ bot.on('text', async (ctx) => {
 
       pending.delete(uid);
 
-      const existing = getActiveAutoRuleForPosition(uid, w.id, state.tokenAddress);
+      const existing = getActiveAutoRuleForPosition(uid, w.id, chainKey, state.tokenAddress);
       if (existing) cancelAutoRule(uid, existing.id);
 
-      createAutoRule({ uid, walletId: w.id, tokenAddress: state.tokenAddress, tpPct, slPct });
+      createAutoRule({ uid, walletId: w.id, chain: chainKey, tokenAddress: state.tokenAddress, tpPct, slPct });
       const parts2 = [];
       if (tpPct !== null) parts2.push(`TP +${tpPct}%`);
       if (slPct !== null) parts2.push(`SL -${slPct}%`);
@@ -273,17 +281,15 @@ bot.on('text', async (ctx) => {
         return ctx.reply(err.message, { parse_mode: 'Markdown' });
       }
 
-      const market = await getTokenMarketData(state.tokenAddress).catch(() => null);
+      const chainKey = getActiveChain(uid);
+      const market = await getTokenMarketData(state.tokenAddress, chainKey).catch(() => null);
       const triggerPrice = mcapToPrice(targetMcap, market);
       if (triggerPrice === null) {
         return ctx.reply('Could not fetch live market data for this token right now — try again in a moment.');
       }
 
-      pending.set(uid, { type: 'limitbuy_amount', tokenAddress: state.tokenAddress, triggerPrice, targetMcap });
-      await ctx.reply(
-        'Send the USD amount to spend when triggered, e.g. `100`:',
-        { parse_mode: 'Markdown' }
-      );
+      pending.set(uid, { type: 'limitbuy_amount', tokenAddress: state.tokenAddress, chain: chainKey, triggerPrice, targetMcap });
+      await ctx.reply('Send the USD amount to spend when triggered, e.g. `100`:', { parse_mode: 'Markdown' });
       return;
     }
 
@@ -304,9 +310,9 @@ bot.on('text', async (ctx) => {
       const w = getActiveWallet(uid);
       if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
       pending.delete(uid);
-      createLimitOrder({ uid, walletId: w.id, tokenAddress: state.tokenAddress, side: 'buy', triggerPrice: state.triggerPrice, amount: amt, targetMcap: state.targetMcap });
+      createLimitOrder({ uid, walletId: w.id, chain: state.chain, tokenAddress: state.tokenAddress, side: 'buy', triggerPrice: state.triggerPrice, amount: amt, targetMcap: state.targetMcap });
       await ctx.reply(
-        `✅ Limit buy queued: ${fmtUsd(amt)} when mcap ≤ ${fmtUsd(state.targetMcap)}. I'll DM you when it fills.`,
+        `✅ Limit buy queued on ${getChain(state.chain).name}: ${fmtUsd(amt)} when mcap ≤ ${fmtUsd(state.targetMcap)}. I'll DM you when it fills.`,
         mainMenu()
       );
       return;
@@ -322,19 +328,20 @@ bot.on('text', async (ctx) => {
 
       const w = getActiveWallet(uid);
       if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
-      const pos = getPosition(uid, w.id, state.tokenAddress);
+      const chainKey = getActiveChain(uid);
+      const pos = getPosition(uid, w.id, chainKey, state.tokenAddress);
       if (!pos || pos.tokenAmount <= 0) {
         pending.delete(uid);
         return ctx.reply('No open position on this token to sell.', mainMenu());
       }
 
-      const market = await getTokenMarketData(state.tokenAddress).catch(() => null);
+      const market = await getTokenMarketData(state.tokenAddress, chainKey).catch(() => null);
       const triggerPrice = mcapToPrice(targetMcap, market);
       if (triggerPrice === null) {
         return ctx.reply('Could not fetch live market data for this token right now — try again in a moment.');
       }
 
-      pending.set(uid, { type: 'limitsell_amount', tokenAddress: state.tokenAddress, triggerPrice, targetMcap, maxAmount: pos.tokenAmount });
+      pending.set(uid, { type: 'limitsell_amount', tokenAddress: state.tokenAddress, chain: chainKey, triggerPrice, targetMcap, maxAmount: pos.tokenAmount });
       await ctx.reply(`Send the token amount to sell when triggered (you hold ${pos.tokenAmount.toFixed(4)}):`);
       return;
     }
@@ -346,9 +353,9 @@ bot.on('text', async (ctx) => {
       const w = getActiveWallet(uid);
       if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
       const clamped = Math.min(amt, state.maxAmount);
-      createLimitOrder({ uid, walletId: w.id, tokenAddress: state.tokenAddress, side: 'sell', triggerPrice: state.triggerPrice, amount: clamped, targetMcap: state.targetMcap });
+      createLimitOrder({ uid, walletId: w.id, chain: state.chain, tokenAddress: state.tokenAddress, side: 'sell', triggerPrice: state.triggerPrice, amount: clamped, targetMcap: state.targetMcap });
       await ctx.reply(
-        `✅ Limit sell queued: ${clamped.toFixed(4)} tokens when mcap ≥ ${fmtUsd(state.targetMcap)}. I'll DM you when it fills.`,
+        `✅ Limit sell queued on ${getChain(state.chain).name}: ${clamped.toFixed(4)} tokens when mcap ≥ ${fmtUsd(state.targetMcap)}. I'll DM you when it fills.`,
         mainMenu()
       );
       return;
@@ -370,15 +377,16 @@ bot.on('text', async (ctx) => {
       const pct = parseFloat(text);
       if (isNaN(pct) || pct <= 0 || pct > 100) return ctx.reply('Send a valid percentage (1-100), e.g. `50`');
 
+      const chainKey = getActiveChain(uid);
       const user = getUser(uid);
       const candidates = user.wallets.filter((w) => {
-        const pos = getPosition(uid, w.id, state.tokenAddress);
+        const pos = getPosition(uid, w.id, chainKey, state.tokenAddress);
         return pos && pos.tokenAmount > 0;
       });
 
       if (candidates.length === 0) {
         pending.delete(uid);
-        return ctx.reply('No wallets hold a position in this token.', mainMenu());
+        return ctx.reply('No wallets hold a position in this token on your active chain.', mainMenu());
       }
 
       pending.set(uid, { type: 'batchsell_select', tokenAddress: state.tokenAddress, pct, candidates, selected: [] });
@@ -392,10 +400,7 @@ bot.on('text', async (ctx) => {
         return ctx.reply(`Send a valid whole number between 1 and ${MAX_BATCH_FUND_NEW_WALLETS}.`);
       }
       pending.set(uid, { type: 'batchfund_new_amount', sourceWalletId: state.sourceWalletId, count });
-      await ctx.reply(
-        `Send the USD amount to fund EACH of the ${count} new wallet(s) with, e.g. \`50\`:`,
-        { parse_mode: 'Markdown' }
-      );
+      await ctx.reply(`Send the USD amount to fund EACH of the ${count} new wallet(s) with, e.g. \`50\`:`, { parse_mode: 'Markdown' });
       return;
     }
 
@@ -409,14 +414,15 @@ bot.on('text', async (ctx) => {
 
       const source = getWallet(uid, state.sourceWalletId);
       if (!source) { pending.delete(uid); return ctx.reply('Source wallet not found.', walletsMenu(uid)); }
+      const chainKey = getActiveChain(uid);
 
-      const sourceUsdcBalance = await getUsdcBalance(source.address).then((b) => Number(ethers.formatUnits(b, USDC_DECIMALS))).catch(() => 0);
-      const gasReserve = await estimateTransferGasReserve(source, state.count);
+      const sourceUsdcBalance = await getChainUsdcBalance(source, chainKey).catch(() => 0);
+      const gasReserve = await estimateTransferGasReserve(chainKey, source, state.count);
       const totalNeeded = amt * state.count + gasReserve;
       if (totalNeeded > sourceUsdcBalance) {
         pending.delete(uid);
         return ctx.reply(
-          `❌ Need ~${fmtUsd(totalNeeded)} total (${fmtUsd(amt * state.count)} + ~${fmtUsd(gasReserve)} possible gas top-up) but *${source.name}* only has ${fmtUsd(sourceUsdcBalance)}.`,
+          `❌ Need ~${fmtUsd(totalNeeded)} total (${fmtUsd(amt * state.count)} + ~${fmtUsd(gasReserve)} possible gas top-up) but *${source.name}* only has ${fmtUsd(sourceUsdcBalance)} on ${getChain(chainKey).name}.`,
           { parse_mode: 'Markdown', ...mainMenu() }
         );
       }
@@ -426,7 +432,7 @@ bot.on('text', async (ctx) => {
       fundsInFlight.add(uid);
       pending.delete(uid);
 
-      await ctx.reply(`Creating ${state.count} new wallet(s) and funding each with ${fmtUsd(amt)}... this may take a moment.`);
+      await ctx.reply(`Creating ${state.count} new wallet(s) and funding each with ${fmtUsd(amt)} on ${getChain(chainKey).name}... this may take a moment.`);
 
       try {
         const newWallets = [];
@@ -437,14 +443,11 @@ bot.on('text', async (ctx) => {
           newWallets.push(w);
         }
 
-        const results = await distributeUsdc(uid, source, newWallets, amt);
+        const results = await distributeUsdc(uid, chainKey, source, newWallets, amt);
         const lines = results.map((r) =>
           r.ok ? `✅ ${r.walletName}: funded (tx \`${r.txHash.slice(0, 12)}...\`)` : `❌ ${r.walletName}: ${r.error}`
         );
-        await ctx.reply(`📤 *Batch Fund Results* — ${fmtUsd(amt)} each\n\n${lines.join('\n')}`, {
-          parse_mode: 'Markdown',
-          ...mainMenu(),
-        });
+        await ctx.reply(`📤 *Batch Fund Results* — ${fmtUsd(amt)} each\n\n${lines.join('\n')}`, { parse_mode: 'Markdown', ...mainMenu() });
       } catch (err) {
         console.error(err);
         await ctx.reply(`❌ Batch fund failed: ${friendlyErrorMessage(err)}`, mainMenu());
@@ -465,14 +468,15 @@ bot.on('text', async (ctx) => {
 
       const source = getWallet(uid, state.sourceWalletId);
       if (!source) { pending.delete(uid); return ctx.reply('Source wallet not found.', walletsMenu(uid)); }
+      const chainKey = getActiveChain(uid);
 
-      const sourceUsdcBalance = await getUsdcBalance(source.address).then((b) => Number(ethers.formatUnits(b, USDC_DECIMALS))).catch(() => 0);
-      const gasReserve = await estimateTransferGasReserve(source, state.targets.length);
+      const sourceUsdcBalance = await getChainUsdcBalance(source, chainKey).catch(() => 0);
+      const gasReserve = await estimateTransferGasReserve(chainKey, source, state.targets.length);
       const totalNeeded = amt * state.targets.length + gasReserve;
       if (totalNeeded > sourceUsdcBalance) {
         pending.delete(uid);
         return ctx.reply(
-          `❌ Need ~${fmtUsd(totalNeeded)} total (${fmtUsd(amt * state.targets.length)} + ~${fmtUsd(gasReserve)} possible gas top-up) but *${source.name}* only has ${fmtUsd(sourceUsdcBalance)}.`,
+          `❌ Need ~${fmtUsd(totalNeeded)} total (${fmtUsd(amt * state.targets.length)} + ~${fmtUsd(gasReserve)} possible gas top-up) but *${source.name}* only has ${fmtUsd(sourceUsdcBalance)} on ${getChain(chainKey).name}.`,
           { parse_mode: 'Markdown', ...mainMenu() }
         );
       }
@@ -482,17 +486,14 @@ bot.on('text', async (ctx) => {
       fundsInFlight.add(uid);
       pending.delete(uid);
 
-      await ctx.reply(`Funding ${state.targets.length} wallet(s) with ${fmtUsd(amt)} each from *${source.name}*... this may take a moment.`, { parse_mode: 'Markdown' });
+      await ctx.reply(`Funding ${state.targets.length} wallet(s) with ${fmtUsd(amt)} each from *${source.name}* on ${getChain(chainKey).name}... this may take a moment.`, { parse_mode: 'Markdown' });
 
       try {
-        const results = await distributeUsdc(uid, source, state.targets, amt);
+        const results = await distributeUsdc(uid, chainKey, source, state.targets, amt);
         const lines = results.map((r) =>
           r.ok ? `✅ ${r.walletName}: funded (tx \`${r.txHash.slice(0, 12)}...\`)` : `❌ ${r.walletName}: ${r.error}`
         );
-        await ctx.reply(`📤 *Batch Fund Results* — ${fmtUsd(amt)} each\n\n${lines.join('\n')}`, {
-          parse_mode: 'Markdown',
-          ...mainMenu(),
-        });
+        await ctx.reply(`📤 *Batch Fund Results* — ${fmtUsd(amt)} each\n\n${lines.join('\n')}`, { parse_mode: 'Markdown', ...mainMenu() });
       } catch (err) {
         console.error(err);
         await ctx.reply(`❌ Batch fund failed: ${friendlyErrorMessage(err)}`, mainMenu());
@@ -500,62 +501,6 @@ bot.on('text', async (ctx) => {
       } finally {
         fundsInFlight.delete(uid);
       }
-      return;
-    }
-
-    if (state.type === 'bridge_amount') {
-      // Bridging stays ETH-denominated — unaffected by the USDC trading migration.
-      let amt, usdInput;
-      try {
-        ({ amountEth: amt, usdInput } = await parseBridgeAmountInput(text));
-      } catch (err) {
-        return ctx.reply(err.message, { parse_mode: 'Markdown' });
-      }
-
-      amt = Number(amt.toFixed(6));
-
-      if (amt < MIN_BRIDGE_ETH) {
-        pending.delete(uid);
-        return ctx.reply(`❌ ${fmtAmountLabel(amt, usdInput)} is below the minimum bridgeable amount (${MIN_BRIDGE_ETH} ETH). Bridges below that typically have no valid route since fees exceed the amount.`, mainMenu());
-      }
-
-      const { maxBridgeEth } = getSettings(uid);
-      if (amt > maxBridgeEth) {
-        pending.delete(uid);
-        return ctx.reply(`❌ ${fmtAmountLabel(amt, usdInput)} exceeds your max bridge size. Adjust it in Settings if this was intentional.`, mainMenu());
-      }
-
-      pending.delete(uid);
-
-      let quote;
-      try {
-        const w = getActiveWallet(uid);
-        if (!w) return ctx.reply('No active wallet. Add one first.', walletsMenu(uid));
-        quote = await getBridgeQuote({ direction: state.direction, amountEth: amt, fromAddress: w.address });
-      } catch (err) {
-        return ctx.reply(`❌ Couldn't get a bridge quote: ${friendlyErrorMessage(err)}`, mainMenu());
-      }
-
-      const sendLine = `Send: ${fmtAmountLabel(amt, usdInput)}`;
-
-      const { fromChain } = chainIdsForDirection(state.direction);
-      const sourceProviderForEstimate = fromChain === ETH_CHAIN_ID ? ethMainnetProvider : provider;
-      const gasEth = await estimateBridgeGasEth(sourceProviderForEstimate, quote, gasMultiplierFor(uid)).catch(() => null);
-      const ethUsdForGas = await getEthUsdPrice().catch(() => null);
-      const gasLine = gasEth !== null
-        ? `\nEst. gas: ~${gasEth.toFixed(5)} ETH${ethUsdForGas !== null ? ` (${fmtUsd(gasEth * ethUsdForGas)})` : ''}`
-        : '';
-
-      await ctx.reply(
-        `🌉 *${directionLabel(state.direction)}*\n\n` +
-        `${sendLine}\n` +
-        `Receive (est.): ${Number(quote.toAmountFormatted).toFixed(4)} ETH\n` +
-        `Fees (est.): ${fmtUsd(quote.feesUsd)}${gasLine}\n` +
-        `Via: ${quote.tool || 'best available route'}\n` +
-        `ETA: ~${quote.estimatedDurationSeconds ? Math.ceil(quote.estimatedDurationSeconds / 60) + ' min' : 'a few minutes'}\n\n` +
-        `Confirm?`,
-        { parse_mode: 'Markdown', ...bridgeConfirmMenu(state.direction === BRIDGE_DIRECTION.ETH_TO_ROBINHOOD ? 'eth_to_robinhood' : 'robinhood_to_eth', amt) }
-      );
       return;
     }
   } catch (err) {

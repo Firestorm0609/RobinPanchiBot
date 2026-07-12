@@ -1,19 +1,22 @@
-import { ethers } from 'ethers';
 import { Markup } from 'telegraf';
 import { bot } from '../bot-instance.js';
-import { pending, fundsInFlight, gasMultiplierFor } from '../state.js';
-import { getUser, getWallet, getSettings } from '../storage.js';
+import { pending, fundsInFlight } from '../state.js';
+import { getUser, getWallet, getSettings, getActiveChain } from '../storage.js';
 import {
   walletsMenu, mainMenu, batchSelectMenu, batchSellSelectMenu, batchFundSelectMenu, collectSelectMenu,
 } from '../menus.js';
-import { performBuyCore, performSellCore, performCollectCore } from '../trade-core.js';
-import { friendlyErrorMessage } from '../format.js';
+import { performBuyCore, performSellCore, performCollectCore, distributeUsdc, estimateTransferGasReserve } from '../trade-core.js';
+import { friendlyErrorMessage, getChainUsdcBalance } from '../format.js';
 import { fmtUsd } from '../price.js';
 import { isRateLimited } from '../ratelimit.js';
 import { sendAdminAlert } from '../alerts.js';
-import { getUsdcBalance } from '../erc20.js';
-import { USDC_DECIMALS, MAX_BATCH_FUND_NEW_WALLETS } from '../config.js';
+import { MAX_BATCH_FUND_NEW_WALLETS } from '../config.js';
 import { shortAddr } from '../wallet.js';
+import { getChain, isSolanaChain } from '../chains.js';
+
+function walletAddrForChain(w, chainKey) {
+  return isSolanaChain(chainKey) ? w.solAddress : w.address;
+}
 
 // ---------- Batch Buy ----------
 
@@ -23,10 +26,7 @@ bot.action(/^batchbuy_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
   const user = getUser(uid);
   if (user.wallets.length < 2) return ctx.reply('You need at least 2 wallets to use Batch Buy.', mainMenu());
   pending.set(uid, { type: 'batch_amount', tokenAddress: ctx.match[1] });
-  await ctx.editMessageText(
-    'Send the USD amount to buy on EACH selected wallet, e.g. `50`:',
-    { parse_mode: 'Markdown' }
-  );
+  await ctx.editMessageText('Send the USD amount to buy on EACH selected wallet, e.g. `50`:', { parse_mode: 'Markdown' });
 });
 
 bot.action(/^batchtoggle_(.+)$/, async (ctx) => {
@@ -55,14 +55,15 @@ bot.action('batchconfirm', async (ctx) => {
     return ctx.reply(`❌ ${fmtUsd(state.usdcAmount)} exceeds your max buy size.`, mainMenu());
   }
 
+  const chainKey = getActiveChain(uid);
   pending.delete(uid);
-  await ctx.editMessageText(`Buying ${fmtUsd(state.usdcAmount)} on ${state.selected.length} wallet(s)... this may take a moment.`);
+  await ctx.editMessageText(`Buying ${fmtUsd(state.usdcAmount)} on ${state.selected.length} wallet(s) on ${getChain(chainKey).name}... this may take a moment.`);
 
   const results = [];
   for (const walletId of state.selected) {
     const w = getWallet(uid, walletId);
     if (!w) { results.push({ ok: false, walletName: walletId, error: 'Wallet not found.' }); continue; }
-    const result = await performBuyCore(uid, w, state.tokenAddress, state.usdcAmount);
+    const result = await performBuyCore(uid, w, chainKey, state.tokenAddress, state.usdcAmount);
     results.push(result);
   }
 
@@ -95,10 +96,7 @@ bot.action(/^bselltoggle_(.+)$/, async (ctx) => {
   const idx = state.selected.indexOf(walletId);
   if (idx >= 0) state.selected.splice(idx, 1); else state.selected.push(walletId);
   pending.set(uid, state);
-  await ctx.editMessageText(
-    'Select wallets to sell on:',
-    batchSellSelectMenu(state.candidates, state.selected)
-  ).catch(() => {});
+  await ctx.editMessageText('Select wallets to sell on:', batchSellSelectMenu(state.candidates, state.selected)).catch(() => {});
 });
 
 bot.action('batchsellconfirm', async (ctx) => {
@@ -109,6 +107,7 @@ bot.action('batchsellconfirm', async (ctx) => {
   if (state.selected.length === 0) return ctx.reply('No wallets selected — tap wallets to select, then Confirm.');
   if (isRateLimited(uid)) return ctx.reply('⏳ Slow down a bit — too many actions in the last minute.');
 
+  const chainKey = getActiveChain(uid);
   pending.delete(uid);
   await ctx.editMessageText(`Selling ${state.pct}% on ${state.selected.length} wallet(s)... this may take a moment.`);
 
@@ -116,7 +115,7 @@ bot.action('batchsellconfirm', async (ctx) => {
   for (const walletId of state.selected) {
     const w = getWallet(uid, walletId);
     if (!w) { results.push({ ok: false, walletName: walletId, error: 'Wallet not found.' }); continue; }
-    const result = await performSellCore(uid, w, state.tokenAddress, state.pct);
+    const result = await performSellCore(uid, w, chainKey, state.tokenAddress, state.pct);
     results.push(result);
   }
 
@@ -130,13 +129,13 @@ bot.action('batchsellconfirm', async (ctx) => {
 });
 
 // ---------- Batch Fund ----------
-// Source wallet is picked by highest USDC balance (the trading currency),
-// not native ETH — gas top-ups happen automatically per-transfer.
+// All amounts are USDC on the user's currently active chain.
 
 bot.action('batchfund_start', async (ctx) => {
   await ctx.answerCbQuery();
   const uid = ctx.from.id;
   const user = getUser(uid);
+  const chainKey = getActiveChain(uid);
 
   if (user.wallets.length === 0) {
     return ctx.editMessageText('No wallets yet. Create one first.', walletsMenu(uid));
@@ -146,26 +145,27 @@ bot.action('batchfund_start', async (ctx) => {
     pending.set(uid, { type: 'batchfund_create_count', sourceWalletId: user.wallets[0].id });
     await ctx.editMessageText(
       `You only have one wallet (*${user.wallets[0].name}*).\n\n` +
-      `How many new wallets would you like to create and fund from it? (max ${MAX_BATCH_FUND_NEW_WALLETS})`,
+      `How many new wallets would you like to create and fund from it (on ${getChain(chainKey).name})? (max ${MAX_BATCH_FUND_NEW_WALLETS})`,
       { parse_mode: 'Markdown' }
     );
     return;
   }
 
-  await ctx.editMessageText('📤 *Batch Fund*\n\nChecking wallet balances...', { parse_mode: 'Markdown' });
+  await ctx.editMessageText(`📤 *Batch Fund* _(${getChain(chainKey).name})_\n\nChecking wallet balances...`, { parse_mode: 'Markdown' });
 
   const balances = await Promise.all(
-    user.wallets.map(async (w) => ({
-      ...w,
-      balance: await getUsdcBalance(w.address).then((b) => Number(ethers.formatUnits(b, USDC_DECIMALS))).catch(() => 0),
-    }))
+    user.wallets.map(async (w) => {
+      const wallet = getWallet(uid, w.id);
+      const balance = await getChainUsdcBalance(wallet, chainKey).catch(() => 0);
+      return { ...w, balance };
+    })
   );
   const source = balances.reduce((a, b) => (b.balance > a.balance ? b : a));
 
   if (source.balance <= 0) {
     pending.delete(uid);
     return ctx.editMessageText(
-      '📤 *Batch Fund*\n\nNone of your wallets have a USDC balance to fund others with. Add funds to a wallet first.',
+      `📤 *Batch Fund*\n\nNone of your wallets have a USDC balance on ${getChain(chainKey).name} to fund others with. Add funds first.`,
       { parse_mode: 'Markdown', ...walletsMenu(uid) }
     );
   }
@@ -175,7 +175,7 @@ bot.action('batchfund_start', async (ctx) => {
   pending.set(uid, { type: 'batchfund_select', sourceWalletId: source.id, candidates, selected: [] });
 
   await ctx.editMessageText(
-    `📤 *Batch Fund*\n\n` +
+    `📤 *Batch Fund* _(${getChain(chainKey).name})_\n\n` +
     `Source wallet: *${source.name}* — ${fmtUsd(source.balance)}\n\n` +
     `Select which wallets to fund (the amount you choose next will be sent to EACH one):`,
     { parse_mode: 'Markdown', ...batchFundSelectMenu(candidates, []) }
@@ -191,10 +191,7 @@ bot.action(/^bfundtoggle_(.+)$/, async (ctx) => {
   const idx = state.selected.indexOf(walletId);
   if (idx >= 0) state.selected.splice(idx, 1); else state.selected.push(walletId);
   pending.set(uid, state);
-  await ctx.editMessageText(
-    'Select which wallets to fund:',
-    batchFundSelectMenu(state.candidates, state.selected)
-  ).catch(() => {});
+  await ctx.editMessageText('Select which wallets to fund:', batchFundSelectMenu(state.candidates, state.selected)).catch(() => {});
 });
 
 bot.action('bfundconfirm', async (ctx) => {
@@ -209,10 +206,7 @@ bot.action('bfundconfirm', async (ctx) => {
     sourceWalletId: state.sourceWalletId,
     targets: state.candidates.filter((w) => state.selected.includes(w.id)),
   });
-  await ctx.editMessageText(
-    'Send the USD amount to send to EACH selected wallet, e.g. `50`:',
-    { parse_mode: 'Markdown' }
-  );
+  await ctx.editMessageText('Send the USD amount to send to EACH selected wallet, e.g. `50`:', { parse_mode: 'Markdown' });
 });
 
 // ---------- Batch Collect ----------
@@ -227,7 +221,7 @@ bot.action('collect_start', async (ctx) => {
   const rows = user.wallets.map((w) => [Markup.button.callback(`${w.name} (${shortAddr(w.address)})`, `collectdest_${w.id}`)]);
   rows.push([Markup.button.callback('❌ Cancel', 'menu_wallets')]);
   await ctx.editMessageText(
-    '📥 *Batch Collect*\n\nChoose the destination wallet — USDC and all tokens from your other wallets will be swept here:',
+    '📥 *Batch Collect*\n\nChoose the destination wallet — USDC and all tokens from your other wallets, on your active chain, will be swept here:',
     { parse_mode: 'Markdown', ...Markup.inlineKeyboard(rows) }
   );
 });
@@ -241,7 +235,7 @@ bot.action(/^collectdest_(.+)$/, async (ctx) => {
   const user = getUser(uid);
   const candidates = user.wallets.filter((w) => w.id !== dest.id);
   const allIds = candidates.map((w) => w.id);
-  pending.set(uid, { type: 'collect_select_sources', destWalletId: dest.id, destName: dest.name, destAddress: dest.address, candidates, selected: allIds });
+  pending.set(uid, { type: 'collect_select_sources', destWalletId: dest.id, destName: dest.name, candidates, selected: allIds });
 
   await ctx.editMessageText(
     `📥 *Batch Collect* → *${dest.name}*\n\nSelect source wallets to sweep from (all selected by default):`,
@@ -276,18 +270,19 @@ bot.action('collectconfirm', async (ctx) => {
   const dest = getWallet(uid, state.destWalletId);
   if (!dest) { pending.delete(uid); return ctx.reply('Destination wallet not found.', walletsMenu(uid)); }
   const sources = state.candidates.filter((w) => state.selected.includes(w.id));
+  const chainKey = getActiveChain(uid);
+  const destAddress = walletAddrForChain(dest, chainKey);
 
   fundsInFlight.add(uid);
   pending.delete(uid);
-  await ctx.editMessageText(`Sweeping USDC + tokens from ${sources.length} wallet(s) into *${dest.name}*... this may take a moment.`, { parse_mode: 'Markdown' });
+  await ctx.editMessageText(`Sweeping USDC + tokens from ${sources.length} wallet(s) on ${getChain(chainKey).name} into *${dest.name}*... this may take a moment.`, { parse_mode: 'Markdown' });
 
   try {
-    const gasMultiplier = gasMultiplierFor(uid);
     const lines = [];
     for (const src of sources) {
       const wallet = getWallet(uid, src.id);
       if (!wallet) { lines.push(`*${src.name}*: ❌ wallet not found`); continue; }
-      const results = await performCollectCore(uid, wallet, dest.address, gasMultiplier);
+      const results = await performCollectCore(uid, chainKey, wallet, destAddress);
       lines.push(`*${wallet.name}*:`);
       if (results.length === 0) {
         lines.push('  nothing to collect');
@@ -306,3 +301,5 @@ bot.action('collectconfirm', async (ctx) => {
     fundsInFlight.delete(uid);
   }
 });
+
+export { walletAddrForChain };

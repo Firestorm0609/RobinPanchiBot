@@ -5,12 +5,13 @@ import { scheduleCardAutoRefresh } from '../autorefresh.js';
 import {
   walletsMenu, mainMenu, renderTokenCard, limitOrdersText, limitOrdersMenu, confirmMenu,
 } from '../menus.js';
-import { getOpenLimitOrdersForUser, cancelLimitOrder, getSettings, getActiveWallet } from '../storage.js';
+import { getOpenLimitOrdersForUser, cancelLimitOrder, getSettings, getActiveWallet, getActiveChain } from '../storage.js';
 import { getTokenMarketData, fmtUsd } from '../price.js';
 import { shortAddr } from '../wallet.js';
-import { dualEthBalanceLines, gasEstimateLine } from '../format.js';
+import { chainBalanceLines, gasEstimateLine } from '../format.js';
 import { executeBuy, executeSell } from '../trade-core.js';
 import { isRateLimited } from '../ratelimit.js';
+import { getChain } from '../chains.js';
 import { FALLBACK_GAS_LIMIT_BUY, FALLBACK_GAS_LIMIT_SELL } from '../config.js';
 
 // ---------- Custom buy/sell prompts ----------
@@ -18,10 +19,7 @@ import { FALLBACK_GAS_LIMIT_BUY, FALLBACK_GAS_LIMIT_SELL } from '../config.js';
 bot.action(/^custombuy_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
   await ctx.answerCbQuery();
   pending.set(ctx.from.id, { type: 'custom_buy', tokenAddress: ctx.match[1] });
-  await ctx.editMessageText(
-    'Send the USD amount to spend, e.g. `100`:',
-    { parse_mode: 'Markdown' }
-  );
+  await ctx.editMessageText('Send the USD amount to spend, e.g. `100`:', { parse_mode: 'Markdown' });
 });
 
 bot.action(/^customsell_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
@@ -74,18 +72,17 @@ bot.action('menu_limitorders', async (ctx) => {
   const uid = ctx.from.id;
   const orders = getOpenLimitOrdersForUser(uid);
 
-  const marketByToken = new Map();
+  const marketByKey = new Map();
   for (const o of orders) {
-    if (!marketByToken.has(o.token_address)) {
-      const market = await getTokenMarketData(o.token_address).catch(() => null);
-      marketByToken.set(o.token_address, market);
-      o._symbol = market?.symbol ?? shortAddr(o.token_address);
-    } else {
-      o._symbol = marketByToken.get(o.token_address)?.symbol ?? shortAddr(o.token_address);
+    const key = `${o.chain}:${o.token_address}`;
+    if (!marketByKey.has(key)) {
+      const market = await getTokenMarketData(o.token_address, o.chain).catch(() => null);
+      marketByKey.set(key, market);
     }
+    o._symbol = marketByKey.get(key)?.symbol ?? shortAddr(o.token_address);
   }
 
-  await ctx.editMessageText(limitOrdersText(orders, marketByToken), {
+  await ctx.editMessageText(limitOrdersText(orders, marketByKey), {
     parse_mode: 'Markdown',
     ...limitOrdersMenu(orders),
   });
@@ -97,16 +94,17 @@ bot.action(/^limitordercancel_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery(cancelled ? 'Order cancelled' : 'Could not cancel (already filled/cancelled?)');
 
   const orders = getOpenLimitOrdersForUser(uid);
-  const marketByToken = new Map();
+  const marketByKey = new Map();
   for (const o of orders) {
-    if (!marketByToken.has(o.token_address)) {
-      const market = await getTokenMarketData(o.token_address).catch(() => null);
-      marketByToken.set(o.token_address, market);
+    const key = `${o.chain}:${o.token_address}`;
+    if (!marketByKey.has(key)) {
+      const market = await getTokenMarketData(o.token_address, o.chain).catch(() => null);
+      marketByKey.set(key, market);
     }
-    o._symbol = marketByToken.get(o.token_address)?.symbol ?? shortAddr(o.token_address);
+    o._symbol = marketByKey.get(key)?.symbol ?? shortAddr(o.token_address);
   }
 
-  await ctx.editMessageText(limitOrdersText(orders, marketByToken), {
+  await ctx.editMessageText(limitOrdersText(orders, marketByKey), {
     parse_mode: 'Markdown',
     ...limitOrdersMenu(orders),
   }).catch(() => {});
@@ -117,13 +115,16 @@ bot.action(/^limitordercancel_(.+)$/, async (ctx) => {
 bot.action('menu_balance', async (ctx) => {
   await ctx.answerCbQuery();
   stopAllViewRefreshes(ctx.from.id);
-  const w = getActiveWallet(ctx.from.id);
-  if (!w) return ctx.editMessageText('No active wallet. Add one first.', walletsMenu(ctx.from.id));
-  const bal = await dualEthBalanceLines(w.address);
-  await ctx.editMessageText(`💰 *${w.name}*\n\`${w.address}\`\n\nBalance:\n${bal}`, {
-    parse_mode: 'Markdown',
-    ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_main')]]),
-  });
+  const uid = ctx.from.id;
+  const w = getActiveWallet(uid);
+  if (!w) return ctx.editMessageText('No active wallet. Add one first.', walletsMenu(uid));
+  const chainKey = getActiveChain(uid);
+  const chain = getChain(chainKey);
+  const bal = await chainBalanceLines(w, chainKey);
+  await ctx.editMessageText(
+    `💰 *${w.name}* _(${chain.name})_\n\`${chainKey === 'solana' ? w.solAddress : w.address}\`\n\nBalance:\n${bal}`,
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_main')]]) }
+  );
 });
 
 // ---------- Token card: refresh ----------
@@ -141,8 +142,6 @@ bot.action(/^refresh_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
 });
 
 // ---------- Buy ----------
-// Amount is USDC (trades are USDC-denominated) — plain USD number, no
-// price-feed conversion needed.
 
 bot.action(/^buy_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
   await ctx.answerCbQuery();
@@ -155,8 +154,9 @@ bot.action(/^buy_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
     return ctx.editMessageText(`❌ ${fmtUsd(usdcAmount)} exceeds your max buy size.`, mainMenu());
   }
   if (confirmTrades) {
-    const gasLine = await gasEstimateLine(uid, FALLBACK_GAS_LIMIT_BUY);
-    await ctx.editMessageText(`Confirm: buy *${fmtUsd(usdcAmount)}* worth of this token?${gasLine}`, {
+    const chainKey = getActiveChain(uid);
+    const gasLine = await gasEstimateLine(chainKey, uid, FALLBACK_GAS_LIMIT_BUY);
+    await ctx.editMessageText(`Confirm: buy *${fmtUsd(usdcAmount)}* worth of this token on ${getChain(chainKey).name}?${gasLine}`, {
       parse_mode: 'Markdown',
       ...confirmMenu('buy', tokenAddress, usdcAmountStr),
     });
@@ -166,11 +166,6 @@ bot.action(/^buy_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
 });
 
 // ---------- Sell ----------
-// NOTE: percentage capture group is [\d.]+ (not \d+) so that decimal sell
-// percentages — which both `custom_sell` and `settings_sell` freely accept
-// via parseFloat — actually match here. With plain \d+, a preset or custom
-// value like "33.5" produced a callback_data with no matching handler, so
-// tapping the button silently did nothing.
 
 bot.action(/^sell_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
   await ctx.answerCbQuery();
@@ -179,7 +174,8 @@ bot.action(/^sell_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
   const uid = ctx.from.id;
   const { confirmTrades } = getSettings(uid);
   if (confirmTrades) {
-    const gasLine = await gasEstimateLine(uid, FALLBACK_GAS_LIMIT_SELL);
+    const chainKey = getActiveChain(uid);
+    const gasLine = await gasEstimateLine(chainKey, uid, FALLBACK_GAS_LIMIT_SELL);
     await ctx.editMessageText(`Confirm: sell *${pctStr}%* of your position?${gasLine}`, {
       parse_mode: 'Markdown',
       ...confirmMenu('sell', tokenAddress, pctStr),
