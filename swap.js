@@ -1,16 +1,21 @@
 import axios from 'axios';
 import { ethers } from 'ethers';
+import { getChain } from './chains.js';
 
 const ZEROX_BASE_URL = 'https://api.0x.org/swap/permit2/quote';
-
-/**
- * Fetch a firm swap quote from 0x, including your affiliate fee.
- */
 const NATIVE_ETH = '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE';
 
-export async function getQuote({ sellToken, buyToken, sellAmount, taker, slippageBps = 100 }) {
+/**
+ * Fetch a firm swap quote from 0x on a specific EVM chain. `chainKey` is one
+ * of the keys in chains.js (e.g. 'base', 'arbitrum', 'robinhood') — 0x
+ * itself is already multi-chain, this just stops the bot from being
+ * hardcoded to a single one.
+ */
+export async function getQuote({ chainKey, sellToken, buyToken, sellAmount, taker, slippageBps = 100 }) {
+  const chain = getChain(chainKey);
+
   const params = {
-    chainId: process.env.CHAIN_ID,
+    chainId: chain.chainId,
     sellToken: sellToken === 'ETH' ? NATIVE_ETH : ethers.getAddress(sellToken),
     buyToken: buyToken === 'ETH' ? NATIVE_ETH : ethers.getAddress(buyToken),
     sellAmount,
@@ -28,21 +33,18 @@ export async function getQuote({ sellToken, buyToken, sellAmount, taker, slippag
       '0x-version': 'v2',
     },
   }).catch((err) => {
-    console.error('0x quote error:', JSON.stringify(err.response?.data ?? err.message, null, 2));
+    console.error(`0x quote error (${chain.name}):`, JSON.stringify(err.response?.data ?? err.message, null, 2));
     throw err;
   });
 
   const data = res.data;
   return {
     ...data,
+    chainKey,
     buyAmountFormatted: ethers.formatUnits(data.buyAmount, data.buyToken?.decimals ?? 18),
   };
 }
 
-/**
- * Builds the swap tx request (does NOT send it) from the 0x quote.
- * Handles Permit2 signature if required by the quote.
- */
 export async function buildSwapTx(signer, quote) {
   const tx = {
     to: quote.transaction.to,
@@ -51,13 +53,11 @@ export async function buildSwapTx(signer, quote) {
     gasLimit: quote.transaction.gas ? BigInt(quote.transaction.gas) : undefined,
   };
 
-  // If quote requires Permit2 signature, sign and append it (see 0x docs for exact EIP-712 payload).
   if (quote.permit2?.eip712) {
     const { domain, types, message } = quote.permit2.eip712;
     const cleanTypes = { ...types };
-    delete cleanTypes.EIP712Domain; // ethers v6 derives this from `domain` itself
+    delete cleanTypes.EIP712Domain;
     const signature = await signer.signTypedData(domain, cleanTypes, message);
-    // Append signature length + signature to calldata per 0x spec
     const sigLengthHex = ethers.zeroPadValue(ethers.toBeHex(ethers.dataLength(signature)), 32);
     tx.data = ethers.concat([tx.data, sigLengthHex, signature]);
   }
@@ -65,13 +65,6 @@ export async function buildSwapTx(signer, quote) {
   return tx;
 }
 
-/**
- * Estimates the ETH cost of a built tx BEFORE it's sent, for display on a
- * confirm screen. Uses the tx's own gasLimit (from the 0x quote) times the
- * network's current fee estimate, scaled by the same gasMultiplier that
- * will actually be applied at send time — so the number shown matches what
- * the user will pay (modulo any gas bumps if the network is congested).
- */
 export async function estimateSwapGasEth(provider, txRequest, gasMultiplier = 1) {
   const feeData = await provider.getFeeData();
   const baseFee = feeData.maxFeePerGas ?? ethers.parseUnits('30', 'gwei');
@@ -81,19 +74,6 @@ export async function estimateSwapGasEth(provider, txRequest, gasMultiplier = 1)
   return Number(ethers.formatEther(costWei));
 }
 
-/**
- * Sends a built tx and waits for confirmation. If the tx isn't mined within
- * `timeoutMs`, resubmits the SAME nonce with fees bumped by `bumpPct`,
- * repeating until it lands or `maxAttempts` is hit. This is what keeps a
- * trade from getting silently stuck forever when the network is congested.
- *
- * `gasMultiplier` scales the INITIAL fee estimate before any congestion
- * bumps are applied — this is how the user's configured gas priority tier
- * (slow/normal/fast, see GAS_TIER_MULTIPLIERS in bot.js) takes effect.
- *
- * Returns { txResponse, receipt, bumped } for the transaction that actually
- * confirmed (the last resubmission, if any bumps happened).
- */
 export async function sendSwapWithGasBump(signer, txRequest, { timeoutMs = 45_000, bumpPct = 20, maxAttempts = 4, gasMultiplier = 1 } = {}) {
   const nonce = await signer.getNonce();
   const feeData = await signer.provider.getFeeData();
@@ -116,5 +96,5 @@ export async function sendSwapWithGasBump(signer, txRequest, { timeoutMs = 45_00
       maxPriorityFeePerGas = (maxPriorityFeePerGas * BigInt(100 + bumpPct)) / 100n;
     }
   }
-  throw new Error('sendSwapWithGasBump: exhausted attempts'); // unreachable
+  throw new Error('sendSwapWithGasBump: exhausted attempts');
 }

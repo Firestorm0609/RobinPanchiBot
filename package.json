@@ -1,6 +1,6 @@
 {
   "name": "panchi-trading-bot",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
   "main": "bot.js",
   "scripts": {
@@ -16,6 +16,9 @@
     "axios": "^1.7.2",
     "dotenv": "^16.4.5",
     "better-sqlite3": "^11.3.0",
-    "sharp": "^0.33.5"
+    "sharp": "^0.33.5",
+    "@solana/web3.js": "^1.95.3",
+    "@solana/spl-token": "^0.4.9",
+    "bs58": "^6.0.0"
   }
 }

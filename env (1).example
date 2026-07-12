@@ -1,0 +1,33 @@
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+ZEROX_API_KEY=your_0x_api_key
+AFFILIATE_ADDRESS=0xYourFeeCollectorAddress
+AFFILIATE_FEE_BPS=50
+
+# 32-byte hex key used to encrypt wallet private keys (both EVM and Solana) at rest.
+# Generate with: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+MASTER_KEY=your_64_char_hex_master_key
+
+# Your own Telegram user/chat ID — receives admin alerts and unlocks /admin_stats.
+ADMIN_CHAT_ID=your_telegram_chat_id
+
+# ---------------------------------------------------------------------------
+# Per-chain RPC endpoints. Each is optional — chains fall back to a public
+# endpoint if unset, but public endpoints are unreliable at real volume, so
+# set a dedicated RPC (Alchemy/Infura/Helius/etc.) for every chain you expect
+# meaningful trading volume on.
+# ---------------------------------------------------------------------------
+ETH_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/your_alchemy_key
+BASE_RPC_URL=https://base-mainnet.g.alchemy.com/v2/your_alchemy_key
+ARBITRUM_RPC_URL=https://arb-mainnet.g.alchemy.com/v2/your_alchemy_key
+BSC_RPC_URL=https://bnb-mainnet.g.alchemy.com/v2/your_alchemy_key
+SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=your_helius_key
+
+# Robinhood Chain — kept as its own required config since it's not a
+# widely-recognized public chain with a well-known fallback RPC.
+CHAIN_ID=4663
+RPC_URL=https://robinhood-mainnet.g.alchemy.com/v2/your_alchemy_key
+USDC_ROBINHOOD_ADDRESS=0xYourRobinhoodChainUsdcAddress
+EXPLORER_BASE_URL=https://explorer.robinhood-chain.example
+
+# Passphrase used by backup.sh to GPG-encrypt SQLite backups.
+BACKUP_PASSPHRASE=your_long_random_backup_passphrase
