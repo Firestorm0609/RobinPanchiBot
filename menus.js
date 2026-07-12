@@ -19,9 +19,9 @@ export function mainMenu() {
     [Markup.button.callback('🔍 Trade Token', 'menu_trade')],
     [Markup.button.callback('📊 Positions', 'menu_positions')],
     [Markup.button.callback('💼 Wallets', 'menu_wallets'), Markup.button.callback('💰 Balance', 'menu_balance')],
-    [Markup.button.callback('🔗 Chain', 'menu_chain'), Markup.button.callback('⏰ Limit Orders', 'menu_limitorders')],
-    [Markup.button.callback('🎟 Rewards', 'menu_rewards'), Markup.button.callback('⚙️ Settings', 'menu_settings')],
-    [Markup.button.callback('❓ Help', 'menu_help')],
+    [Markup.button.callback('📥 Deposit', 'menu_deposit'), Markup.button.callback('🔗 Chain', 'menu_chain')],
+    [Markup.button.callback('⏰ Limit Orders', 'menu_limitorders'), Markup.button.callback('🎟 Rewards', 'menu_rewards')],
+    [Markup.button.callback('⚙️ Settings', 'menu_settings'), Markup.button.callback('❓ Help', 'menu_help')],
     [Markup.button.url('🐦 X', 'https://x.com/robinpanchi')],
   ]);
 }
@@ -56,6 +56,27 @@ export function exportConfirmMenu(walletId) {
   return Markup.inlineKeyboard([
     [Markup.button.callback('⚠️ Yes, show my keys', `wallet_export_confirm_${walletId}`)],
     [Markup.button.callback('❌ Cancel', 'menu_wallets')],
+  ]);
+}
+
+// ---------- Deposit ----------
+// "Choose a network to deposit from" picker — shows the active wallet's
+// address on whichever chain the user selects. Read-only convenience view;
+// doesn't create or move anything.
+
+export function depositMenu() {
+  const rows = ALL_CHAIN_KEYS.map((key) => {
+    const chain = getChain(key);
+    return [Markup.button.callback(chain.name, `deposit_chain_${key}`)];
+  });
+  rows.push([Markup.button.callback('⬅️ Back', 'menu_main')]);
+  return Markup.inlineKeyboard(rows);
+}
+
+export function depositChainDetailMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('⬅️ Choose a different network', 'menu_deposit')],
+    [Markup.button.callback('🏠 Main Menu', 'menu_main')],
   ]);
 }
 

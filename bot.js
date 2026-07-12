@@ -15,6 +15,7 @@ import './handlers/wallets.js';
 import './handlers/positions.js';
 import './handlers/settings.js';
 import './handlers/token.js';
+import './handlers/deposit.js';
 import './handlers/batch.js';
 import './handlers/rewards.js';
 import './handlers/text.js'; // must be last: registers the catch-all bot.on('text', ...)
