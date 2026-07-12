@@ -35,6 +35,14 @@ export const CA_REGEX = /^0x[a-fA-F0-9]{40}$/;
 // point of actually decoding it, e.g. via PublicKey()).
 export const SOLANA_ADDRESS_REGEX = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
+// Unanchored source fragment matching EITHER an EVM address OR a Solana mint,
+// for building bot.action() callback_data regexes that must work for a token
+// on either chain (buy/sell/custombuy/tpsl/limit/refresh buttons — anything
+// keyed off a pasted token address). CA_REGEX/SOLANA_ADDRESS_REGEX are
+// anchored (^...$) so they can't be spliced into a larger pattern directly —
+// this is the same alternation, without anchors, for that purpose.
+export const TOKEN_ADDR_SRC = '(?:0x[a-fA-F0-9]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})';
+
 export const QUOTE_STALE_MS = 15_000;
 export const AUTO_TRADE_POLL_INTERVAL_MS = 30_000;
 export const LIMIT_ORDER_POLL_INTERVAL_MS = 30_000;

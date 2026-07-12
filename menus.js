@@ -13,6 +13,7 @@ import {
 } from './storage.js';
 import { chainBalanceLines, gasEstimateLine, getUnifiedUsdBalance } from './format.js';
 import { FALLBACK_GAS_LIMIT_BUY } from './config.js';
+import { setPositionsIndex } from './state.js';
 
 export function mainMenu() {
   return Markup.inlineKeyboard([
@@ -56,12 +57,6 @@ export function exportConfirmMenu(walletId) {
 }
 
 // ---------- Deposit ----------
-// "Choose a network to deposit from" picker — shows the active wallet's
-// address on whichever chain the user selects. Read-only convenience view;
-// doesn't create or move anything. This is now the ONLY place chains are
-// surfaced to the user — trading auto-detects the right chain per pasted
-// token (handlers/text.js's resolveChainForCA), so there's no separate
-// manual "Chain" tab anymore.
 
 export function depositMenu() {
   const rows = ALL_CHAIN_KEYS.map((key) => {
@@ -80,11 +75,6 @@ export function depositChainDetailMenu() {
 }
 
 // ---------- Withdraw ----------
-// Mirrors Deposit's "choose a network" picker. The subsequent amount /
-// destination-address prompts are plain text.js pending-state steps (same
-// pattern as custom buy/sell) rather than menu-driven, since free-text
-// input is unavoidable for an amount + an arbitrary address. The final
-// confirm step (with a gas estimate) IS a menu, via withdrawConfirmMenu.
 
 export function withdrawMenu() {
   const rows = ALL_CHAIN_KEYS.map((key) => {
@@ -126,13 +116,6 @@ export function rewardsMenu() {
   ]);
 }
 
-/**
- * Trades are USDC-denominated directly on whichever chain is active — no
- * price-feed conversion needed. Buy/sell/limit/TP-SL callbacks don't encode
- * the chain; every handler resolves it via getActiveChain(uid) at the
- * moment it executes, same pattern as getActiveWallet(uid). Batch Buy/Sell
- * removed — every trade is single-wallet now.
- */
 export function tokenMenu(uid, tokenAddress, hasPosition) {
   const s = getSettings(uid);
   const buyLabel = (amt) => `Buy ${fmtUsd(amt)}`;
@@ -201,9 +184,6 @@ export function limitOrdersMenu(orders) {
 }
 
 // ---------- Token info + PnL rendering ----------
-// Always operates on the user's currently active chain (getActiveChain),
-// which is set automatically per-token by resolveChainForCA — there's no
-// manual chain picker anymore.
 
 export async function renderTokenCard(uid, tokenAddress) {
   const w = getActiveWallet(uid);
@@ -253,10 +233,6 @@ export async function renderTokenCard(uid, tokenAddress) {
   const walletBalance = await chainBalanceLines(w, chainKey).catch(() => 'unavailable');
   const gasLine = await gasEstimateLine(chainKey, uid, FALLBACK_GAS_LIMIT_BUY).catch(() => '');
 
-  // Unified total across every chain — best-effort, single extra line so the
-  // user can see at a glance whether they have funds sitting on a different
-  // chain than the one they're about to trade on. Never blocks the card on
-  // failure — falls back to omitting the line entirely.
   const unifiedLine = await getUnifiedUsdBalance(w)
     .then((u) => `\nUnified balance (all chains): ${fmtUsd(u.totalUsd)}${u.anyUnavailable ? ' _(partial)_' : ''}`)
     .catch(() => '');
@@ -275,11 +251,19 @@ export async function renderTokenCard(uid, tokenAddress) {
 }
 
 // ---------- Positions list rendering ----------
-// Covers every open position across ALL wallets AND ALL chains.
+// Covers every open position across ALL wallets AND ALL chains. Each
+// position is now a tappable button (`pos_<idx>`) that opens the real
+// token card (with buy/sell buttons) for that specific wallet+chain+token —
+// previously the list was read-only text with no way to act on a position
+// from here. The index -> {walletId, chain, tokenAddress} mapping is
+// stashed in state.js's positionsIndex, keyed by uid, since a Solana mint
+// won't reliably fit a chain+wallet+token combo inside Telegram's 64-byte
+// callback_data limit.
 
 export async function renderPositionsView(uid) {
   const positions = getAllPositionsForUser(uid);
   if (positions.length === 0) {
+    setPositionsIndex(uid, []);
     return {
       text: '📊 No positions yet. Trade a token to open one.',
       markup: Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_main')]]),
@@ -287,14 +271,17 @@ export async function renderPositionsView(uid) {
   }
 
   const lines = [];
+  const buttonRows = [];
   let totalValueUsd = 0;
   let totalCostUsd = 0;
   let anyPriceUnavailable = false;
 
-  for (const pos of positions) {
+  for (let i = 0; i < positions.length; i++) {
+    const pos = positions[i];
     const market = await getTokenMarketData(pos.tokenAddress, pos.chain).catch(() => null);
     const symbol = market?.symbol ?? shortAddr(pos.tokenAddress);
     const chainName = getChain(pos.chain).name;
+
     if (market) {
       const valueUsd = pos.tokenAmount * market.priceUsd;
       const costUsd = pos.costUsdc;
@@ -306,11 +293,17 @@ export async function renderPositionsView(uid) {
       let line = `*${symbol}* (${pos.walletName} — ${chainName}): ${fmtTokenAmount(pos.tokenAmount)} — ${fmtUsd(valueUsd)} (${emoji} ${pnlPct.toFixed(1)}%)`;
       if (pos.entryMcap != null) line += `\n  Entry mcap: ${fmtUsd(pos.entryMcap)}`;
       lines.push(line);
+      buttonRows.push([Markup.button.callback(`${emoji} ${symbol} (${chainName})`, `pos_${i}`)]);
     } else {
       anyPriceUnavailable = true;
       lines.push(`*${symbol}* (${pos.walletName} — ${chainName}): ${fmtTokenAmount(pos.tokenAmount)} — price unavailable`);
+      buttonRows.push([Markup.button.callback(`${symbol} (${chainName})`, `pos_${i}`)]);
     }
   }
+
+  setPositionsIndex(uid, positions.map((p) => ({
+    walletId: p.walletId, chain: p.chain, tokenAddress: p.tokenAddress,
+  })));
 
   const totalPnlUsd = totalValueUsd - totalCostUsd;
   const totalPnlPct = totalCostUsd > 0 ? (totalPnlUsd / totalCostUsd) * 100 : 0;
@@ -322,7 +315,13 @@ export async function renderPositionsView(uid) {
     `Total value: ${fmtUsd(totalValueUsd)}\n` +
     `Total cost: ${fmtUsd(totalCostUsd)}\n` +
     `Total PnL: ${totalEmoji} ${fmtUsd(totalPnlUsd)} (${totalPnlPct.toFixed(1)}%)${disclaimer}\n\n` +
-    lines.join('\n');
+    lines.join('\n') +
+    `\n\nTap a position below to open it:`;
 
-  return { text, markup: refreshBackMenu('menu_positions_refresh') };
+  buttonRows.push([
+    Markup.button.callback('🔄 Refresh', 'menu_positions_refresh'),
+    Markup.button.callback('⬅️ Back', 'menu_main'),
+  ]);
+
+  return { text, markup: Markup.inlineKeyboard(buttonRows) };
 }

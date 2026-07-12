@@ -49,3 +49,25 @@ export function stopAllAutoRefreshes() {
   for (const timer of positionsRefreshTimers.values()) clearInterval(timer);
   positionsRefreshTimers.clear();
 }
+
+// ---------- Positions list -> token-card lookup ----------
+// Telegram callback_data is capped at 64 bytes, which a Solana mint (up to
+// 44 chars) plus a wallet id plus a chain key won't reliably fit into. So
+// the Positions view (menus.js's renderPositionsView) doesn't encode the
+// token address in the button at all — it stores the position list here,
+// keyed by uid, and each button just carries its index into that list
+// (handlers/positions.js's `pos_<idx>` action). Overwritten every time the
+// Positions view is (re)rendered, so it's always in sync with what's on
+// screen; stale taps after a refresh just fail gracefully (index out of
+// range -> handled as "list changed, refresh and try again").
+export const positionsIndex = new Map(); // uid -> [{ walletId, chain, tokenAddress }, ...]
+
+export function setPositionsIndex(uid, list) {
+  positionsIndex.set(String(uid), list);
+}
+
+export function getPositionsIndexEntry(uid, idx) {
+  const list = positionsIndex.get(String(uid));
+  if (!list) return null;
+  return list[idx] ?? null;
+}
