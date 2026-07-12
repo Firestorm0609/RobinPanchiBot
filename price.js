@@ -1,5 +1,7 @@
 import axios from 'axios';
+import { ethers } from 'ethers';
 import { ALL_CHAIN_KEYS } from './chains.js';
+import { getChain, getEvmProvider, isSolanaChain, isEvmChain } from './chains.js';
 
 let ethPriceCache = { value: null, ts: 0 };
 
@@ -37,7 +39,7 @@ const DEXSCREENER_CHAIN_SLUG = {
  * pairs from other chains that happen to share the query, e.g. if the same
  * address string exists on two EVM chains).
  */
-export async function getTokenMarketData(tokenAddress, chainKey) {
+async function getDexScreenerMarketData(tokenAddress, chainKey) {
   const res = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`);
   const allPairs = res.data?.pairs || [];
   const slug = DEXSCREENER_CHAIN_SLUG[chainKey];
@@ -54,12 +56,143 @@ export async function getTokenMarketData(tokenAddress, chainKey) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Uniswap Trading API fallback (EVM chains only) — used when DexScreener has
+// no indexed pair yet for a token (common for brand-new pools). Free tier,
+// no billing required: https://developers.uniswap.org
+//
+// We deliberately quote token -> that chain's settlement stablecoin directly
+// (instead of routing through a wrapped-native leg) so we never need to know
+// a chain's WETH/WBNB address — the API's own router handles pathfinding,
+// and this keeps Robinhood Chain (whose wrapped-native address isn't
+// published anywhere we can verify) working the same as every other chain.
+//
+// This is READ-ONLY price discovery. Trade execution still goes through 0x
+// (see swap.js) — nothing here signs or sends a transaction.
+// ---------------------------------------------------------------------------
+
+const UNISWAP_QUOTE_URL = 'https://trade-api.gateway.uniswap.org/v1/quote';
+// Any validly-checksummed address works as `swapper` for a quote-only
+// request — no funds move and no signature is requested. Using a
+// well-known public address (Uniswap's own docs example) rather than the
+// zero address, since some routers special-case/reject 0x000...000.
+const QUOTE_ONLY_SWAPPER = '0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045';
+
+const ERC20_META_ABI = [
+  'function decimals() view returns (uint8)',
+  'function symbol() view returns (string)',
+  'function totalSupply() view returns (uint256)',
+];
+
+async function getUniswapV3MarketData(tokenAddress, chainKey) {
+  const apiKey = process.env.UNISWAP_API_KEY;
+  if (!apiKey) return null;
+  if (!isEvmChain(chainKey)) return null;
+
+  const chain = getChain(chainKey);
+  const provider = getEvmProvider(chainKey);
+  const token = new ethers.Contract(tokenAddress, ERC20_META_ABI, provider);
+
+  const [decimals, symbol, totalSupplyRaw] = await Promise.all([
+    token.decimals().catch(() => 18),
+    token.symbol().catch(() => '???'),
+    token.totalSupply().catch(() => null),
+  ]);
+
+  // Quote selling 1 whole token for the chain's stablecoin — gives us a spot
+  // price without needing a wrapped-native leg or guessing pool fee tiers
+  // (the API's router figures out the best path itself).
+  const oneTokenRaw = ethers.parseUnits('1', decimals).toString();
+
+  let res;
+  try {
+    res = await axios.post(
+      UNISWAP_QUOTE_URL,
+      {
+        type: 'EXACT_INPUT',
+        amount: oneTokenRaw,
+        tokenInChainId: String(chain.chainId),
+        tokenOutChainId: String(chain.chainId),
+        tokenIn: ethers.getAddress(tokenAddress),
+        tokenOut: ethers.getAddress(chain.usdcAddress),
+        swapper: QUOTE_ONLY_SWAPPER,
+        routingPreference: 'BEST_PRICE',
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'x-universal-router-version': '2.0',
+        },
+        timeout: 8000,
+      }
+    );
+  } catch (err) {
+    // No route/pool found, or API error — just means this fallback can't
+    // help for this token; caller treats it the same as "no market data".
+    return null;
+  }
+
+  // Response field naming isn't fully documented publicly at time of
+  // writing — check a few plausible shapes defensively rather than assume
+  // one exact schema.
+  const data = res.data;
+  const outAmountRaw =
+    data?.quote?.output?.amount ??
+    data?.output?.amount ??
+    data?.quote?.amountOut ??
+    data?.amountOut ??
+    null;
+
+  if (!outAmountRaw) return null;
+
+  const usdcDecimals = chain.usdcDecimals ?? 6;
+  const priceUsd = Number(ethers.formatUnits(outAmountRaw, usdcDecimals));
+  if (!priceUsd || !Number.isFinite(priceUsd) || priceUsd <= 0) return null;
+
+  let marketCap = null;
+  if (totalSupplyRaw) {
+    const supply = Number(ethers.formatUnits(totalSupplyRaw, decimals));
+    if (Number.isFinite(supply) && supply > 0) marketCap = supply * priceUsd;
+  }
+
+  return {
+    symbol,
+    priceUsd,
+    marketCap,
+    liquidityUsd: null, // not exposed by a quote-only call
+    priceChange24h: null, // not exposed by a quote-only call
+  };
+}
+
+/**
+ * Token market data (price, market cap, liquidity) scoped to a specific
+ * chain. Tries DexScreener first; on EVM chains, falls back to a live
+ * Uniswap Trading API quote if DexScreener has no indexed pair yet (common
+ * for brand-new pools) and UNISWAP_API_KEY is set. Solana has no fallback —
+ * DexScreener is the only source there.
+ */
+export async function getTokenMarketData(tokenAddress, chainKey) {
+  const dexData = await getDexScreenerMarketData(tokenAddress, chainKey).catch(() => null);
+  if (dexData) return dexData;
+
+  if (isSolanaChain(chainKey)) return null;
+
+  return getUniswapV3MarketData(tokenAddress, chainKey).catch(() => null);
+}
+
 /**
  * Cross-chain auto-detect: given just a token address/mint (no chain
  * specified — e.g. the user pasted a CA without saying which chain), finds
  * every chain this bot supports where that address has live market data,
  * ranked by liquidity. This is what lets a pasted CA "just work" without the
  * user picking a chain first.
+ *
+ * NOTE: this stays DexScreener-only (no Uniswap fallback) — the Uniswap
+ * fallback needs a specific chain to quote against, so it can't cheaply
+ * probe "every chain at once" the way DexScreener's cross-chain search can.
+ * The per-chain fallback in getTokenMarketData still applies once a chain
+ * is actually selected (see resolveChainForCA in handlers/text.js).
  *
  * Returns an array of { chainKey, market } sorted by liquidity descending.
  * Empty array if the address has no market data on any supported chain.
