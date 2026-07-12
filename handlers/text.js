@@ -3,7 +3,7 @@ import { bot } from '../bot-instance.js';
 import { createWallet } from '../wallet.js';
 import { getTokenMarketData, findTokenAcrossChains, fmtUsd } from '../price.js';
 import { isRateLimited } from '../ratelimit.js';
-import { getChain } from '../chains.js';
+import { getChain, isSolanaChain } from '../chains.js';
 import {
   getWallet,
   renameWallet,
@@ -20,10 +20,10 @@ import {
   createLimitOrder,
   addWallet,
 } from '../storage.js';
-import { CA_REGEX, SOLANA_ADDRESS_REGEX, FALLBACK_GAS_LIMIT_BUY, FALLBACK_GAS_LIMIT_SELL, TERMS_TEXT } from '../config.js';
+import { CA_REGEX, SOLANA_ADDRESS_REGEX, FALLBACK_GAS_LIMIT_BUY, FALLBACK_GAS_LIMIT_SELL, FALLBACK_GAS_LIMIT_ERC20_TRANSFER, TERMS_TEXT } from '../config.js';
 import { pending, stopPositionsRefresh } from '../state.js';
-import { gasEstimateLine, friendlyErrorMessage, parseUsdcAmountInput, parseMcapInput, mcapToPrice } from '../format.js';
-import { mainMenu, walletsMenu, confirmMenu, renderTokenCard } from '../menus.js';
+import { gasEstimateLine, friendlyErrorMessage, parseUsdcAmountInput, parseMcapInput, mcapToPrice, getChainUsdcBalance } from '../format.js';
+import { mainMenu, walletsMenu, confirmMenu, renderTokenCard, withdrawConfirmMenu } from '../menus.js';
 import { executeBuy, executeSell } from '../trade-core.js';
 import { scheduleCardAutoRefresh } from '../autorefresh.js';
 
@@ -70,6 +70,11 @@ async function resolveChainForCA(uid, tokenAddress) {
   if (activeMarket) return { chainKey: activeChain, switched: false };
 
   return { chainKey: null, switched: false };
+}
+
+/** True if `address` looks like a valid destination for `chainKey` (EVM 0x... or Solana base58 mint format). */
+function isValidAddressForChain(chainKey, address) {
+  return isSolanaChain(chainKey) ? SOLANA_ADDRESS_REGEX.test(address) : CA_REGEX.test(address);
 }
 
 bot.on('text', async (ctx) => {
@@ -236,6 +241,50 @@ bot.on('text', async (ctx) => {
       } else {
         await executeSell(ctx, uid, state.tokenAddress, val);
       }
+      return;
+    }
+
+    // ---------- Withdraw: amount -> destination address -> confirm ----------
+
+    if (state.type === 'withdraw_amount') {
+      let amt;
+      try {
+        amt = parseUsdcAmountInput(text);
+      } catch (err) {
+        return ctx.reply(err.message, { parse_mode: 'Markdown' });
+      }
+
+      const w = getActiveWallet(uid);
+      if (!w) { pending.delete(uid); return ctx.reply('No active wallet.', walletsMenu(uid)); }
+
+      const balance = await getChainUsdcBalance(w, state.chainKey).catch(() => null);
+      if (balance !== null && amt > balance) {
+        return ctx.reply(`❌ That's more than your available balance (${fmtUsd(balance)}). Send a smaller amount.`);
+      }
+
+      pending.set(uid, { type: 'withdraw_address', chainKey: state.chainKey, amount: amt });
+      const addressHint = isSolanaChain(state.chainKey) ? 'a Solana address' : 'an EVM (0x...) address';
+      await ctx.reply(`Send the destination address (${addressHint}):`);
+      return;
+    }
+
+    if (state.type === 'withdraw_address') {
+      if (!isValidAddressForChain(state.chainKey, text)) {
+        const kind = isSolanaChain(state.chainKey) ? 'Solana address' : 'EVM (0x...) address';
+        return ctx.reply(`That doesn't look like a valid ${kind}. Send a valid destination address.`);
+      }
+
+      pending.set(uid, { type: 'withdraw_confirm', chainKey: state.chainKey, amount: state.amount, toAddress: text });
+
+      const chain = getChain(state.chainKey);
+      const gasLine = await gasEstimateLine(state.chainKey, uid, FALLBACK_GAS_LIMIT_ERC20_TRANSFER).catch(() => '');
+      const shortTo = text.length > 14 ? `${text.slice(0, 8)}...${text.slice(-6)}` : text;
+
+      await ctx.reply(
+        `Confirm withdrawal:\n*${fmtUsd(state.amount)}* on ${chain.name} → \`${shortTo}\`${gasLine}\n\n` +
+        `⚠️ Double-check the address — this cannot be reversed once sent.`,
+        { parse_mode: 'Markdown', ...withdrawConfirmMenu() }
+      );
       return;
     }
 
