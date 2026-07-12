@@ -510,7 +510,7 @@ bot.action('menu_rewards', async (ctx) => {
   const tickets = getTicketCount(uid);
   await ctx.editMessageText(
     `🎟 *Rewards*\n\n` +
-    `Refer friends to earn raffle tickets for a chance to win a Panchi NFT.\n` +
+    `Refer friends to earn raffle tickets for a chance to win a prize.\n` +
     `1 successful referral = 1 ticket. No limit.\n\n` +
     `Your tickets: *${tickets}*`,
     { parse_mode: 'Markdown', ...rewardsMenu() }
