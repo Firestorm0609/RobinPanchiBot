@@ -1,6 +1,6 @@
 import { Markup } from 'telegraf';
 import { bot } from '../bot-instance.js';
-import { pending, stopPositionsRefresh, stopPortfolioRefresh, stopAllViewRefreshes } from '../state.js';
+import { pending, stopPositionsRefresh, stopAllViewRefreshes } from '../state.js';
 import { scheduleCardAutoRefresh } from '../autorefresh.js';
 import {
   walletsMenu, mainMenu, renderTokenCard, limitOrdersText, limitOrdersMenu, confirmMenu,
@@ -133,7 +133,6 @@ bot.action(/^refresh_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
   const tokenAddress = ctx.match[1];
   const uid = ctx.from.id;
   stopPositionsRefresh(uid);
-  stopPortfolioRefresh(uid);
   const { text, markup } = await renderTokenCard(uid, tokenAddress);
   await ctx.editMessageText(text, { parse_mode: 'Markdown', ...markup }).catch((err) => {
     if (!err.description?.includes('message is not modified')) throw err;
