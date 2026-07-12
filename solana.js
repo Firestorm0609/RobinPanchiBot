@@ -112,6 +112,27 @@ export async function transferSol(signerKeypair, toAddress, lamports) {
   return { signature };
 }
 
+/** Raw balance (bigint) + decimals for ANY SPL token mint — used to resolve exact sell amounts, mirroring erc20.js's getTokenBalance/getDecimals for EVM. */
+export async function getSplTokenBalanceRaw(mintAddress, ownerAddress) {
+  const connection = getSolanaConnection();
+  const owner = new PublicKey(ownerAddress);
+  const mint = new PublicKey(mintAddress);
+  const ata = await getAssociatedTokenAddress(mint, owner);
+  try {
+    const account = await getAccount(connection, ata);
+    return account.amount; // bigint
+  } catch (err) {
+    if (err instanceof TokenAccountNotFoundError) return 0n;
+    throw err;
+  }
+}
+
+export async function getSplTokenDecimals(mintAddress) {
+  const connection = getSolanaConnection();
+  const mintInfo = await connection.getParsedAccountInfo(new PublicKey(mintAddress));
+  return mintInfo.value?.data?.parsed?.info?.decimals ?? 6;
+}
+
 export function shortSolAddr(addr) {
   return `${addr.slice(0, 4)}...${addr.slice(-4)}`;
 }

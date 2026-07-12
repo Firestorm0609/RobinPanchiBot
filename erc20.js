@@ -1,7 +1,5 @@
 import { ethers } from 'ethers';
-import { provider, USDC_ROBINHOOD_ADDRESS } from './config.js';
 
-// Canonical Permit2 contract address — same on all EVM chains that have it deployed.
 export const PERMIT2_ADDRESS = '0x000000000022D473030F116dDEE9F6B43aC78BA3';
 
 const ERC20_ABI = [
@@ -12,56 +10,32 @@ const ERC20_ABI = [
   'function transfer(address to, uint256 amount) returns (bool)',
 ];
 
-/**
- * Ensures the signer has approved Permit2 to move at least `amount` of `tokenAddress`.
- * One-time per token per wallet — subsequent sells skip the on-chain approve.
- */
+/** Ensures `signer` has approved Permit2 to move at least `amount` of `tokenAddress` on whatever chain `signer` is connected to. */
 export async function ensureAllowance(signer, tokenAddress, amount) {
   const token = new ethers.Contract(tokenAddress, ERC20_ABI, signer);
   const owner = await signer.getAddress();
   const current = await token.allowance(owner, PERMIT2_ADDRESS);
-
-  if (current >= amount) return null; // already approved, nothing to do
-
+  if (current >= amount) return null;
   const tx = await token.approve(PERMIT2_ADDRESS, ethers.MaxUint256);
   return tx.wait();
 }
 
-/**
- * Fetches the token's actual decimals. Falls back to 18 if the call fails
- * (non-standard token) — caller should treat that as a best-effort guess.
- */
 export async function getDecimals(provider, tokenAddress) {
   const token = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
   return Number(await token.decimals());
 }
 
-/**
- * Raw on-chain token balance (bigint, smallest unit) for an address.
- * Used by Batch Collect to know how much of a token it can actually sweep,
- * rather than trusting the locally tracked position (which can drift from
- * the real chain state).
- */
 export async function getTokenBalance(provider, tokenAddress, ownerAddress) {
   const token = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
   return token.balanceOf(ownerAddress);
 }
 
-/**
- * Raw on-chain USDC balance (bigint, smallest unit) for an address.
- * Used by gas.js to decide whether an auto gas top-up (USDC -> ETH) is
- * affordable, and anywhere else that needs the "real" USDC balance rather
- * than the bot's locally tracked figures.
- */
-export async function getUsdcBalance(ownerAddress) {
-  const token = new ethers.Contract(USDC_ROBINHOOD_ADDRESS, ERC20_ABI, provider);
+/** USDC balance on whatever chain `provider` is connected to — pass that chain's USDC address explicitly. */
+export async function getUsdcBalance(provider, usdcAddress, ownerAddress) {
+  const token = new ethers.Contract(usdcAddress, ERC20_ABI, provider);
   return token.balanceOf(ownerAddress);
 }
 
-/**
- * Sends the full given amount (bigint, smallest unit) of a token to
- * `toAddress`. Used by Batch Collect. Returns the mined receipt.
- */
 export async function transferToken(signer, tokenAddress, toAddress, amount) {
   const token = new ethers.Contract(tokenAddress, ERC20_ABI, signer);
   const tx = await token.transfer(toAddress, amount);
