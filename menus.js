@@ -95,6 +95,10 @@ export function bridgeMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('Ethereum ➜ Robinhood', 'bridge_dir_eth_to_robinhood')],
     [Markup.button.callback('Robinhood ➜ Ethereum', 'bridge_dir_robinhood_to_eth')],
+    [
+      Markup.button.callback('💯 Bridge All (Eth➜Robin)', 'bridgeall_eth_to_robinhood'),
+      Markup.button.callback('💯 Bridge All (Robin➜Eth)', 'bridgeall_robinhood_to_eth'),
+    ],
     [Markup.button.callback('🕘 Recent Bridges', 'bridge_history')],
     [Markup.button.callback('⬅️ Back', 'menu_main')],
   ]);
