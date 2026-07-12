@@ -27,7 +27,7 @@ export function referralLink(code) {
  * Shows BOTH chains explicitly — "Robinhood ETH" and "Ethereum ETH" — never
  * a bare "ETH" that leaves it ambiguous which chain it's on. A zero balance
  * is shown as "0.0000", not hidden; only an actual RPC failure shows
- * "unavailable".
+ * "unavailable". This is native ETH (gas balance), NOT the trading currency.
  */
 export async function dualEthBalanceLines(address) {
   const ethUsd = await getEthUsdPrice().catch(() => null);
@@ -62,6 +62,7 @@ export function fmtBridgeBalanceLine(label, amount, ethUsd) {
   return `${label}: ${amount.toFixed(4)}${usdLine}`;
 }
 
+/** Gas is always paid in native ETH regardless of trading currency, so this stays ETH-denominated. */
 export async function gasEstimateLine(uid, fallbackGasLimit) {
   try {
     const mult = gasMultiplierFor(uid);
@@ -81,7 +82,7 @@ export function friendlyErrorMessage(err) {
   const raw = `${err?.message || ''} ${err?.shortMessage || ''} ${err?.reason || ''}`.toLowerCase();
 
   if (code === 'INSUFFICIENT_FUNDS' || raw.includes('insufficient funds')) {
-    return 'Insufficient balance to cover this trade plus gas. Add more ETH to your wallet and try again.';
+    return 'Insufficient balance to cover this trade plus gas. Add more USDC (and a little ETH for gas) to your wallet and try again.';
   }
   if (raw.includes('gas required exceeds allowance') || raw.includes('out of gas') || raw.includes('intrinsic gas too low')) {
     return 'Not enough ETH to cover network gas fees. Add a bit more ETH and try again.';
@@ -111,14 +112,24 @@ export async function getFreshQuote(quoteParams, quote, fetchedAt) {
 }
 
 /**
- * Parses a user-entered amount. USD is now the DEFAULT format (mimics
- * FOMO-style UX) — a bare number like `100` or `$100` is read as USD and
- * converted to ETH via the live price. To enter a raw ETH amount instead,
- * suffix it with "eth", e.g. `0.05 eth`.
- *
- * Internally we still always resolve to an ETH amount (`amountEth`) since
- * every trade/bridge/transfer executes in ETH — only the input/display
- * layer is USD-first now.
+ * Parses a USDC trade amount. Since USDC is pegged ~1:1 to USD, a bare
+ * number like `100` or `$100` IS the USDC amount — no price-feed conversion
+ * needed. This is what every buy/sell/limit-order amount uses now.
+ */
+export function parseUsdcAmountInput(text) {
+  const trimmed = text.trim().replace(/^\$/, '').replace(/\s*usdc?$/i, '');
+  const amt = parseFloat(trimmed.replace(/,/g, ''));
+  if (isNaN(amt) || amt <= 0) {
+    throw new Error('Send a valid positive USD amount, e.g. `100`');
+  }
+  return amt;
+}
+
+/**
+ * ETH-only parsing, used exclusively by the bridge feature — bridging
+ * remains native-ETH-denominated (separate from USDC trading) until
+ * multichain bridging lands. A bare number is read as USD and converted to
+ * ETH via the live price; suffix `eth` to enter a raw ETH amount instead.
  */
 export async function parseEthOrUsdInput(text) {
   const trimmed = text.trim();
@@ -194,10 +205,11 @@ export function mcapToPrice(targetMcap, market) {
 }
 
 /**
- * Standard "amount" label used across buy/batch/bridge confirmations and
- * results — USD-first, with the ETH equivalent shown in parentheses. Falls
- * back to a plain ETH label if no USD figure is available (e.g. explicit
- * `0.05 eth` input, or price feed was down at parse time).
+ * Bridge-only amount label — USD-first, with the ETH equivalent shown in
+ * parentheses. Falls back to a plain ETH label if no USD figure is
+ * available (e.g. explicit `0.05 eth` input, or price feed was down at
+ * parse time). NOT used for trades — those are already USDC/USD directly,
+ * just use fmtUsd().
  */
 export function fmtAmountLabel(amountEth, usdInput) {
   if (usdInput !== null && usdInput !== undefined) {
