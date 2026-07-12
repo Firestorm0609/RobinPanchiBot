@@ -3,8 +3,23 @@ import { VersionedTransaction } from '@solana/web3.js';
 import { getSolanaConnection } from './solana.js';
 import { CHAINS } from './chains.js';
 
-const JUPITER_QUOTE_URL = 'https://quote-api.jup.ag/v6/quote';
-const JUPITER_SWAP_URL = 'https://quote-api.jup.ag/v6/swap';
+// quote-api.jup.ag (the old free v6 endpoint) has been retired — it now
+// requires a paid API key and its DNS often doesn't even resolve anymore
+// ("getaddrinfo ENOTFOUND quote-api.jup.ag"). lite-api.jup.ag is Jupiter's
+// current free self-serve tier (same request/response shape, just a v1
+// path instead of v6). Set JUPITER_API_KEY in .env to use api.jup.ag's paid
+// tier instead (higher rate limits, needed at real volume) — same code
+// path, different base URL + an auth header.
+const JUPITER_BASE_URL = process.env.JUPITER_API_KEY
+  ? 'https://api.jup.ag'
+  : 'https://lite-api.jup.ag';
+const JUPITER_QUOTE_URL = `${JUPITER_BASE_URL}/swap/v1/quote`;
+const JUPITER_SWAP_URL = `${JUPITER_BASE_URL}/swap/v1/swap`;
+
+function jupiterHeaders() {
+  return process.env.JUPITER_API_KEY ? { 'x-api-key': process.env.JUPITER_API_KEY } : {};
+}
+
 const USDC_MINT = CHAINS.solana.usdcMint;
 const NATIVE_SOL_MINT = 'So11111111111111111111111111111111111111112';
 
@@ -25,7 +40,7 @@ export async function getSolanaQuote({ sellToken, buyToken, sellAmountRaw, slipp
   };
   if (feeBps) params.platformFeeBps = feeBps;
 
-  const res = await axios.get(JUPITER_QUOTE_URL, { params }).catch((err) => {
+  const res = await axios.get(JUPITER_QUOTE_URL, { params, headers: jupiterHeaders() }).catch((err) => {
     console.error('Jupiter quote error:', JSON.stringify(err.response?.data ?? err.message, null, 2));
     throw new Error(err.response?.data?.error || 'Failed to get Jupiter quote');
   });
@@ -49,7 +64,7 @@ export async function buildSolanaSwapTx(quote, userPublicKey, { feeAccount = nul
   if (priorityFeeLamports) body.prioritizationFeeLamports = priorityFeeLamports;
   else body.prioritizationFeeLamports = 'auto';
 
-  const res = await axios.post(JUPITER_SWAP_URL, body).catch((err) => {
+  const res = await axios.post(JUPITER_SWAP_URL, body, { headers: jupiterHeaders() }).catch((err) => {
     console.error('Jupiter swap-build error:', JSON.stringify(err.response?.data ?? err.message, null, 2));
     throw new Error(err.response?.data?.error || 'Failed to build Jupiter swap transaction');
   });
