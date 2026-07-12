@@ -45,7 +45,13 @@ export const GAS_TIERS = ['slow', 'normal', 'fast'];
 export const GAS_TIER_MULTIPLIERS = { slow: 0.85, normal: 1, fast: 1.35 };
 export const FALLBACK_GAS_LIMIT_BUY = 300_000n;
 export const FALLBACK_GAS_LIMIT_SELL = 280_000n;
-export const FALLBACK_GAS_LIMIT_TRANSFER = 21_000n;
+export const FALLBACK_GAS_LIMIT_TRANSFER = 21_000n; // plain native transfer
+// ERC20 `transfer()` (stablecoin withdrawal) costs meaningfully more gas than
+// a plain native transfer — 65k is a safe round-up over the ~45-52k typical
+// for a standard (non-proxy) ERC20 transfer, used only for the display
+// estimate shown before confirming a withdraw, not the actual tx gas limit
+// (that's still resolved live at send time via ethers' default estimation).
+export const FALLBACK_GAS_LIMIT_ERC20_TRANSFER = 65_000n;
 
 // ---------------------------------------------------------------------------
 // Gas abstraction (EVM only — Solana's "gas" is a near-zero flat fee paid in
@@ -94,6 +100,8 @@ export const HELP_TEXT =
   'No. Your wallet works on every supported chain already (same address on all EVM chains; a separate Solana address for Solana). Deposit on whichever chain you like — if a token you paste trades on a chain where you\'re short of funds, the bot automatically bridges the shortfall in from another chain where you have a balance, then completes the trade. Small shortfalls (under $5) aren\'t auto-bridged since bridging fees wouldn\'t be worth it — just fund that chain directly for a top-up that small.\n\n' +
   '*Which chains are supported?*\n' +
   'Ethereum, Base, Arbitrum, BNB Chain, Robinhood Chain, and Solana. Deposit USDC on every chain except Robinhood Chain, where the settlement stablecoin is USDG (Robinhood does not have a native USDC deployment) — check 📥 Deposit to see each chain\'s address.\n\n' +
+  '*How do I withdraw?*\n' +
+  'Open 📤 Withdraw, pick the chain to withdraw from, enter the amount and destination address. You\'ll see an estimated network fee before confirming.\n\n' +
   '*Where\'s my referral link?*\n' +
   'Open 🎟 Rewards from the main menu.\n\n' +
   '*What are the fees?*\n' +

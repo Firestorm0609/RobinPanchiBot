@@ -19,7 +19,8 @@ export function mainMenu() {
     [Markup.button.callback('🔍 Trade Token', 'menu_trade')],
     [Markup.button.callback('📊 Positions', 'menu_positions')],
     [Markup.button.callback('💼 Wallets', 'menu_wallets'), Markup.button.callback('💰 Balance', 'menu_balance')],
-    [Markup.button.callback('📥 Deposit', 'menu_deposit'), Markup.button.callback('⏰ Limit Orders', 'menu_limitorders')],
+    [Markup.button.callback('📥 Deposit', 'menu_deposit'), Markup.button.callback('📤 Withdraw', 'menu_withdraw')],
+    [Markup.button.callback('⏰ Limit Orders', 'menu_limitorders')],
     [Markup.button.callback('🎟 Rewards', 'menu_rewards'), Markup.button.callback('⚙️ Settings', 'menu_settings')],
     [Markup.button.callback('❓ Help', 'menu_help')],
     [Markup.button.url('🐦 X', 'https://x.com/robinpanchi')],
@@ -75,6 +76,31 @@ export function depositChainDetailMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('⬅️ Choose a different network', 'menu_deposit')],
     [Markup.button.callback('🏠 Main Menu', 'menu_main')],
+  ]);
+}
+
+// ---------- Withdraw ----------
+// Mirrors Deposit's "choose a network" picker. The subsequent amount /
+// destination-address prompts are plain text.js pending-state steps (same
+// pattern as custom buy/sell) rather than menu-driven, since free-text
+// input is unavoidable for an amount + an arbitrary address. The final
+// confirm step (with a gas estimate) IS a menu, via withdrawConfirmMenu.
+
+export function withdrawMenu() {
+  const rows = ALL_CHAIN_KEYS.map((key) => {
+    const chain = getChain(key);
+    return [Markup.button.callback(chain.name, `withdraw_chain_${key}`)];
+  });
+  rows.push([Markup.button.callback('⬅️ Back', 'menu_main')]);
+  return Markup.inlineKeyboard(rows);
+}
+
+export function withdrawConfirmMenu() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('✅ Confirm', 'withdraw_confirm_yes'),
+      Markup.button.callback('❌ Cancel', 'withdraw_confirm_cancel'),
+    ],
   ]);
 }
 
