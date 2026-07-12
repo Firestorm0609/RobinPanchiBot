@@ -168,15 +168,23 @@ async function getPumpFunMarketData(mintAddress) {
   // what's actually withdrawable liquidity.
   let liquidityUsd = null;
   const lamportReserves = d.real_sol_reserves ?? d.virtual_sol_reserves ?? null;
+  dbg('pump.fun raw reserve fields', {
+    real_sol_reserves: d.real_sol_reserves,
+    virtual_sol_reserves: d.virtual_sol_reserves,
+    chosen: lamportReserves,
+  });
   if (lamportReserves != null) {
     const solReserve = Number(lamportReserves) / 1e9; // lamports -> SOL
     if (Number.isFinite(solReserve) && solReserve > 0) {
-      const solUsd = await getNativeUsdPrice('SOL').catch(() => null);
+      const solUsd = await getNativeUsdPrice('SOL').catch((err) => { dbg('SOL price lookup failed', err.message); return null; });
+      dbg('pump.fun liquidity calc', { solReserve, solUsd });
       if (solUsd) {
         const candidate = solReserve * 2 * solUsd;
         if (Number.isFinite(candidate) && candidate > 0) liquidityUsd = candidate;
       }
     }
+  } else {
+    dbg('pump.fun: no real_sol_reserves or virtual_sol_reserves field found on response — full response keys:', Object.keys(d));
   }
 
   return {
