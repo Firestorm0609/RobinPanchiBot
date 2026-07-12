@@ -1,6 +1,6 @@
 import { Markup } from 'telegraf';
 import { bot } from '../bot-instance.js';
-import { createWallet, importWallet, shortAddr } from '../wallet.js';
+import { createWallet, shortAddr } from '../wallet.js';
 import { getTokenMarketData, findTokenAcrossChains, fmtUsd } from '../price.js';
 import { sendAdminAlert } from '../alerts.js';
 import { isRateLimited } from '../ratelimit.js';
@@ -120,27 +120,6 @@ bot.on('text', async (ctx) => {
         `✅ Wallet *${text}* created:\nEVM: \`${w.evmAddress}\`\nSolana: \`${w.solAddress}\`\n\nDeposit native USDC on any supported chain to trade there — no bridging needed.`,
         { parse_mode: 'Markdown', ...mainMenu() }
       );
-      return;
-    }
-
-    if (state.type === 'import_name') {
-      pending.set(uid, { type: 'import_key', name: text });
-      await ctx.reply('Now send the private key for this wallet (EVM `0x...` key, or a Solana base58 secret key):');
-      return;
-    }
-
-    if (state.type === 'import_key') {
-      const { wallet: w, generatedSide } = importWallet(state.name, text);
-      addWallet(uid, w);
-      pending.delete(uid);
-      const genNote = generatedSide === 'solana'
-        ? `\n\n_A new Solana address was generated for this wallet — fund it separately to trade on Solana._`
-        : `\n\n_A new EVM address was generated for this wallet — fund it separately to trade on EVM chains._`;
-      await ctx.reply(
-        `✅ Wallet *${state.name}* imported:\nEVM: \`${w.evmAddress}\`\nSolana: \`${w.solAddress}\`${genNote}`,
-        { parse_mode: 'Markdown', ...mainMenu() }
-      );
-      ctx.deleteMessage(ctx.message.message_id).catch(() => {});
       return;
     }
 

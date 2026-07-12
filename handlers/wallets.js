@@ -10,7 +10,7 @@ bot.action('menu_wallets', async (ctx) => {
   const uid = ctx.from.id;
   const user = getUser(uid);
   const header = user.wallets.length === 0
-    ? 'No wallets yet. Create or import one to get started.'
+    ? 'No wallets yet. Create one to get started.'
     : '💼 *Your Wallets*\n✅ = active wallet for trading';
   await ctx.editMessageText(header, { parse_mode: 'Markdown', ...walletsMenu(uid) });
 });
@@ -19,12 +19,6 @@ bot.action('wallet_create', async (ctx) => {
   await ctx.answerCbQuery();
   pending.set(ctx.from.id, { type: 'create_name' });
   await ctx.editMessageText('Send a name for this new wallet (e.g. "Main"):');
-});
-
-bot.action('wallet_import', async (ctx) => {
-  await ctx.answerCbQuery();
-  pending.set(ctx.from.id, { type: 'import_name' });
-  await ctx.editMessageText('Send a name for the imported wallet (e.g. "Cold Wallet"):');
 });
 
 bot.action(/^wallet_activate_(.+)$/, async (ctx) => {
@@ -66,7 +60,7 @@ bot.action(/^wallet_export_(?!confirm)(.+)$/, async (ctx) => {
   );
 });
 
-bot.action(/^wallet_(?!create|import|activate|rename|remove|export)(.+)$/, async (ctx) => {
+bot.action(/^wallet_(?!create|activate|rename|remove|export)(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const w = getWallet(ctx.from.id, ctx.match[1]);
   if (!w) return ctx.editMessageText('Wallet not found.', walletsMenu(ctx.from.id));
