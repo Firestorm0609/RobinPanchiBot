@@ -82,6 +82,31 @@ bot.on('text', async (ctx) => {
   const state = pending.get(uid);
   const text = ctx.message.text.trim();
 
+  // Must run BEFORE the generic isContractAddress branch below: a
+  // withdrawal destination address (EVM 0x... or Solana base58) matches
+  // the same shape as a token contract address/mint, so without this check
+  // first, typing a destination address here would get misinterpreted as
+  // "paste a token to trade" instead of completing the withdrawal.
+  if (state?.type === 'withdraw_address') {
+    if (!isValidAddressForChain(state.chainKey, text)) {
+      const kind = isSolanaChain(state.chainKey) ? 'Solana address' : 'EVM (0x...) address';
+      return ctx.reply(`That doesn't look like a valid ${kind}. Send a valid destination address.`);
+    }
+
+    pending.set(uid, { type: 'withdraw_confirm', chainKey: state.chainKey, amount: state.amount, toAddress: text });
+
+    const chain = getChain(state.chainKey);
+    const gasLine = await gasEstimateLine(state.chainKey, uid, FALLBACK_GAS_LIMIT_ERC20_TRANSFER).catch(() => '');
+    const shortTo = text.length > 14 ? `${text.slice(0, 8)}...${text.slice(-6)}` : text;
+
+    await ctx.reply(
+      `Confirm withdrawal:\n*${fmtUsd(state.amount)}* on ${chain.name} → \`${shortTo}\`${gasLine}\n\n` +
+      `⚠️ Double-check the address — this cannot be reversed once sent.`,
+      { parse_mode: 'Markdown', ...withdrawConfirmMenu() }
+    );
+    return;
+  }
+
   if (isContractAddress(text)) {
     if (!hasAgreedTerms(uid)) {
       return ctx.reply(TERMS_TEXT, {
@@ -265,26 +290,6 @@ bot.on('text', async (ctx) => {
       pending.set(uid, { type: 'withdraw_address', chainKey: state.chainKey, amount: amt });
       const addressHint = isSolanaChain(state.chainKey) ? 'a Solana address' : 'an EVM (0x...) address';
       await ctx.reply(`Send the destination address (${addressHint}):`);
-      return;
-    }
-
-    if (state.type === 'withdraw_address') {
-      if (!isValidAddressForChain(state.chainKey, text)) {
-        const kind = isSolanaChain(state.chainKey) ? 'Solana address' : 'EVM (0x...) address';
-        return ctx.reply(`That doesn't look like a valid ${kind}. Send a valid destination address.`);
-      }
-
-      pending.set(uid, { type: 'withdraw_confirm', chainKey: state.chainKey, amount: state.amount, toAddress: text });
-
-      const chain = getChain(state.chainKey);
-      const gasLine = await gasEstimateLine(state.chainKey, uid, FALLBACK_GAS_LIMIT_ERC20_TRANSFER).catch(() => '');
-      const shortTo = text.length > 14 ? `${text.slice(0, 8)}...${text.slice(-6)}` : text;
-
-      await ctx.reply(
-        `Confirm withdrawal:\n*${fmtUsd(state.amount)}* on ${chain.name} → \`${shortTo}\`${gasLine}\n\n` +
-        `⚠️ Double-check the address — this cannot be reversed once sent.`,
-        { parse_mode: 'Markdown', ...withdrawConfirmMenu() }
-      );
       return;
     }
 
