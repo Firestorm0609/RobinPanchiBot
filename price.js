@@ -65,7 +65,7 @@ const DEXSCREENER_CHAIN_SLUG = {
   arbitrum: 'arbitrum',
   bsc: 'bsc',
   solana: 'solana',
-  robinhood: process.env.DEXSCREENER_ROBINHOOD_SLUG || 'robinhoodchain',
+  robinhood: process.env.DEXSCREENER_ROBINHOOD_SLUG || 'robinhood',
 };
 
 // ---------------------------------------------------------------------------
@@ -440,4 +440,4 @@ export function fmtTokenAmount(n) {
   if (abs >= 1_000) return `${(n / 1_000).toFixed(2)}K`;
   if (abs >= 1) return n.toFixed(4);
   return n.toFixed(6);
-                               }
+        }
