@@ -157,43 +157,19 @@ async function getPumpFunMarketData(mintAddress) {
   const priceUsd = marketCap / totalSupply;
   if (!Number.isFinite(priceUsd) || priceUsd <= 0) return null;
 
-  // pump.fun's coin endpoint doesn't return a liquidity-in-USD figure
-  // directly — it exposes raw bonding-curve/pool reserves instead
-  // (virtual_sol_reserves / real_sol_reserves, in lamports). We approximate
-  // USD liquidity as 2x the SOL-side reserve (SOL side + equivalent token
-  // side) converted at the live SOL/USD price. This is an ESTIMATE, not an
-  // indexed figure like DexScreener's — prefer real_sol_reserves (actual
-  // pool reserves) over virtual_sol_reserves (bonding-curve virtual
-  // reserves used for pricing) when both are present, since it's closer to
-  // what's actually withdrawable liquidity.
-  let liquidityUsd = null;
-  const lamportReserves = (d.real_sol_reserves && d.real_sol_reserves > 0)
-    ? d.real_sol_reserves
-    : (d.virtual_sol_reserves ?? null);
-  dbg('pump.fun raw reserve fields', {
-    real_sol_reserves: d.real_sol_reserves,
-    virtual_sol_reserves: d.virtual_sol_reserves,
-    chosen: lamportReserves,
-  });
-  if (lamportReserves != null) {
-    const solReserve = Number(lamportReserves) / 1e9; // lamports -> SOL
-    if (Number.isFinite(solReserve) && solReserve > 0) {
-      const solUsd = await getNativeUsdPrice('SOL').catch((err) => { dbg('SOL price lookup failed', err.message); return null; });
-      dbg('pump.fun liquidity calc', { solReserve, solUsd });
-      if (solUsd) {
-        const candidate = solReserve * 2 * solUsd;
-        if (Number.isFinite(candidate) && candidate > 0) liquidityUsd = candidate;
-      }
-    }
-  } else {
-    dbg('pump.fun: no real_sol_reserves or virtual_sol_reserves field found on response — full response keys:', Object.keys(d));
-  }
-
   return {
     symbol: d.symbol ?? '???',
     priceUsd,
     marketCap,
-    liquidityUsd,
+    // Left null here — filled in by getTokenMarketData() below via a
+    // DexScreener lookup when possible. pump.fun's own reserve fields
+    // (real_sol_reserves / virtual_sol_reserves) are NOT a reliable proxy:
+    // pre-graduation real_sol_reserves is 0 by design (funds are virtual
+    // until migration), and post-graduation virtual_sol_reserves is stale
+    // bonding-curve state that no longer reflects the actual migrated pool
+    // (now on PumpSwap/Raydium) — using it produced numbers ~3x off from
+    // DexScreener's indexed figure in testing.
+    liquidityUsd: null,
     priceChange24h: null,
   };
 }
@@ -367,7 +343,14 @@ export async function getTokenMarketData(tokenAddress, chainKey) {
   if (isSolanaChain(chainKey)) {
     const pumpData = await getPumpFunMarketData(tokenAddress).catch(() => null);
     if (pumpData) {
-      dbg('resolved via pump.fun');
+      dbg('resolved via pump.fun (price/mcap); looking up DexScreener for liquidity figure');
+      const dexForLiquidity = await getDexScreenerMarketData(tokenAddress, chainKey).catch(() => null);
+      if (dexForLiquidity?.liquidityUsd != null) {
+        pumpData.liquidityUsd = dexForLiquidity.liquidityUsd;
+        dbg('merged DexScreener liquidity into pump.fun result', { liquidityUsd: dexForLiquidity.liquidityUsd });
+      } else {
+        dbg('DexScreener had no liquidity figure either — leaving liquidityUsd null');
+      }
       return pumpData;
     }
     const dex = await getDexScreenerMarketData(tokenAddress, chainKey).catch(() => null);
