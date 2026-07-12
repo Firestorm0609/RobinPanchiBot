@@ -20,11 +20,41 @@ export function getCachedEthUsdPrice() {
   return null;
 }
 
-// Same base58 sanity check used elsewhere (config.js's SOLANA_ADDRESS_REGEX)
-// — duplicated here (not imported) to keep price.js dependency-free of
-// config.js and avoid a circular import risk. Kept in sync manually; if you
-// change one, change both.
-const SOLANA_ADDRESS_REGEX = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+// Generic native-gas-token USD price (ETH for most chains, BNB for BSC) —
+// used to convert a token->WETH/WBNB quote into a USD price when a chain's
+// pools are paired with the wrapped native token rather than the
+// stablecoin directly (common for brand-new/launchpad tokens — see
+// getUniswapV3MarketData below).
+const NATIVE_COINGECKO_ID = { ETH: 'ethereum', BNB: 'binancecoin' };
+const nativePriceCache = new Map(); // symbol -> { value, ts }
+
+async function getNativeUsdPrice(nativeSymbol) {
+  const cached = nativePriceCache.get(nativeSymbol);
+  if (cached && Date.now() - cached.ts < 30_000) return cached.value;
+
+  const coingeckoId = NATIVE_COINGECKO_ID[nativeSymbol];
+  if (!coingeckoId) return null;
+
+  const res = await axios.get('https://api.coingecko.com/api/v3/simple/price', {
+    params: { ids: coingeckoId, vs_currencies: 'usd' },
+  });
+  const price = res.data?.[coingeckoId]?.usd ?? null;
+  if (price) nativePriceCache.set(nativeSymbol, { value: price, ts: Date.now() });
+  return price;
+}
+
+// Wrapped-native token address per EVM chain — needed only for the
+// token->WETH fallback leg below (never used for trade execution, which
+// stays on 0x/swap.js). ethereum/base/arbitrum/bsc addresses are the
+// long-standing canonical deployments; robinhood's was confirmed live
+// against an indexed Uniswap V3 pair (chain launched July 2026).
+const WRAPPED_NATIVE_ADDRESS = {
+  ethereum: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
+  base: '0x4200000000000000000000000000000000000006',
+  arbitrum: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1',
+  bsc: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',
+  robinhood: '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73',
+};
 
 // DexScreener's chainId slugs for the `chainId` field in its API responses —
 // used to confirm a pair result actually belongs to the chain we asked about
@@ -71,6 +101,7 @@ async function getDexScreenerMarketData(tokenAddress, chainKey) {
 // checks SOLANA_ADDRESS_REGEX itself rather than trusting callers.
 // ---------------------------------------------------------------------------
 
+const SOLANA_ADDRESS_REGEX = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const PUMPFUN_COIN_URL = 'https://frontend-api-v3.pump.fun/coins';
 
 async function getPumpFunMarketData(mintAddress) {
@@ -113,18 +144,22 @@ async function getPumpFunMarketData(mintAddress) {
 
 // ---------------------------------------------------------------------------
 // Uniswap Trading API fallback (EVM chains only) — used when DexScreener has
-// no indexed pair yet for a token (common for brand-new pools). Free tier,
-// no billing required: https://developers.uniswap.org
+// no indexed pair yet for a token (common for brand-new pools, e.g. tokens
+// launched via a launchpad like NOXA Fun on Robinhood Chain that deploy
+// straight onto canonical Uniswap V3 but pair with WETH, not the chain's
+// stablecoin). Free tier, no billing required: developers.uniswap.org
 //
-// We deliberately quote token -> that chain's settlement stablecoin directly
-// (instead of routing through a wrapped-native leg) so we never need to know
-// a chain's WETH/WBNB address — the API's own router handles pathfinding.
+// Two attempts, in order:
+//   1. token -> chain's stablecoin directly (works when a deep direct pool
+//      exists, common on established chains like Ethereum/Base/Arbitrum).
+//   2. token -> wrapped native (WETH/WBNB), then convert to USD using a
+//      live native-token price. This is the path that actually covers
+//      NOXA Fun-style launches, which pair exclusively with WETH.
 //
 // This is READ-ONLY price discovery. Trade execution still goes through 0x
 // (see swap.js) — nothing here signs or sends a transaction. Note: this
-// fallback only sees pools indexed by Uniswap's own router — it can't see
-// pools deployed through a different factory (e.g. a third-party launchpad
-// running its own Uniswap-V3-compatible factory).
+// fallback only sees pools indexed by Uniswap's own router — it still can't
+// see pools deployed through a genuinely separate (non-Uniswap) factory.
 // ---------------------------------------------------------------------------
 
 const UNISWAP_QUOTE_URL = 'https://trade-api.gateway.uniswap.org/v1/quote';
@@ -135,6 +170,42 @@ const ERC20_META_ABI = [
   'function symbol() view returns (string)',
   'function totalSupply() view returns (uint256)',
 ];
+
+async function fetchUniswapQuote({ chain, tokenIn, tokenOut, amountRaw, apiKey }) {
+  try {
+    const res = await axios.post(
+      UNISWAP_QUOTE_URL,
+      {
+        type: 'EXACT_INPUT',
+        amount: amountRaw,
+        tokenInChainId: String(chain.chainId),
+        tokenOutChainId: String(chain.chainId),
+        tokenIn: ethers.getAddress(tokenIn),
+        tokenOut: ethers.getAddress(tokenOut),
+        swapper: QUOTE_ONLY_SWAPPER,
+        routingPreference: 'BEST_PRICE',
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'x-universal-router-version': '2.0',
+        },
+        timeout: 8000,
+      }
+    );
+    const data = res.data;
+    return (
+      data?.quote?.output?.amount ??
+      data?.output?.amount ??
+      data?.quote?.amountOut ??
+      data?.amountOut ??
+      null
+    );
+  } catch {
+    return null;
+  }
+}
 
 async function getUniswapV3MarketData(tokenAddress, chainKey) {
   const apiKey = process.env.UNISWAP_API_KEY;
@@ -152,47 +223,37 @@ async function getUniswapV3MarketData(tokenAddress, chainKey) {
   ]);
 
   const oneTokenRaw = ethers.parseUnits('1', decimals).toString();
+  let priceUsd = null;
 
-  let res;
-  try {
-    res = await axios.post(
-      UNISWAP_QUOTE_URL,
-      {
-        type: 'EXACT_INPUT',
-        amount: oneTokenRaw,
-        tokenInChainId: String(chain.chainId),
-        tokenOutChainId: String(chain.chainId),
-        tokenIn: ethers.getAddress(tokenAddress),
-        tokenOut: ethers.getAddress(chain.usdcAddress),
-        swapper: QUOTE_ONLY_SWAPPER,
-        routingPreference: 'BEST_PRICE',
-      },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-          'x-universal-router-version': '2.0',
-        },
-        timeout: 8000,
-      }
-    );
-  } catch {
-    return null;
+  // Attempt 1: direct token -> stablecoin quote.
+  const usdcOutRaw = await fetchUniswapQuote({
+    chain, tokenIn: tokenAddress, tokenOut: chain.usdcAddress, amountRaw: oneTokenRaw, apiKey,
+  });
+  if (usdcOutRaw) {
+    const usdcDecimals = chain.usdcDecimals ?? 6;
+    const candidate = Number(ethers.formatUnits(usdcOutRaw, usdcDecimals));
+    if (Number.isFinite(candidate) && candidate > 0) priceUsd = candidate;
   }
 
-  const data = res.data;
-  const outAmountRaw =
-    data?.quote?.output?.amount ??
-    data?.output?.amount ??
-    data?.quote?.amountOut ??
-    data?.amountOut ??
-    null;
+  // Attempt 2: token -> wrapped native, converted via live native USD price.
+  if (priceUsd === null) {
+    const wrappedNative = WRAPPED_NATIVE_ADDRESS[chainKey];
+    if (wrappedNative) {
+      const wethOutRaw = await fetchUniswapQuote({
+        chain, tokenIn: tokenAddress, tokenOut: wrappedNative, amountRaw: oneTokenRaw, apiKey,
+      });
+      if (wethOutRaw) {
+        const nativeUsd = await getNativeUsdPrice(chain.nativeSymbol).catch(() => null);
+        if (nativeUsd) {
+          const wethAmount = Number(ethers.formatUnits(wethOutRaw, 18)); // WETH/WBNB are always 18 decimals
+          const candidate = wethAmount * nativeUsd;
+          if (Number.isFinite(candidate) && candidate > 0) priceUsd = candidate;
+        }
+      }
+    }
+  }
 
-  if (!outAmountRaw) return null;
-
-  const usdcDecimals = chain.usdcDecimals ?? 6;
-  const priceUsd = Number(ethers.formatUnits(outAmountRaw, usdcDecimals));
-  if (!priceUsd || !Number.isFinite(priceUsd) || priceUsd <= 0) return null;
+  if (priceUsd === null) return null;
 
   let marketCap = null;
   if (totalSupplyRaw) {
@@ -204,8 +265,8 @@ async function getUniswapV3MarketData(tokenAddress, chainKey) {
     symbol,
     priceUsd,
     marketCap,
-    liquidityUsd: null,
-    priceChange24h: null,
+    liquidityUsd: null, // not exposed by a quote-only call
+    priceChange24h: null, // not exposed by a quote-only call
   };
 }
 
@@ -219,7 +280,8 @@ async function getUniswapV3MarketData(tokenAddress, chainKey) {
  * all, like a plain Raydium/Orca listing).
  *
  * EVM chains: DexScreener first, falling back to a live Uniswap Trading API
- * quote if DexScreener has no indexed pair and UNISWAP_API_KEY is set.
+ * quote (token->stablecoin, then token->wrapped-native) if DexScreener has
+ * no indexed pair and UNISWAP_API_KEY is set.
  */
 export async function getTokenMarketData(tokenAddress, chainKey) {
   if (isSolanaChain(chainKey)) {
@@ -242,10 +304,7 @@ export async function getTokenMarketData(tokenAddress, chainKey) {
  *
  * pump.fun is only consulted when `tokenAddress` actually looks like a
  * Solana mint (base58, 32-44 chars) — an EVM 0x... address is never passed
- * to it. This matters because pump.fun's endpoint has been observed
- * returning an unrelated match for malformed/non-Solana input rather than a
- * clean 404, which previously caused plain EVM tokens to get mislabeled as
- * Solana. Uniswap's per-chain fallback is NOT used here — it needs one
+ * to it. Uniswap's per-chain fallback is NOT used here — it needs one
  * specific chain to quote against, so it can't cheaply probe "every EVM
  * chain at once" the way DexScreener's cross-chain search can. That
  * fallback still applies once a chain is actually selected (see
