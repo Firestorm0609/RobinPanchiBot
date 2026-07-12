@@ -167,7 +167,9 @@ async function getPumpFunMarketData(mintAddress) {
   // reserves used for pricing) when both are present, since it's closer to
   // what's actually withdrawable liquidity.
   let liquidityUsd = null;
-  const lamportReserves = d.real_sol_reserves ?? d.virtual_sol_reserves ?? null;
+  const lamportReserves = (d.real_sol_reserves && d.real_sol_reserves > 0)
+    ? d.real_sol_reserves
+    : (d.virtual_sol_reserves ?? null);
   dbg('pump.fun raw reserve fields', {
     real_sol_reserves: d.real_sol_reserves,
     virtual_sol_reserves: d.virtual_sol_reserves,
