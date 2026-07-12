@@ -93,12 +93,10 @@ bot.on('text', async (ctx) => {
     pending.delete(uid);
     stopPositionsRefresh(uid);
 
-    const { chainKey, switched, from } = await resolveChainForCA(uid, text);
-    if (switched) {
-      const toName = getChain(chainKey).name;
-      const fromName = getChain(from).name;
-      await ctx.reply(`ℹ️ Best liquidity for this token is on *${toName}* — switched you from ${fromName}.`, { parse_mode: 'Markdown' });
-    }
+    // Resolves + switches the active chain to wherever this token has the
+    // best liquidity, silently (no chat notification on switch — the user
+    // just wants the token card).
+    const { chainKey } = await resolveChainForCA(uid, text);
 
     const { text: cardText, markup } = await renderTokenCard(uid, text);
     const sent = await ctx.reply(cardText, { parse_mode: 'Markdown', ...markup });
