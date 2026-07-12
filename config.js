@@ -117,6 +117,6 @@ export const HELP_TEXT =
 
 export const WELCOME_TEXT =
   '🌴 *RobinPanchi Trading Bot*\n' +
-  'The first NFT trading bot on Robinhood 🍃\n\n' +
+  'Fast token swaps on Robinhood Chain 🍃\n\n' +
   'Paste a token contract address to trade it.\n\n' +
   '_Support: panchi.eth@gmail.com_';
