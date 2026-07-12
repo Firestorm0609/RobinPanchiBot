@@ -26,24 +26,8 @@ export function createSolanaWallet() {
   return { address: kp.publicKey.toBase58(), privateKey: bs58.encode(kp.secretKey) };
 }
 
-/** Imports a Solana wallet from a base58 secret key (the format Phantom/Solflare export). Throws if invalid. */
-export function importSolanaWallet(base58SecretKey) {
-  const secretKey = bs58.decode(base58SecretKey.trim());
-  const kp = Keypair.fromSecretKey(secretKey);
-  return { address: kp.publicKey.toBase58(), privateKey: bs58.encode(kp.secretKey) };
-}
-
 export function keypairFromPrivateKey(base58SecretKey) {
   return Keypair.fromSecretKey(bs58.decode(base58SecretKey));
-}
-
-export function isValidSolanaPrivateKey(str) {
-  try {
-    const decoded = bs58.decode(str.trim());
-    return decoded.length === 64;
-  } catch {
-    return false;
-  }
 }
 
 export async function getSolBalance(address) {

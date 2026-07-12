@@ -1,5 +1,4 @@
 import { ethers } from 'ethers';
-import { PublicKey } from '@solana/web3.js';
 import { getQuote, buildSwapTx, sendSwapWithGasBump } from './swap.js';
 import { getSolanaQuote, buildSolanaSwapTx, sendSolanaSwap } from './solana-swap.js';
 import { getBridgeQuote, summarizeBridgeQuote, executeBridge } from './bridge.js';
@@ -9,14 +8,14 @@ import { shortAddr } from './wallet.js';
 import {
   getSettings, createPendingTrade, markPendingTradeSubmitted, markPendingTradeDone,
   markPendingTradeBridging, markPendingTradeBridged, markPendingTradeSwapping,
-  recordTrade, getPosition, getAllPositions, getActiveWallet, getActiveChain,
+  recordTrade, getPosition, getActiveWallet, getActiveChain,
 } from './storage.js';
 import { sendAdminAlert } from './alerts.js';
 import {
   getChain, getEvmProvider, isSolanaChain, explorerTxUrl, getStableDecimals, ALL_CHAIN_KEYS,
 } from './chains.js';
 import {
-  keypairFromPrivateKey, getSplTokenBalanceRaw, getSplTokenDecimals, transferSolanaUsdc,
+  keypairFromPrivateKey, getSplTokenBalanceRaw, getSplTokenDecimals,
 } from './solana.js';
 import { gasMultiplierFor, tradesInFlight } from './state.js';
 import {
@@ -237,9 +236,9 @@ export async function performSwapBuy(uid, wallet, chainKey, tokenAddress, usdcAm
  *
  * `onProgress(message)` is an optional callback fired with human-readable
  * status updates during a bridge (e.g. "Bridging $50 from Base -> Robinhood
- * Chain..."). Callers that don't care (batch buy, auto TP/SL, limit orders)
- * can omit it — bridging still happens, just silently to them, same as any
- * other async step in this function.
+ * Chain..."). Callers that don't care (auto TP/SL, limit orders) can omit
+ * it — bridging still happens, just silently to them, same as any other
+ * async step in this function.
  */
 export async function performBuyCore(uid, wallet, chainKey, tokenAddress, usdcAmount, { onProgress = noop } = {}) {
   if (tradesInFlight.has(uid)) return { ok: false, error: LOCKED_ERROR, locked: true, walletName: wallet.name };
@@ -478,6 +477,7 @@ export async function performUsdcTransferCore(uid, chainKey, sourceWallet, toAdd
       const keypair = keypairFromPrivateKey(sourceWallet.solPrivateKey);
       await ensureSolanaGasReserve(sourceWallet.solAddress);
       const rawAmount = await toRawUsdc(chainKey, usdcAmount);
+      const { transferSolanaUsdc } = await import('./solana.js');
       const { signature } = await transferSolanaUsdc(keypair, toAddress, rawAmount);
       return { ok: true, txHash: signature };
     }
@@ -493,106 +493,4 @@ export async function performUsdcTransferCore(uid, chainKey, sourceWallet, toAdd
   } catch (err) {
     return { ok: false, error: friendlyErrorMessage(err) };
   }
-}
-
-export async function distributeUsdc(uid, chainKey, sourceWallet, targets, usdcAmount) {
-  const results = [];
-  for (const target of targets) {
-    const toAddress = isSolanaChain(chainKey) ? target.solAddress : target.address;
-    const result = await performUsdcTransferCore(uid, chainKey, sourceWallet, toAddress, usdcAmount);
-    results.push({ ...result, walletName: target.name });
-  }
-  return results;
-}
-
-export async function estimateTransferGasReserve(chainKey, sourceWallet, count) {
-  try {
-    if (isSolanaChain(chainKey)) return 0;
-    const provider = getEvmProvider(chainKey);
-    const balance = await provider.getBalance(sourceWallet.address);
-    const balanceNum = Number(ethers.formatEther(balance));
-    const { MIN_GAS_ETH_RESERVE, GAS_TOPUP_USDC_AMOUNT } = await import('./config.js');
-    if (balanceNum >= MIN_GAS_ETH_RESERVE) return 0;
-    return GAS_TOPUP_USDC_AMOUNT;
-  } catch {
-    const { GAS_TOPUP_USDC_AMOUNT } = await import('./config.js');
-    return GAS_TOPUP_USDC_AMOUNT;
-  }
-}
-
-async function transferSolanaToken(keypair, mintAddress, toAddress, rawAmount) {
-  const { getAssociatedTokenAddress, createTransferInstruction, createAssociatedTokenAccountIdempotentInstruction } = await import('@solana/spl-token');
-  const { Transaction, sendAndConfirmTransaction } = await import('@solana/web3.js');
-  const { getSolanaConnection } = await import('./solana.js');
-  const connection = getSolanaConnection();
-  const mint = new PublicKey(mintAddress);
-  const dest = new PublicKey(toAddress);
-  const sourceAta = await getAssociatedTokenAddress(mint, keypair.publicKey);
-  const destAta = await getAssociatedTokenAddress(mint, dest);
-  const tx = new Transaction().add(
-    createAssociatedTokenAccountIdempotentInstruction(keypair.publicKey, destAta, dest, mint),
-    createTransferInstruction(sourceAta, destAta, keypair.publicKey, rawAmount)
-  );
-  const signature = await sendAndConfirmTransaction(connection, tx, [keypair], { commitment: 'confirmed' });
-  return { signature };
-}
-
-/** Sweeps USDC + every tracked token from one wallet into destAddress, on ONE chain. */
-export async function performCollectCore(uid, chainKey, sourceWallet, destAddress) {
-  const results = [];
-  const positions = getAllPositions(uid, sourceWallet.id, chainKey);
-
-  if (isSolanaChain(chainKey)) {
-    const keypair = keypairFromPrivateKey(sourceWallet.solPrivateKey);
-    for (const pos of positions) {
-      try {
-        const rawBalance = await getSplTokenBalanceRaw(pos.tokenAddress, sourceWallet.solAddress);
-        if (rawBalance <= 0n) continue;
-        const { signature } = await transferSolanaToken(keypair, pos.tokenAddress, destAddress, rawBalance);
-        results.push({ ok: true, label: shortAddr(pos.tokenAddress), txHash: signature });
-      } catch (err) {
-        results.push({ ok: false, label: shortAddr(pos.tokenAddress), error: friendlyErrorMessage(err) });
-      }
-    }
-    try {
-      const usdcBalance = await getSplTokenBalanceRaw(getChain('solana').usdcMint, sourceWallet.solAddress);
-      if (usdcBalance > 0n) {
-        const { signature } = await transferSolanaUsdc(keypair, destAddress, usdcBalance);
-        results.push({ ok: true, label: 'USDC', txHash: signature });
-      }
-    } catch (err) {
-      results.push({ ok: false, label: 'USDC', error: friendlyErrorMessage(err) });
-    }
-    return results;
-  }
-
-  const chain = getChain(chainKey);
-  const provider = getEvmProvider(chainKey);
-  const signer = new ethers.Wallet(sourceWallet.privateKey, provider);
-  const { transferToken, getUsdcBalance } = await import('./erc20.js');
-
-  for (const pos of positions) {
-    try {
-      await ensureGasReserve(chainKey, signer, sourceWallet.address);
-      const onChainBalance = await getTokenBalance(provider, pos.tokenAddress, sourceWallet.address);
-      if (onChainBalance <= 0n) continue;
-      const receipt = await transferToken(signer, pos.tokenAddress, destAddress, onChainBalance);
-      results.push({ ok: true, label: shortAddr(pos.tokenAddress), txHash: receipt.hash });
-    } catch (err) {
-      results.push({ ok: false, label: shortAddr(pos.tokenAddress), error: friendlyErrorMessage(err) });
-    }
-  }
-
-  try {
-    const usdcBalance = await getUsdcBalance(provider, chain.usdcAddress, sourceWallet.address);
-    if (usdcBalance > 0n) {
-      await ensureGasReserve(chainKey, signer, sourceWallet.address);
-      const receipt = await transferToken(signer, chain.usdcAddress, destAddress, usdcBalance);
-      results.push({ ok: true, label: chain.stableSymbol || 'USDC', txHash: receipt.hash });
-    }
-  } catch (err) {
-    results.push({ ok: false, label: chain.stableSymbol || 'USDC', error: friendlyErrorMessage(err) });
-  }
-
-  return results;
 }
