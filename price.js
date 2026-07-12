@@ -25,7 +25,7 @@ export function getCachedEthUsdPrice() {
 // pools are paired with the wrapped native token rather than the
 // stablecoin directly (common for brand-new/launchpad tokens — see
 // getUniswapV3MarketData below).
-const NATIVE_COINGECKO_ID = { ETH: 'ethereum', BNB: 'binancecoin' };
+const NATIVE_COINGECKO_ID = { ETH: 'ethereum', BNB: 'binancecoin', SOL: 'solana' };
 const nativePriceCache = new Map(); // symbol -> { value, ts }
 
 async function getNativeUsdPrice(nativeSymbol) {
@@ -157,15 +157,33 @@ async function getPumpFunMarketData(mintAddress) {
   const priceUsd = marketCap / totalSupply;
   if (!Number.isFinite(priceUsd) || priceUsd <= 0) return null;
 
+  // pump.fun's coin endpoint doesn't return a liquidity-in-USD figure
+  // directly — it exposes raw bonding-curve/pool reserves instead
+  // (virtual_sol_reserves / real_sol_reserves, in lamports). We approximate
+  // USD liquidity as 2x the SOL-side reserve (SOL side + equivalent token
+  // side) converted at the live SOL/USD price. This is an ESTIMATE, not an
+  // indexed figure like DexScreener's — prefer real_sol_reserves (actual
+  // pool reserves) over virtual_sol_reserves (bonding-curve virtual
+  // reserves used for pricing) when both are present, since it's closer to
+  // what's actually withdrawable liquidity.
+  let liquidityUsd = null;
+  const lamportReserves = d.real_sol_reserves ?? d.virtual_sol_reserves ?? null;
+  if (lamportReserves != null) {
+    const solReserve = Number(lamportReserves) / 1e9; // lamports -> SOL
+    if (Number.isFinite(solReserve) && solReserve > 0) {
+      const solUsd = await getNativeUsdPrice('SOL').catch(() => null);
+      if (solUsd) {
+        const candidate = solReserve * 2 * solUsd;
+        if (Number.isFinite(candidate) && candidate > 0) liquidityUsd = candidate;
+      }
+    }
+  }
+
   return {
     symbol: d.symbol ?? '???',
     priceUsd,
     marketCap,
-    // pump.fun's coin endpoint doesn't return a liquidity-in-USD figure
-    // directly (it exposes raw bonding-curve/pool reserves instead, which
-    // aren't directly comparable to DexScreener's liquidity figure) —
-    // leave null rather than report a misleading number.
-    liquidityUsd: null,
+    liquidityUsd,
     priceChange24h: null,
   };
 }
@@ -440,4 +458,4 @@ export function fmtTokenAmount(n) {
   if (abs >= 1_000) return `${(n / 1_000).toFixed(2)}K`;
   if (abs >= 1) return n.toFixed(4);
   return n.toFixed(6);
-        }
+}
