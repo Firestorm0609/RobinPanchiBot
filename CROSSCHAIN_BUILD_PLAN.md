@@ -37,29 +37,6 @@ Robinhood, Solana). So this is buildable — no blocker there.
 - `bridge.js` — **NEW as of Phase 1.** Standalone LI.FI REST wrapper. See
   below.
 
-## Recent fixes already shipped (don't redo)
-1. `DEXSCREENER_ROBINHOOD_SLUG` default corrected: 'robinhoodchain' ->
-   'robinhood' (confirmed via live debug logs). Fixed in price.js.
-2. Solana RPC: user added Helius `SOLANA_RPC_URL` — balances now resolve.
-3. `solAddress: null` bug: was just user's OLD wallet being active
-   (pre-multichain wallet) — NOT a code bug. New wallets get both
-   EVM+Solana keypairs correctly via `wallet.js:createWallet()`.
-4. pump.fun liquidity: reserve-based estimate was WRONG (real_sol_reserves
-   is 0 post-graduation, virtual_sol_reserves is stale post-migration —
-   produced numbers ~3x off DexScreener). REPLACED with: use pump.fun for
-   price/mcap, merge in DexScreener's liquidityUsd when available. Shipped
-   in price.js `getTokenMarketData()`.
-5. Chain-auto-switch notification message removed per user request
-   (handlers/text.js) — switch still happens, just silently now.
-6. `PRICE_DEBUG=1` / `[price debug]` and `[format debug]` logging added to
-   price.js and format.js — leave these in, they're gated behind the env
-   var and harmless in production.
-
-All fixed files were delivered as full-file artifacts (not patches) to:
-price.js, format.js, handlers/text.js — user needs to have these three
-already deployed before any bridging work begins. Confirmed at the start
-of this build.
-
 ## Progress so far
 
 ### Phase 0 — Prerequisites — DONE
