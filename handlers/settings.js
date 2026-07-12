@@ -65,12 +65,12 @@ bot.action('settings_toggle_confirm', async (ctx) => {
   await ctx.editMessageText('⚙️ *Settings*', { parse_mode: 'Markdown', ...settingsMenu(ctx.from.id) });
 });
 
-// FIX: menus.js renders a "Flex card PnL: ... (tap to cycle)" button with
-// callback_data 'settings_flexpnl', but there was previously no bot.action
-// handler registered for it at all — tapping it silently did nothing since
-// Telegraf has no matching handler to invoke. Cycles eth -> usd -> hidden.
+// Cycles usdc -> hidden. 'usdc' shows the exact $ PnL on flex/sell cards;
+// 'hidden' shows only the % return. (Previously cycled eth -> usd -> hidden
+// from back when trades were ETH-denominated — simplified now that trades
+// are USDC-denominated directly, see pnl-card.js.)
 bot.action('settings_flexpnl', async (ctx) => {
-  const FLEX_PNL_MODES = ['eth', 'usd', 'hidden'];
+  const FLEX_PNL_MODES = ['usdc', 'hidden'];
   const s = getSettings(ctx.from.id);
   const idx = FLEX_PNL_MODES.indexOf(s.flexPnlMode);
   const next = FLEX_PNL_MODES[(idx + 1) % FLEX_PNL_MODES.length];

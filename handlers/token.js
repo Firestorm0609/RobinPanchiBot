@@ -6,9 +6,9 @@ import {
   walletsMenu, mainMenu, renderTokenCard, limitOrdersText, limitOrdersMenu, confirmMenu,
 } from '../menus.js';
 import { getOpenLimitOrdersForUser, cancelLimitOrder, getSettings, getActiveWallet } from '../storage.js';
-import { getTokenMarketData, getEthUsdPrice } from '../price.js';
+import { getTokenMarketData, fmtUsd } from '../price.js';
 import { shortAddr } from '../wallet.js';
-import { dualEthBalanceLines, gasEstimateLine, fmtAmountLabel } from '../format.js';
+import { dualEthBalanceLines, gasEstimateLine } from '../format.js';
 import { executeBuy, executeSell } from '../trade-core.js';
 import { isRateLimited } from '../ratelimit.js';
 import { FALLBACK_GAS_LIMIT_BUY, FALLBACK_GAS_LIMIT_SELL } from '../config.js';
@@ -19,7 +19,7 @@ bot.action(/^custombuy_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
   await ctx.answerCbQuery();
   pending.set(ctx.from.id, { type: 'custom_buy', tokenAddress: ctx.match[1] });
   await ctx.editMessageText(
-    'Send the amount to spend — USD like `100`, or ETH like `0.03 eth`:',
+    'Send the USD amount to spend, e.g. `100`:',
     { parse_mode: 'Markdown' }
   );
 });
@@ -141,27 +141,27 @@ bot.action(/^refresh_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
 });
 
 // ---------- Buy ----------
+// Amount is USDC (trades are USDC-denominated) — plain USD number, no
+// price-feed conversion needed.
 
 bot.action(/^buy_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   if (isRateLimited(ctx.from.id)) return ctx.reply('⏳ Slow down a bit — too many actions in the last minute.');
-  const [, tokenAddress, ethAmountStr] = ctx.match;
+  const [, tokenAddress, usdcAmountStr] = ctx.match;
   const uid = ctx.from.id;
-  const { confirmTrades, maxBuyEth } = getSettings(uid);
-  const ethAmount = Number(ethAmountStr);
-  const ethUsd = await getEthUsdPrice().catch(() => null);
-  const label = fmtAmountLabel(ethAmount, ethUsd ? ethAmount * ethUsd : null);
-  if (ethAmount > maxBuyEth) {
-    return ctx.editMessageText(`❌ ${label} exceeds your max buy size.`, mainMenu());
+  const { confirmTrades, maxBuyUsdc } = getSettings(uid);
+  const usdcAmount = Number(usdcAmountStr);
+  if (usdcAmount > maxBuyUsdc) {
+    return ctx.editMessageText(`❌ ${fmtUsd(usdcAmount)} exceeds your max buy size.`, mainMenu());
   }
   if (confirmTrades) {
     const gasLine = await gasEstimateLine(uid, FALLBACK_GAS_LIMIT_BUY);
-    await ctx.editMessageText(`Confirm: buy *${label}* worth of this token?${gasLine}`, {
+    await ctx.editMessageText(`Confirm: buy *${fmtUsd(usdcAmount)}* worth of this token?${gasLine}`, {
       parse_mode: 'Markdown',
-      ...confirmMenu('buy', tokenAddress, ethAmountStr),
+      ...confirmMenu('buy', tokenAddress, usdcAmountStr),
     });
   } else {
-    await executeBuy(ctx, uid, tokenAddress, ethAmount);
+    await executeBuy(ctx, uid, tokenAddress, usdcAmount);
   }
 });
 

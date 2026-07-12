@@ -7,10 +7,12 @@ import {
   walletsMenu, mainMenu, batchSelectMenu, batchSellSelectMenu, batchFundSelectMenu, collectSelectMenu,
 } from '../menus.js';
 import { performBuyCore, performSellCore, performCollectCore } from '../trade-core.js';
-import { friendlyErrorMessage, fmtAmountLabel } from '../format.js';
+import { friendlyErrorMessage } from '../format.js';
+import { fmtUsd } from '../price.js';
 import { isRateLimited } from '../ratelimit.js';
 import { sendAdminAlert } from '../alerts.js';
-import { provider, MAX_BATCH_FUND_NEW_WALLETS } from '../config.js';
+import { getUsdcBalance } from '../erc20.js';
+import { USDC_DECIMALS, MAX_BATCH_FUND_NEW_WALLETS } from '../config.js';
 import { shortAddr } from '../wallet.js';
 
 // ---------- Batch Buy ----------
@@ -22,7 +24,7 @@ bot.action(/^batchbuy_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
   if (user.wallets.length < 2) return ctx.reply('You need at least 2 wallets to use Batch Buy.', mainMenu());
   pending.set(uid, { type: 'batch_amount', tokenAddress: ctx.match[1] });
   await ctx.editMessageText(
-    'Send the amount to buy on EACH selected wallet — USD like `50`, or ETH like `0.02 eth`:',
+    'Send the USD amount to buy on EACH selected wallet, e.g. `50`:',
     { parse_mode: 'Markdown' }
   );
 });
@@ -47,28 +49,27 @@ bot.action('batchconfirm', async (ctx) => {
   if (state.selected.length === 0) return ctx.reply('No wallets selected — tap wallets to select, then Confirm.');
   if (isRateLimited(uid)) return ctx.reply('⏳ Slow down a bit — too many actions in the last minute.');
 
-  const { maxBuyEth } = getSettings(uid);
-  if (state.ethAmount > maxBuyEth) {
+  const { maxBuyUsdc } = getSettings(uid);
+  if (state.usdcAmount > maxBuyUsdc) {
     pending.delete(uid);
-    return ctx.reply(`❌ ${fmtAmountLabel(state.ethAmount, state.usdInput)} exceeds your max buy size.`, mainMenu());
+    return ctx.reply(`❌ ${fmtUsd(state.usdcAmount)} exceeds your max buy size.`, mainMenu());
   }
 
   pending.delete(uid);
-  const label = fmtAmountLabel(state.ethAmount, state.usdInput);
-  await ctx.editMessageText(`Buying ${label} on ${state.selected.length} wallet(s)... this may take a moment.`);
+  await ctx.editMessageText(`Buying ${fmtUsd(state.usdcAmount)} on ${state.selected.length} wallet(s)... this may take a moment.`);
 
   const results = [];
   for (const walletId of state.selected) {
     const w = getWallet(uid, walletId);
     if (!w) { results.push({ ok: false, walletName: walletId, error: 'Wallet not found.' }); continue; }
-    const result = await performBuyCore(uid, w, state.tokenAddress, state.ethAmount);
+    const result = await performBuyCore(uid, w, state.tokenAddress, state.usdcAmount);
     results.push(result);
   }
 
   const lines = results.map((r) =>
     r.ok ? `✅ ${r.walletName}: bought (tx \`${r.txHash.slice(0, 12)}...\`)` : `❌ ${r.walletName}: ${r.error}`
   );
-  await ctx.reply(`📦 *Batch Buy Results* — ${label} each\n\n${lines.join('\n')}`, {
+  await ctx.reply(`📦 *Batch Buy Results* — ${fmtUsd(state.usdcAmount)} each\n\n${lines.join('\n')}`, {
     parse_mode: 'Markdown',
     ...mainMenu(),
   });
@@ -129,6 +130,8 @@ bot.action('batchsellconfirm', async (ctx) => {
 });
 
 // ---------- Batch Fund ----------
+// Source wallet is picked by highest USDC balance (the trading currency),
+// not native ETH — gas top-ups happen automatically per-transfer.
 
 bot.action('batchfund_start', async (ctx) => {
   await ctx.answerCbQuery();
@@ -154,7 +157,7 @@ bot.action('batchfund_start', async (ctx) => {
   const balances = await Promise.all(
     user.wallets.map(async (w) => ({
       ...w,
-      balance: await provider.getBalance(w.address).then((b) => Number(ethers.formatEther(b))).catch(() => 0),
+      balance: await getUsdcBalance(w.address).then((b) => Number(ethers.formatUnits(b, USDC_DECIMALS))).catch(() => 0),
     }))
   );
   const source = balances.reduce((a, b) => (b.balance > a.balance ? b : a));
@@ -162,7 +165,7 @@ bot.action('batchfund_start', async (ctx) => {
   if (source.balance <= 0) {
     pending.delete(uid);
     return ctx.editMessageText(
-      '📤 *Batch Fund*\n\nNone of your wallets have an ETH balance to fund others with. Add funds to a wallet first.',
+      '📤 *Batch Fund*\n\nNone of your wallets have a USDC balance to fund others with. Add funds to a wallet first.',
       { parse_mode: 'Markdown', ...walletsMenu(uid) }
     );
   }
@@ -173,7 +176,7 @@ bot.action('batchfund_start', async (ctx) => {
 
   await ctx.editMessageText(
     `📤 *Batch Fund*\n\n` +
-    `Source wallet: *${source.name}* — ${source.balance.toFixed(4)} ETH\n\n` +
+    `Source wallet: *${source.name}* — ${fmtUsd(source.balance)}\n\n` +
     `Select which wallets to fund (the amount you choose next will be sent to EACH one):`,
     { parse_mode: 'Markdown', ...batchFundSelectMenu(candidates, []) }
   );
@@ -207,7 +210,7 @@ bot.action('bfundconfirm', async (ctx) => {
     targets: state.candidates.filter((w) => state.selected.includes(w.id)),
   });
   await ctx.editMessageText(
-    'Send the amount to send to EACH selected wallet — USD like `50`, or ETH like `0.02 eth`:',
+    'Send the USD amount to send to EACH selected wallet, e.g. `50`:',
     { parse_mode: 'Markdown' }
   );
 });
@@ -224,7 +227,7 @@ bot.action('collect_start', async (ctx) => {
   const rows = user.wallets.map((w) => [Markup.button.callback(`${w.name} (${shortAddr(w.address)})`, `collectdest_${w.id}`)]);
   rows.push([Markup.button.callback('❌ Cancel', 'menu_wallets')]);
   await ctx.editMessageText(
-    '📥 *Batch Collect*\n\nChoose the destination wallet — ETH and all tokens from your other wallets will be swept here:',
+    '📥 *Batch Collect*\n\nChoose the destination wallet — USDC and all tokens from your other wallets will be swept here:',
     { parse_mode: 'Markdown', ...Markup.inlineKeyboard(rows) }
   );
 });
@@ -276,7 +279,7 @@ bot.action('collectconfirm', async (ctx) => {
 
   fundsInFlight.add(uid);
   pending.delete(uid);
-  await ctx.editMessageText(`Sweeping ETH + tokens from ${sources.length} wallet(s) into *${dest.name}*... this may take a moment.`, { parse_mode: 'Markdown' });
+  await ctx.editMessageText(`Sweeping USDC + tokens from ${sources.length} wallet(s) into *${dest.name}*... this may take a moment.`, { parse_mode: 'Markdown' });
 
   try {
     const gasMultiplier = gasMultiplierFor(uid);

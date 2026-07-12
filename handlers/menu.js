@@ -3,6 +3,7 @@ import { bot } from '../bot-instance.js';
 import { sendAdminAlert } from '../alerts.js';
 import { isRateLimited } from '../ratelimit.js';
 import { generateFlexCard } from '../pnl-card.js';
+import { fmtUsd } from '../price.js';
 import {
   hasAgreedTerms,
   setAgreedTerms,
@@ -66,7 +67,7 @@ bot.command('flex', async (ctx) => {
     // generateFlexCard handles both an open position (live unrealized PnL)
     // and a closed one (realized PnL from trade history) — it returns null
     // only if there's no trade history at all for this token on this wallet,
-    // or market/price data is unavailable.
+    // or market data is unavailable.
     const cardBuffer = await generateFlexCard(uid, arg);
     if (!cardBuffer) {
       return ctx.reply('No trade history on that token for your active wallet — nothing to flex.', mainMenu());
@@ -91,22 +92,22 @@ bot.command('admin_stats', async (ctx) => {
   if (String(ctx.from.id) !== String(process.env.ADMIN_CHAT_ID)) return;
   const s = getStats();
   const feeBps = Number(process.env.AFFILIATE_FEE_BPS || 0);
-  const estFeesEth = (s.totalVolumeEth * feeBps) / 10000;
+  const estFeesUsdc = (s.totalVolumeUsdc * feeBps) / 10000;
   await ctx.reply(
     `📊 *Admin Stats*\n\n` +
     `Users: ${s.totalUsers}\n` +
     `Wallets: ${s.totalWallets}\n` +
     `Open positions: ${s.openPositions}\n` +
     `Total trades: ${s.totalTrades}\n` +
-    `Total volume: ${s.totalVolumeEth.toFixed(4)} ETH\n` +
-    `Est. fees earned: ${estFeesEth.toFixed(4)} ETH\n` +
+    `Total volume: ${fmtUsd(s.totalVolumeUsdc)}\n` +
+    `Est. fees earned: ${fmtUsd(estFeesUsdc)}\n` +
     `Total referrals: ${s.totalReferrals}\n` +
     `Total bridges: ${s.totalBridges} (completed volume: ${s.totalBridgeVolumeEth.toFixed(4)} ETH)\n` +
     `Active TP/SL rules: ${s.activeAutoRules}\n` +
     `Open limit orders: ${s.openLimitOrders}\n\n` +
     `Last 24h:\n` +
     `Active users: ${s.activeUsers24h}\n` +
-    `Volume: ${s.volume24hEth.toFixed(4)} ETH`,
+    `Volume: ${fmtUsd(s.volume24hUsdc)}`,
     { parse_mode: 'Markdown' }
   );
 });

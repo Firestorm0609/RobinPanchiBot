@@ -6,6 +6,7 @@ import { getEthUsdPrice, getTokenMarketData, fmtUsd } from '../price.js';
 import { getBridgeQuote, estimateBridgeGasEth, BRIDGE_DIRECTION, chainIdsForDirection, ETH_CHAIN_ID } from '../bridge.js';
 import { sendAdminAlert } from '../alerts.js';
 import { isRateLimited } from '../ratelimit.js';
+import { getUsdcBalance } from '../erc20.js';
 import {
   getUser,
   addWallet,
@@ -23,18 +24,18 @@ import {
 } from '../storage.js';
 import {
   provider, ethMainnetProvider, CA_REGEX, FALLBACK_GAS_LIMIT_BUY, FALLBACK_GAS_LIMIT_SELL,
-  MAX_BATCH_FUND_NEW_WALLETS, MIN_BRIDGE_ETH, TERMS_TEXT,
+  MAX_BATCH_FUND_NEW_WALLETS, MIN_BRIDGE_ETH, TERMS_TEXT, USDC_DECIMALS,
 } from '../config.js';
 import { pending, fundsInFlight, lowBalanceWarned, gasMultiplierFor, stopPositionsRefresh } from '../state.js';
 import {
-  dualEthBalanceLines, gasEstimateLine, friendlyErrorMessage, parseEthOrUsdInput, parseBridgeAmountInput,
+  dualEthBalanceLines, gasEstimateLine, friendlyErrorMessage, parseUsdcAmountInput, parseBridgeAmountInput,
   parseMcapInput, mcapToPrice, fmtAmountLabel,
 } from '../format.js';
 import {
   mainMenu, walletsMenu, bridgeConfirmMenu, directionLabel, batchSelectMenu, batchSellSelectMenu, confirmMenu,
   renderTokenCard,
 } from '../menus.js';
-import { executeBuy, executeSell, estimateTransferGasReserve, distributeEth } from '../trade-core.js';
+import { executeBuy, executeSell, estimateTransferGasReserve, distributeUsdc } from '../trade-core.js';
 import { scheduleCardAutoRefresh } from '../autorefresh.js';
 
 bot.on('text', async (ctx) => {
@@ -70,7 +71,7 @@ bot.on('text', async (ctx) => {
       const w = createWallet(text);
       addWallet(uid, w);
       pending.delete(uid);
-      await ctx.reply(`✅ Wallet *${text}* created:\n\`${w.address}\`\n\nFund it with ETH on Robinhood Chain to trade.`, {
+      await ctx.reply(`✅ Wallet *${text}* created:\n\`${w.address}\`\n\nFund it with USDC on Robinhood Chain to trade.`, {
         parse_mode: 'Markdown',
         ...mainMenu(),
       });
@@ -116,18 +117,11 @@ bot.on('text', async (ctx) => {
     }
 
     if (state.type === 'settings_buy') {
-      const usdAmounts = text.split(',').map((s) => parseFloat(s.trim().replace(/^\$/, ''))).filter((n) => !isNaN(n) && n > 0);
-      if (usdAmounts.length === 0) return ctx.reply('Send valid USD numbers, e.g. `10, 50, 200`');
-      let ethUsd;
-      try {
-        ethUsd = await getEthUsdPrice();
-      } catch {
-        return ctx.reply('Price feed is down right now — try again shortly.');
-      }
-      const amounts = usdAmounts.map((usd) => Number((usd / ethUsd).toFixed(6)));
-      updateSettings(uid, { buyPresetsEth: amounts });
+      const amounts = text.split(',').map((s) => parseFloat(s.trim().replace(/^\$/, ''))).filter((n) => !isNaN(n) && n > 0);
+      if (amounts.length === 0) return ctx.reply('Send valid USD numbers, e.g. `10, 50, 200`');
+      updateSettings(uid, { buyPresetsUsdc: amounts });
       pending.delete(uid);
-      await ctx.reply(`✅ Buy presets updated: ${usdAmounts.map((u) => fmtUsd(u)).join(', ')}`, mainMenu());
+      await ctx.reply(`✅ Buy presets updated: ${amounts.map(fmtUsd).join(', ')}`, mainMenu());
       return;
     }
 
@@ -152,20 +146,15 @@ bot.on('text', async (ctx) => {
     if (state.type === 'settings_maxbuy') {
       const usd = parseFloat(text.replace(/^\$/, ''));
       if (isNaN(usd) || usd <= 0) return ctx.reply('Send a valid positive USD amount, e.g. `500`');
-      let ethUsd;
-      try {
-        ethUsd = await getEthUsdPrice();
-      } catch {
-        return ctx.reply('Price feed is down right now — try again shortly.');
-      }
-      const amt = Number((usd / ethUsd).toFixed(6));
-      updateSettings(uid, { maxBuyEth: amt });
+      updateSettings(uid, { maxBuyUsdc: usd });
       pending.delete(uid);
       await ctx.reply(`✅ Max buy size set to ${fmtUsd(usd)}`, mainMenu());
       return;
     }
 
     if (state.type === 'settings_maxbridge') {
+      // Bridging stays ETH-denominated (separate from USDC trading), so
+      // this is still stored/converted in ETH.
       const usd = parseFloat(text.replace(/^\$/, ''));
       if (isNaN(usd) || usd <= 0) return ctx.reply('Send a valid positive USD amount, e.g. `500`');
       let ethUsd;
@@ -195,28 +184,25 @@ bot.on('text', async (ctx) => {
     }
 
     if (state.type === 'custom_buy') {
-      let val, usdInput;
+      let val;
       try {
-        ({ amountEth: val, usdInput } = await parseEthOrUsdInput(text));
+        val = parseUsdcAmountInput(text);
       } catch (err) {
         return ctx.reply(err.message, { parse_mode: 'Markdown' });
       }
 
-      val = Number(val.toFixed(6));
-
-      const { maxBuyEth } = getSettings(uid);
-      if (val > maxBuyEth) {
+      const { maxBuyUsdc } = getSettings(uid);
+      if (val > maxBuyUsdc) {
         pending.delete(uid);
-        return ctx.reply(`❌ ${fmtAmountLabel(val, usdInput)} exceeds your max buy size. Adjust it in Settings if this was intentional.`, mainMenu());
+        return ctx.reply(`❌ ${fmtUsd(val)} exceeds your max buy size. Adjust it in Settings if this was intentional.`, mainMenu());
       }
 
       pending.delete(uid);
 
       const { confirmTrades } = getSettings(uid);
-      const label = fmtAmountLabel(val, usdInput);
       if (confirmTrades) {
         const gasLine = await gasEstimateLine(uid, FALLBACK_GAS_LIMIT_BUY);
-        await ctx.reply(`Confirm: buy *${label}*?${gasLine}`, {
+        await ctx.reply(`Confirm: buy *${fmtUsd(val)}*?${gasLine}`, {
           parse_mode: 'Markdown',
           ...confirmMenu('buy', state.tokenAddress, val),
         });
@@ -295,25 +281,24 @@ bot.on('text', async (ctx) => {
 
       pending.set(uid, { type: 'limitbuy_amount', tokenAddress: state.tokenAddress, triggerPrice, targetMcap });
       await ctx.reply(
-        'Send the amount to spend when triggered — USD like `100`, or ETH like `0.05 eth`:',
+        'Send the USD amount to spend when triggered, e.g. `100`:',
         { parse_mode: 'Markdown' }
       );
       return;
     }
 
     if (state.type === 'limitbuy_amount') {
-      let amt, usdInput;
+      let amt;
       try {
-        ({ amountEth: amt, usdInput } = await parseEthOrUsdInput(text));
+        amt = parseUsdcAmountInput(text);
       } catch (err) {
         return ctx.reply(err.message, { parse_mode: 'Markdown' });
       }
-      amt = Number(amt.toFixed(6));
 
-      const { maxBuyEth } = getSettings(uid);
-      if (amt > maxBuyEth) {
+      const { maxBuyUsdc } = getSettings(uid);
+      if (amt > maxBuyUsdc) {
         pending.delete(uid);
-        return ctx.reply(`❌ ${fmtAmountLabel(amt, usdInput)} exceeds your max buy size (${maxBuyEth} ETH). Adjust it in Settings if this was intentional.`, mainMenu());
+        return ctx.reply(`❌ ${fmtUsd(amt)} exceeds your max buy size (${fmtUsd(maxBuyUsdc)}). Adjust it in Settings if this was intentional.`, mainMenu());
       }
 
       const w = getActiveWallet(uid);
@@ -321,7 +306,7 @@ bot.on('text', async (ctx) => {
       pending.delete(uid);
       createLimitOrder({ uid, walletId: w.id, tokenAddress: state.tokenAddress, side: 'buy', triggerPrice: state.triggerPrice, amount: amt, targetMcap: state.targetMcap });
       await ctx.reply(
-        `✅ Limit buy queued: ${fmtAmountLabel(amt, usdInput)} when mcap ≤ ${fmtUsd(state.targetMcap)}. I'll DM you when it fills.`,
+        `✅ Limit buy queued: ${fmtUsd(amt)} when mcap ≤ ${fmtUsd(state.targetMcap)}. I'll DM you when it fills.`,
         mainMenu()
       );
       return;
@@ -370,14 +355,13 @@ bot.on('text', async (ctx) => {
     }
 
     if (state.type === 'batch_amount') {
-      let amt, usdInput;
+      let amt;
       try {
-        ({ amountEth: amt, usdInput } = await parseEthOrUsdInput(text));
+        amt = parseUsdcAmountInput(text);
       } catch (err) {
         return ctx.reply(err.message, { parse_mode: 'Markdown' });
       }
-      amt = Number(amt.toFixed(6));
-      pending.set(uid, { type: 'batch_select', tokenAddress: state.tokenAddress, ethAmount: amt, usdInput, selected: [] });
+      pending.set(uid, { type: 'batch_select', tokenAddress: state.tokenAddress, usdcAmount: amt, selected: [] });
       await ctx.reply('Select wallets to buy on:', batchSelectMenu(uid, []));
       return;
     }
@@ -409,31 +393,30 @@ bot.on('text', async (ctx) => {
       }
       pending.set(uid, { type: 'batchfund_new_amount', sourceWalletId: state.sourceWalletId, count });
       await ctx.reply(
-        `Send the amount to fund EACH of the ${count} new wallet(s) with — USD like \`50\`, or ETH like \`0.02 eth\`:`,
+        `Send the USD amount to fund EACH of the ${count} new wallet(s) with, e.g. \`50\`:`,
         { parse_mode: 'Markdown' }
       );
       return;
     }
 
     if (state.type === 'batchfund_new_amount') {
-      let amt, usdInput;
+      let amt;
       try {
-        ({ amountEth: amt, usdInput } = await parseEthOrUsdInput(text));
+        amt = parseUsdcAmountInput(text);
       } catch (err) {
         return ctx.reply(err.message, { parse_mode: 'Markdown' });
       }
-      amt = Number(amt.toFixed(6));
 
       const source = getWallet(uid, state.sourceWalletId);
       if (!source) { pending.delete(uid); return ctx.reply('Source wallet not found.', walletsMenu(uid)); }
 
-      const sourceBalance = await provider.getBalance(source.address).then((b) => Number(ethers.formatEther(b))).catch(() => 0);
-      const gasReserve = await estimateTransferGasReserve(uid, state.count);
+      const sourceUsdcBalance = await getUsdcBalance(source.address).then((b) => Number(ethers.formatUnits(b, USDC_DECIMALS))).catch(() => 0);
+      const gasReserve = await estimateTransferGasReserve(source, state.count);
       const totalNeeded = amt * state.count + gasReserve;
-      if (totalNeeded > sourceBalance) {
+      if (totalNeeded > sourceUsdcBalance) {
         pending.delete(uid);
         return ctx.reply(
-          `❌ Need ~${totalNeeded.toFixed(6)} ETH total (${(amt * state.count).toFixed(6)} + ~${gasReserve.toFixed(6)} est. gas) but *${source.name}* only has ${sourceBalance.toFixed(6)} ETH.`,
+          `❌ Need ~${fmtUsd(totalNeeded)} total (${fmtUsd(amt * state.count)} + ~${fmtUsd(gasReserve)} possible gas top-up) but *${source.name}* only has ${fmtUsd(sourceUsdcBalance)}.`,
           { parse_mode: 'Markdown', ...mainMenu() }
         );
       }
@@ -443,8 +426,7 @@ bot.on('text', async (ctx) => {
       fundsInFlight.add(uid);
       pending.delete(uid);
 
-      const label = fmtAmountLabel(amt, usdInput);
-      await ctx.reply(`Creating ${state.count} new wallet(s) and funding each with ${label}... this may take a moment.`);
+      await ctx.reply(`Creating ${state.count} new wallet(s) and funding each with ${fmtUsd(amt)}... this may take a moment.`);
 
       try {
         const newWallets = [];
@@ -455,11 +437,11 @@ bot.on('text', async (ctx) => {
           newWallets.push(w);
         }
 
-        const results = await distributeEth(uid, source, newWallets, amt);
+        const results = await distributeUsdc(uid, source, newWallets, amt);
         const lines = results.map((r) =>
           r.ok ? `✅ ${r.walletName}: funded (tx \`${r.txHash.slice(0, 12)}...\`)` : `❌ ${r.walletName}: ${r.error}`
         );
-        await ctx.reply(`📤 *Batch Fund Results* — ${label} each\n\n${lines.join('\n')}`, {
+        await ctx.reply(`📤 *Batch Fund Results* — ${fmtUsd(amt)} each\n\n${lines.join('\n')}`, {
           parse_mode: 'Markdown',
           ...mainMenu(),
         });
@@ -474,24 +456,23 @@ bot.on('text', async (ctx) => {
     }
 
     if (state.type === 'batchfund_amount') {
-      let amt, usdInput;
+      let amt;
       try {
-        ({ amountEth: amt, usdInput } = await parseEthOrUsdInput(text));
+        amt = parseUsdcAmountInput(text);
       } catch (err) {
         return ctx.reply(err.message, { parse_mode: 'Markdown' });
       }
-      amt = Number(amt.toFixed(6));
 
       const source = getWallet(uid, state.sourceWalletId);
       if (!source) { pending.delete(uid); return ctx.reply('Source wallet not found.', walletsMenu(uid)); }
 
-      const sourceBalance = await provider.getBalance(source.address).then((b) => Number(ethers.formatEther(b))).catch(() => 0);
-      const gasReserve = await estimateTransferGasReserve(uid, state.targets.length);
+      const sourceUsdcBalance = await getUsdcBalance(source.address).then((b) => Number(ethers.formatUnits(b, USDC_DECIMALS))).catch(() => 0);
+      const gasReserve = await estimateTransferGasReserve(source, state.targets.length);
       const totalNeeded = amt * state.targets.length + gasReserve;
-      if (totalNeeded > sourceBalance) {
+      if (totalNeeded > sourceUsdcBalance) {
         pending.delete(uid);
         return ctx.reply(
-          `❌ Need ~${totalNeeded.toFixed(6)} ETH total (${(amt * state.targets.length).toFixed(6)} + ~${gasReserve.toFixed(6)} est. gas) but *${source.name}* only has ${sourceBalance.toFixed(6)} ETH.`,
+          `❌ Need ~${fmtUsd(totalNeeded)} total (${fmtUsd(amt * state.targets.length)} + ~${fmtUsd(gasReserve)} possible gas top-up) but *${source.name}* only has ${fmtUsd(sourceUsdcBalance)}.`,
           { parse_mode: 'Markdown', ...mainMenu() }
         );
       }
@@ -501,15 +482,14 @@ bot.on('text', async (ctx) => {
       fundsInFlight.add(uid);
       pending.delete(uid);
 
-      const label = fmtAmountLabel(amt, usdInput);
-      await ctx.reply(`Funding ${state.targets.length} wallet(s) with ${label} each from *${source.name}*... this may take a moment.`, { parse_mode: 'Markdown' });
+      await ctx.reply(`Funding ${state.targets.length} wallet(s) with ${fmtUsd(amt)} each from *${source.name}*... this may take a moment.`, { parse_mode: 'Markdown' });
 
       try {
-        const results = await distributeEth(uid, source, state.targets, amt);
+        const results = await distributeUsdc(uid, source, state.targets, amt);
         const lines = results.map((r) =>
           r.ok ? `✅ ${r.walletName}: funded (tx \`${r.txHash.slice(0, 12)}...\`)` : `❌ ${r.walletName}: ${r.error}`
         );
-        await ctx.reply(`📤 *Batch Fund Results* — ${label} each\n\n${lines.join('\n')}`, {
+        await ctx.reply(`📤 *Batch Fund Results* — ${fmtUsd(amt)} each\n\n${lines.join('\n')}`, {
           parse_mode: 'Markdown',
           ...mainMenu(),
         });
@@ -524,6 +504,7 @@ bot.on('text', async (ctx) => {
     }
 
     if (state.type === 'bridge_amount') {
+      // Bridging stays ETH-denominated — unaffected by the USDC trading migration.
       let amt, usdInput;
       try {
         ({ amountEth: amt, usdInput } = await parseBridgeAmountInput(text));
