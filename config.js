@@ -50,6 +50,13 @@ export const LIMIT_ORDER_POLL_INTERVAL_MS = 30_000;
 
 export const MAX_BATCH_FUND_NEW_WALLETS = 20; // sane upper bound on wallets-created-in-one-go
 
+// LI.FI has no route below roughly $1.2 (source-side value floor across most
+// paths) and at least one path additionally requires a min transferred
+// amount around 0.035 ETH-equivalent. 0.002 ETH gives comfortable headroom
+// above the ~$1.2 floor at typical ETH prices so users get a clear message
+// instead of a wall of "no available quotes" routing errors from LI.FI.
+export const MIN_BRIDGE_ETH = 0.002;
+
 export const GAS_TIERS = ['slow', 'normal', 'fast'];
 export const GAS_TIER_MULTIPLIERS = { slow: 0.85, normal: 1, fast: 1.35 };
 export const FALLBACK_GAS_LIMIT_BUY = 300_000n;
