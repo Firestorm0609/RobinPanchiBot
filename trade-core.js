@@ -259,7 +259,14 @@ export async function performSwapBuy(uid, wallet, chainKey, tokenAddress, usdcAm
   const address = walletAddressForChain(wallet, chainKey);
 
   if (isSolanaChain(chainKey)) {
-    const curve = await getBondingCurveState(tokenAddress).catch(() => null);
+    let curve = null;
+    try {
+      curve = await getBondingCurveState(tokenAddress);
+    } catch (err) {
+      console.error(`[pump.fun] bonding-curve check failed for ${tokenAddress}, falling back to Jupiter:`, err.message);
+    }
+    console.log(`[pump.fun] ${tokenAddress}: ${curve ? `curve found, complete=${curve.complete}` : 'no curve account (not pump.fun-launched, or lookup failed — see above)'}`);
+
     if (curve && !curve.complete) {
       return performPumpFunBuy(uid, wallet, tokenAddress, usdcAmount, pendingTradeId);
     }
@@ -422,7 +429,14 @@ export async function performSellCore(uid, wallet, chainKey, tokenAddress, pct) 
     pendingTradeId = createPendingTrade({ uid, walletId: wallet.id, chain: chainKey, tokenAddress, side: 'sell', amount: tokenAmount });
 
     if (isSolanaChain(chainKey)) {
-      const curve = await getBondingCurveState(tokenAddress).catch(() => null);
+      let curve = null;
+      try {
+        curve = await getBondingCurveState(tokenAddress);
+      } catch (err) {
+        console.error(`[pump.fun] bonding-curve check failed for ${tokenAddress}, falling back to Jupiter:`, err.message);
+      }
+      console.log(`[pump.fun] ${tokenAddress}: ${curve ? `curve found, complete=${curve.complete}` : 'no curve account (not pump.fun-launched, or lookup failed — see above)'}`);
+
       if (curve && !curve.complete) {
         return await performPumpFunSell(uid, wallet, tokenAddress, pos, rawAmount, tokenAmount, pendingTradeId);
       }
