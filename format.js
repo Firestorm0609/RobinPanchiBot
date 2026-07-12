@@ -1,6 +1,6 @@
 import { ethers } from 'ethers';
 import { getQuote } from './swap.js';
-import { fmtUsd } from './price.js';
+import { fmtUsd, getEthUsdPrice, getCachedEthUsdPrice } from './price.js';
 import { getChain, getEvmProvider, explorerTxUrl, isSolanaChain, isEvmChain, ALL_CHAIN_KEYS, getStableDecimals, stableSymbolFor } from './chains.js';
 import { getSolBalance, getSolanaUsdcBalance } from './solana.js';
 import { getUsdcBalance } from './erc20.js';
@@ -136,6 +136,67 @@ export function formatUnifiedBalanceLines(unified) {
   return `*Total: ${fmtUsd(unified.totalUsd)}*${disclaimer}\n\n${chainLines}`;
 }
 
+// ---------------------------------------------------------------------------
+// Native-token USD pricing for gas-estimate display. Every estimated-gas
+// line shown to the user is now in USD, not the chain's native token amount
+// — a raw ETH/BNB/SOL figure means little to most users; a dollar amount is
+// immediately legible. Solana's line was already a flat USD estimate; this
+// section adds the same for EVM chains (ETH, BNB), using a live USD price
+// with a short cache (mirrors price.js's own 30s ETH cache) plus a
+// conservative fallback price if the live lookup fails, so a network hiccup
+// never blocks showing SOME gas estimate.
+// ---------------------------------------------------------------------------
+
+const NATIVE_COINGECKO_ID = { ETH: 'ethereum', BNB: 'binancecoin' };
+const FALLBACK_NATIVE_USD_PRICE = { ETH: 3000, BNB: 600 }; // high-side, conservative; see gas.js for the same pattern
+
+let nativePriceCache = { symbol: null, value: null, ts: 0 };
+
+async function getNativeUsdPriceCached(nativeSymbol) {
+  // ETH already has a shared cache in price.js — reuse it instead of a
+  // second CoinGecko call for the most common case.
+  if (nativeSymbol === 'ETH') {
+    const cached = getCachedEthUsdPrice();
+    if (cached) return cached;
+    try {
+      return await getEthUsdPrice();
+    } catch {
+      return FALLBACK_NATIVE_USD_PRICE.ETH;
+    }
+  }
+
+  if (nativePriceCache.symbol === nativeSymbol && Date.now() - nativePriceCache.ts < 30_000) {
+    return nativePriceCache.value;
+  }
+
+  const id = NATIVE_COINGECKO_ID[nativeSymbol];
+  if (!id) return FALLBACK_NATIVE_USD_PRICE[nativeSymbol] ?? null;
+
+  try {
+    const axios = (await import('axios')).default;
+    const res = await axios.get('https://api.coingecko.com/api/v3/simple/price', {
+      params: { ids: id, vs_currencies: 'usd' },
+      timeout: 5000,
+    });
+    const price = res.data?.[id]?.usd ?? null;
+    if (price) {
+      nativePriceCache = { symbol: nativeSymbol, value: price, ts: Date.now() };
+      return price;
+    }
+  } catch {
+    // fall through to fallback below
+  }
+  return FALLBACK_NATIVE_USD_PRICE[nativeSymbol] ?? null;
+}
+
+/**
+ * Estimated network fee for a trade/withdrawal, always shown in USD now
+ * (previously showed the raw native-token amount, e.g. "~0.00003 ETH",
+ * which most users can't quickly translate into a cost). Solana was
+ * already a flat USD estimate; EVM chains now convert the computed native
+ * fee into USD via a live (cached) price, falling back to a conservative
+ * hardcoded price if the live lookup fails so a line is always shown.
+ */
 export async function gasEstimateLine(chainKey, uid, fallbackGasLimit) {
   if (isSolanaChain(chainKey)) {
     return '\nEst. network fee: ~$0.01 (Solana)';
@@ -148,7 +209,19 @@ export async function gasEstimateLine(chainKey, uid, fallbackGasLimit) {
     const baseFee = feeData.maxFeePerGas ?? ethers.parseUnits('30', 'gwei');
     const maxFee = (baseFee * BigInt(Math.round(mult * 1000))) / 1000n;
     const gasNative = Number(ethers.formatEther(fallbackGasLimit * maxFee));
-    return `\nEst. gas: ~${gasNative.toFixed(5)} ${chain.nativeSymbol}`;
+
+    const nativeUsdPrice = await getNativeUsdPriceCached(chain.nativeSymbol);
+    if (!nativeUsdPrice) {
+      // Absolute last resort — couldn't price it at all, show native amount
+      // rather than nothing.
+      return `\nEst. gas: ~${gasNative.toFixed(5)} ${chain.nativeSymbol}`;
+    }
+
+    const gasUsd = gasNative * nativeUsdPrice;
+    // Sub-cent fees (common on cheap chains) still deserve a non-zero
+    // display — fmtUsd rounds to 2dp, so show extra precision below $0.01.
+    const gasUsdLabel = gasUsd < 0.01 ? `$${gasUsd.toFixed(4)}` : fmtUsd(gasUsd);
+    return `\nEst. gas: ~${gasUsdLabel}`;
   } catch {
     return '';
   }
