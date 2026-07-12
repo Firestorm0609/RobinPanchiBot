@@ -17,6 +17,7 @@ import {
 import {
   keypairFromPrivateKey, getSplTokenBalanceRaw, getSplTokenDecimals,
 } from './solana.js';
+import { getBondingCurveState, executePumpFunBuy, executePumpFunSell } from './pumpfun.js';
 import { gasMultiplierFor, tradesInFlight } from './state.js';
 import {
   friendlyErrorMessage, getFreshQuote, getChainUsdcBalance,
@@ -167,6 +168,76 @@ async function bridgeShortfall({ wallet, fromChainKey, toChainKey, shortfallUsd,
 }
 
 // ---------------------------------------------------------------------------
+// pump.fun bonding-curve buy/sell — used ONLY for Solana tokens that haven't
+// graduated to an AMM pool yet (Jupiter has no route for those at all; see
+// pumpfun.js). The curve trades native SOL, not USDC, so both legs below
+// bridge through a plain Jupiter USDC<->SOL swap (a deep, always-liquid
+// pair) around the bonding-curve instruction itself.
+// ---------------------------------------------------------------------------
+
+async function performPumpFunBuy(uid, wallet, tokenAddress, usdcAmount, pendingTradeId) {
+  const keypair = keypairFromPrivateKey(wallet.solPrivateKey);
+  await ensureSolanaGasReserve(wallet.solAddress);
+
+  const sellAmountRaw = await toRawUsdc('solana', usdcAmount);
+  const solQuote = await getSolanaQuote({ sellToken: 'USDC', buyToken: 'SOL', sellAmountRaw });
+  const solTx = await buildSolanaSwapTx(solQuote, keypair.publicKey);
+  await sendSolanaSwap(keypair, solTx);
+  const solInLamports = BigInt(solQuote.outAmount);
+
+  const { slippageBps } = getSettings(uid);
+  const { signature, tokensOut } = await executePumpFunBuy(keypair, tokenAddress, solInLamports, slippageBps);
+  markPendingTradeSubmitted(pendingTradeId, signature);
+  markPendingTradeDone(pendingTradeId, 'confirmed');
+
+  const tokenAmount = Number(tokensOut) / 10 ** 6; // pump.fun tokens are always 6 decimals pre-graduation
+  const entryMarket = await getTokenMarketData(tokenAddress, 'solana').catch(() => null);
+  recordTrade(uid, wallet.id, 'solana', tokenAddress, 'buy', tokenAmount, usdcAmount, entryMarket?.marketCap ?? null);
+
+  return {
+    ok: true, txHash: signature, walletName: wallet.name,
+    entryMcap: entryMarket?.marketCap ?? null, viaPumpFunBondingCurve: true,
+  };
+}
+
+async function performPumpFunSell(uid, wallet, tokenAddress, pos, rawAmount, tokenAmount, pendingTradeId) {
+  const keypair = keypairFromPrivateKey(wallet.solPrivateKey);
+  await ensureSolanaGasReserve(wallet.solAddress);
+
+  const { slippageBps } = getSettings(uid);
+  const { signature, solOut } = await executePumpFunSell(keypair, tokenAddress, rawAmount, slippageBps);
+
+  // Convert the received native SOL back into USDC so the position's PnL
+  // stays denominated the same way every other chain's trades are. If this
+  // leg fails, the sell itself already succeeded on-chain — the SOL is safe
+  // in the wallet, just not yet converted, so this is logged rather than
+  // thrown (throwing here would incorrectly mark a successful sell as failed).
+  let usdcReceived = 0;
+  try {
+    const solQuote = await getSolanaQuote({ sellToken: 'SOL', buyToken: 'USDC', sellAmountRaw: solOut });
+    const solTx = await buildSolanaSwapTx(solQuote, keypair.publicKey);
+    await sendSolanaSwap(keypair, solTx);
+    usdcReceived = Number(solQuote.outAmount) / 10 ** getChain('solana').usdcDecimals;
+  } catch (err) {
+    console.error(`Post pump.fun-sell SOL->USDC conversion failed for uid ${uid}, token ${tokenAddress}:`, err.message);
+    // usdcReceived stays 0 — the sell itself succeeded on-chain (SOL is in
+    // the wallet), we just couldn't price/convert it right now. Recorded
+    // as a $0 sell rather than guessing a USD value.
+  }
+
+  markPendingTradeSubmitted(pendingTradeId, signature);
+  markPendingTradeDone(pendingTradeId, 'confirmed');
+
+  const exitMarket = await getTokenMarketData(tokenAddress, 'solana').catch(() => null);
+  recordTrade(uid, wallet.id, 'solana', tokenAddress, 'sell', tokenAmount, usdcReceived, exitMarket?.marketCap ?? null);
+
+  return {
+    ok: true, txHash: signature, walletName: wallet.name, usdcReceived,
+    entryMcap: pos.entryMcap ?? null, exitMcap: exitMarket?.marketCap ?? null, viaPumpFunBondingCurve: true,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Swap execution — factored out of performBuyCore so it can also be called
 // standalone by pollers.js when resuming a trade whose bridge leg completed
 // after a restart (bridge already done, pending_trade already exists;
@@ -178,11 +249,21 @@ async function bridgeShortfall({ wallet, fromChainKey, toChainKey, shortfallUsd,
  * already holds enough stablecoin (bridging, if any, is the caller's job).
  * Does NOT create the pending trade or manage tradesInFlight — caller does
  * both, since this is shared between a fresh buy and a resumed bridge.
+ *
+ * On Solana, first checks whether the token is a pump.fun bonding-curve
+ * token that hasn't graduated yet — if so, routes through pumpfun.js
+ * instead of Jupiter (see performPumpFunBuy above), since Jupiter has no
+ * route for pre-graduation tokens at all.
  */
 export async function performSwapBuy(uid, wallet, chainKey, tokenAddress, usdcAmount, pendingTradeId) {
   const address = walletAddressForChain(wallet, chainKey);
 
   if (isSolanaChain(chainKey)) {
+    const curve = await getBondingCurveState(tokenAddress).catch(() => null);
+    if (curve && !curve.complete) {
+      return performPumpFunBuy(uid, wallet, tokenAddress, usdcAmount, pendingTradeId);
+    }
+
     await ensureSolanaGasReserve(address);
     const keypair = keypairFromPrivateKey(wallet.solPrivateKey);
     const sellAmountRaw = await toRawUsdc(chainKey, usdcAmount);
@@ -341,6 +422,11 @@ export async function performSellCore(uid, wallet, chainKey, tokenAddress, pct) 
     pendingTradeId = createPendingTrade({ uid, walletId: wallet.id, chain: chainKey, tokenAddress, side: 'sell', amount: tokenAmount });
 
     if (isSolanaChain(chainKey)) {
+      const curve = await getBondingCurveState(tokenAddress).catch(() => null);
+      if (curve && !curve.complete) {
+        return await performPumpFunSell(uid, wallet, tokenAddress, pos, rawAmount, tokenAmount, pendingTradeId);
+      }
+
       await ensureSolanaGasReserve(address);
       const keypair = keypairFromPrivateKey(wallet.solPrivateKey);
 
@@ -415,8 +501,9 @@ export async function executeBuy(ctx, uid, tokenAddress, usdcAmount) {
   const txLink = explorerTxUrl(chainKey, result.txHash);
   const mcapLine = result.entryMcap != null ? `\nEntry mcap: ${fmtUsd(result.entryMcap)}` : '';
   const bridgeLine = result.bridged ? `\n_(auto-bridged shortfall from ${getChain(result.bridgeFromChain).name})_` : '';
+  const pumpLine = result.viaPumpFunBondingCurve ? `\n_(bought via pump.fun bonding curve — not yet graduated)_` : '';
   await ctx.reply(
-    (txLink ? `✅ Confirmed on ${chain.name} — [view transaction](${txLink})` : `✅ Confirmed on ${chain.name}`) + mcapLine + bridgeLine,
+    (txLink ? `✅ Confirmed on ${chain.name} — [view transaction](${txLink})` : `✅ Confirmed on ${chain.name}`) + mcapLine + bridgeLine + pumpLine,
     { parse_mode: 'Markdown' }
   );
   const { text, markup } = await renderTokenCard(uid, tokenAddress);
@@ -447,9 +534,10 @@ export async function executeSell(ctx, uid, tokenAddress, pct) {
   if (result.entryMcap != null) mcapLines.push(`Entry mcap: ${fmtUsd(result.entryMcap)}`);
   if (result.exitMcap != null) mcapLines.push(`Exit mcap: ${fmtUsd(result.exitMcap)}`);
   const mcapBlock = mcapLines.length ? `\n${mcapLines.join('\n')}` : '';
+  const pumpLine = result.viaPumpFunBondingCurve ? `\n_(sold via pump.fun bonding curve — not yet graduated)_` : '';
 
   await ctx.reply(
-    (txLink ? `✅ Confirmed on ${chain.name} — [view transaction](${txLink})` : `✅ Confirmed on ${chain.name}`) + mcapBlock,
+    (txLink ? `✅ Confirmed on ${chain.name} — [view transaction](${txLink})` : `✅ Confirmed on ${chain.name}`) + mcapBlock + pumpLine,
     { parse_mode: 'Markdown' }
   );
 
