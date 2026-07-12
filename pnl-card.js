@@ -19,9 +19,13 @@ function escapeXml(str) {
 }
 
 /**
- * Builds the PnL label string according to the user's flexPnlMode setting.
- * mode: 'eth' | 'usd' | 'hidden'
+ * Builds the PnL VALUE label string (ETH or USD amount) according to the
+ * user's flexPnlMode setting. mode: 'eth' | 'usd' | 'hidden'
  * Returns null if the mode is 'hidden' or the required figure isn't available.
+ * NOTE: this only controls the value shown top-right — the PnL percentage
+ * stat at the bottom of the card is shown regardless of mode (see
+ * buildOverlaySvg callers below), since "hidden" only means "don't show my
+ * exact ETH/USD amount", not "don't show my % return".
  */
 function formatPnlLabel(mode, { pnlEth, pnlUsd }) {
   if (mode === 'hidden') return null;
@@ -35,19 +39,19 @@ function formatPnlLabel(mode, { pnlEth, pnlUsd }) {
   return `${pnlEth >= 0 ? '+' : ''}${pnlEth.toFixed(3)} ETH`;
 }
 
-function buildOverlaySvg({ symbol, subtitle, pnlLabel, isWin, stats, nftLabel, footerLeft, footerRight }) {
+function buildOverlaySvg({ symbol, subtitle, pnlLabel, isWin, stats, footerLeft, footerRight }) {
   const pnlColor = isWin ? '#97C459' : '#E24B4A';
 
   const colWidth = (CARD_SIZE - 64) / stats.length;
   const statCols = stats.map((s, i) => {
     const x = 32 + i * colWidth;
     return `
-    <text x="${x}" y="${CARD_SIZE - 118}" font-family="Arial, sans-serif" font-size="20" fill="#888780">${escapeXml(s.label)}</text>
-    <text x="${x}" y="${CARD_SIZE - 88}" font-family="Arial, sans-serif" font-size="29" font-weight="bold" fill="${s.color || '#ffffff'}">${escapeXml(s.value)}</text>`;
+    <text x="${x}" y="${CARD_SIZE - 118}" font-family="Arial, sans-serif" font-size="22" fill="#888780">${escapeXml(s.label)}</text>
+    <text x="${x}" y="${CARD_SIZE - 86}" font-family="Arial, sans-serif" font-size="32" font-weight="bold" fill="${s.color || '#ffffff'}">${escapeXml(s.value)}</text>`;
   }).join('');
 
   const pnlText = pnlLabel
-    ? `<text x="${CARD_SIZE - 32}" y="53" font-family="Arial, sans-serif" font-size="24" font-weight="bold" fill="${pnlColor}" text-anchor="end">${escapeXml(pnlLabel)}</text>`
+    ? `<text x="${CARD_SIZE - 32}" y="53" font-family="Arial, sans-serif" font-size="26" font-weight="bold" fill="${pnlColor}" text-anchor="end">${escapeXml(pnlLabel)}</text>`
     : '';
 
   return `
@@ -61,17 +65,16 @@ function buildOverlaySvg({ symbol, subtitle, pnlLabel, isWin, stats, nftLabel, f
     </defs>
     <rect width="${CARD_SIZE}" height="${CARD_SIZE}" fill="url(#fade)"/>
 
-    <text x="32" y="53" font-family="Arial, sans-serif" font-size="21" font-weight="bold" fill="#ffffff">${escapeXml(nftLabel)}</text>
     ${pnlText}
 
-    <text x="32" y="${CARD_SIZE - 190}" font-family="Arial, sans-serif" font-size="44" font-weight="bold" fill="#ffffff">${escapeXml(symbol)}</text>
-    <text x="32" y="${CARD_SIZE - 158}" font-family="Arial, sans-serif" font-size="22" fill="#B4B2A9">${escapeXml(subtitle)}</text>
+    <text x="32" y="${CARD_SIZE - 190}" font-family="Arial, sans-serif" font-size="48" font-weight="bold" fill="#ffffff">${escapeXml(symbol)}</text>
+    <text x="32" y="${CARD_SIZE - 158}" font-family="Arial, sans-serif" font-size="24" fill="#B4B2A9">${escapeXml(subtitle)}</text>
 
     ${statCols}
 
     <line x1="32" y1="${CARD_SIZE - 56}" x2="${CARD_SIZE - 32}" y2="${CARD_SIZE - 56}" stroke="rgba(255,255,255,0.15)" stroke-width="1"/>
-    <text x="32" y="${CARD_SIZE - 27}" font-family="Arial, sans-serif" font-size="17" fill="#5f5e5a">${escapeXml(footerLeft)}</text>
-    <text x="${CARD_SIZE - 32}" y="${CARD_SIZE - 27}" font-family="Arial, sans-serif" font-size="17" fill="#5f5e5a" text-anchor="end">${escapeXml(footerRight)}</text>
+    <text x="32" y="${CARD_SIZE - 27}" font-family="Arial, sans-serif" font-size="18" fill="#5f5e5a">${escapeXml(footerLeft)}</text>
+    <text x="${CARD_SIZE - 32}" y="${CARD_SIZE - 27}" font-family="Arial, sans-serif" font-size="18" fill="#5f5e5a" text-anchor="end">${escapeXml(footerRight)}</text>
   </svg>`;
 }
 
@@ -82,10 +85,9 @@ function buildOverlaySvg({ symbol, subtitle, pnlLabel, isWin, stats, nftLabel, f
 async function renderCard({ symbol, subtitle, pnlLabel, isWin, stats }) {
   const idx = pickNftIndex();
   const imgPath = path.join(NFT_DIR, `${idx}.jpg`);
-  const nftLabel = `Panchi #${idx}`;
 
   const overlay = Buffer.from(buildOverlaySvg({
-    symbol, subtitle, pnlLabel, isWin, stats, nftLabel,
+    symbol, subtitle, pnlLabel, isWin, stats,
     footerLeft: 't.me/panchitradingbot',
     footerRight: '@robinpanchi',
   }));
@@ -101,6 +103,8 @@ async function renderCard({ symbol, subtitle, pnlLabel, isWin, stats }) {
  * Realized-PnL card for a completed sell. Pass everything already computed
  * by the caller (trade-core.js) — this module doesn't re-fetch trade data.
  * Respects the user's flexPnlMode setting: 'eth' | 'usd' | 'hidden'.
+ * 'hidden' only suppresses the exact ETH/USD PnL value — the % return stat
+ * still shows either way.
  */
 export async function generateSellPnlCard({ uid, symbol, pct, pnlEth, pnlPct, entryMcap, exitMcap }) {
   const { flexPnlMode } = getSettings(uid);
@@ -116,10 +120,8 @@ export async function generateSellPnlCard({ uid, symbol, pct, pnlEth, pnlPct, en
   const stats = [
     { label: 'Entry mcap', value: entryMcap != null ? fmtUsd(entryMcap) : 'n/a' },
     { label: 'Exit mcap', value: exitMcap != null ? fmtUsd(exitMcap) : 'n/a' },
+    { label: 'PnL', value: `${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`, color: isWin ? '#97C459' : '#E24B4A' },
   ];
-  if (flexPnlMode !== 'hidden') {
-    stats.push({ label: 'PnL', value: `${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`, color: isWin ? '#97C459' : '#E24B4A' });
-  }
 
   return renderCard({ symbol, subtitle: `Sold ${pct}% of position`, pnlLabel, isWin, stats });
 }
@@ -147,10 +149,8 @@ async function generateOpenPositionFlexCard(uid, wallet, tokenAddress, pos) {
   const stats = [
     { label: 'Holding', value: fmtTokenAmount(pos.tokenAmount) },
     { label: 'Value', value: fmtUsd(valueUsd) },
+    { label: 'PnL', value: `${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`, color: isWin ? '#97C459' : '#E24B4A' },
   ];
-  if (flexPnlMode !== 'hidden') {
-    stats.push({ label: 'PnL', value: `${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`, color: isWin ? '#97C459' : '#E24B4A' });
-  }
 
   return renderCard({
     symbol: market.symbol,
@@ -190,10 +190,8 @@ async function generateClosedPositionFlexCard(uid, wallet, tokenAddress) {
   const stats = [
     { label: 'Entry mcap', value: entryMcap != null ? fmtUsd(entryMcap) : 'n/a' },
     { label: 'Exit mcap', value: exitMcap != null ? fmtUsd(exitMcap) : 'n/a' },
+    { label: 'PnL', value: `${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`, color: isWin ? '#97C459' : '#E24B4A' },
   ];
-  if (flexPnlMode !== 'hidden') {
-    stats.push({ label: 'PnL', value: `${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`, color: isWin ? '#97C459' : '#E24B4A' });
-  }
 
   return renderCard({ symbol, subtitle: 'Closed position', pnlLabel, isWin, stats });
 }
