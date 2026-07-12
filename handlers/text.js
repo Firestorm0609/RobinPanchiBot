@@ -1,15 +1,12 @@
 import { Markup } from 'telegraf';
 import { bot } from '../bot-instance.js';
-import { createWallet, shortAddr } from '../wallet.js';
+import { createWallet } from '../wallet.js';
 import { getTokenMarketData, findTokenAcrossChains, fmtUsd } from '../price.js';
-import { sendAdminAlert } from '../alerts.js';
 import { isRateLimited } from '../ratelimit.js';
-import { getChain, isSolanaChain } from '../chains.js';
+import { getChain } from '../chains.js';
 import {
-  getUser,
-  addWallet,
-  renameWallet,
   getWallet,
+  renameWallet,
   getActiveWallet,
   getActiveChain,
   setActiveChain,
@@ -21,19 +18,13 @@ import {
   cancelAutoRule,
   getActiveAutoRuleForPosition,
   createLimitOrder,
+  addWallet,
 } from '../storage.js';
-import {
-  CA_REGEX, SOLANA_ADDRESS_REGEX, FALLBACK_GAS_LIMIT_BUY, FALLBACK_GAS_LIMIT_SELL,
-  MAX_BATCH_FUND_NEW_WALLETS, TERMS_TEXT,
-} from '../config.js';
-import { pending, fundsInFlight, gasMultiplierFor, stopPositionsRefresh } from '../state.js';
-import {
-  gasEstimateLine, friendlyErrorMessage, parseUsdcAmountInput, parseMcapInput, mcapToPrice, getChainUsdcBalance,
-} from '../format.js';
-import {
-  mainMenu, walletsMenu, batchSelectMenu, batchSellSelectMenu, confirmMenu, renderTokenCard,
-} from '../menus.js';
-import { executeBuy, executeSell, estimateTransferGasReserve, distributeUsdc } from '../trade-core.js';
+import { CA_REGEX, SOLANA_ADDRESS_REGEX, FALLBACK_GAS_LIMIT_BUY, FALLBACK_GAS_LIMIT_SELL, TERMS_TEXT } from '../config.js';
+import { pending, stopPositionsRefresh } from '../state.js';
+import { gasEstimateLine, friendlyErrorMessage, parseUsdcAmountInput, parseMcapInput, mcapToPrice } from '../format.js';
+import { mainMenu, walletsMenu, confirmMenu, renderTokenCard } from '../menus.js';
+import { executeBuy, executeSell } from '../trade-core.js';
 import { scheduleCardAutoRefresh } from '../autorefresh.js';
 
 /** True if `text` looks like an EVM address or a Solana mint. */
@@ -50,6 +41,10 @@ function isContractAddress(text) {
  * so "does it have data on my currently active chain" is not a safe check
  * to run first: it can silently show/trade the wrong token if the active
  * chain happens to have some (irrelevant) liquidity at that address.
+ *
+ * This is the ONLY place a user's active chain changes now — there's no
+ * manual chain picker anymore, so every trade is on whichever chain this
+ * function decides has the best liquidity for the token just pasted.
  *
  * Returns { chainKey, switched } where chainKey is the chain to render/trade
  * on, and switched is true if we moved the user off their active chain.
@@ -364,149 +359,6 @@ bot.on('text', async (ctx) => {
         `✅ Limit sell queued on ${getChain(state.chain).name}: ${clamped.toFixed(4)} tokens when mcap ≥ ${fmtUsd(state.targetMcap)}. I'll DM you when it fills.`,
         mainMenu()
       );
-      return;
-    }
-
-    if (state.type === 'batch_amount') {
-      let amt;
-      try {
-        amt = parseUsdcAmountInput(text);
-      } catch (err) {
-        return ctx.reply(err.message, { parse_mode: 'Markdown' });
-      }
-      pending.set(uid, { type: 'batch_select', tokenAddress: state.tokenAddress, usdcAmount: amt, selected: [] });
-      await ctx.reply('Select wallets to buy on:', batchSelectMenu(uid, []));
-      return;
-    }
-
-    if (state.type === 'batchsell_pct') {
-      const pct = parseFloat(text);
-      if (isNaN(pct) || pct <= 0 || pct > 100) return ctx.reply('Send a valid percentage (1-100), e.g. `50`');
-
-      const chainKey = getActiveChain(uid);
-      const user = getUser(uid);
-      const candidates = user.wallets.filter((w) => {
-        const pos = getPosition(uid, w.id, chainKey, state.tokenAddress);
-        return pos && pos.tokenAmount > 0;
-      });
-
-      if (candidates.length === 0) {
-        pending.delete(uid);
-        return ctx.reply('No wallets hold a position in this token on your active chain.', mainMenu());
-      }
-
-      pending.set(uid, { type: 'batchsell_select', tokenAddress: state.tokenAddress, pct, candidates, selected: [] });
-      await ctx.reply('Select wallets to sell on:', batchSellSelectMenu(candidates, []));
-      return;
-    }
-
-    if (state.type === 'batchfund_create_count') {
-      const count = parseInt(text, 10);
-      if (isNaN(count) || count <= 0 || count > MAX_BATCH_FUND_NEW_WALLETS) {
-        return ctx.reply(`Send a valid whole number between 1 and ${MAX_BATCH_FUND_NEW_WALLETS}.`);
-      }
-      pending.set(uid, { type: 'batchfund_new_amount', sourceWalletId: state.sourceWalletId, count });
-      await ctx.reply(`Send the USD amount to fund EACH of the ${count} new wallet(s) with, e.g. \`50\`:`, { parse_mode: 'Markdown' });
-      return;
-    }
-
-    if (state.type === 'batchfund_new_amount') {
-      let amt;
-      try {
-        amt = parseUsdcAmountInput(text);
-      } catch (err) {
-        return ctx.reply(err.message, { parse_mode: 'Markdown' });
-      }
-
-      const source = getWallet(uid, state.sourceWalletId);
-      if (!source) { pending.delete(uid); return ctx.reply('Source wallet not found.', walletsMenu(uid)); }
-      const chainKey = getActiveChain(uid);
-
-      const sourceUsdcBalance = await getChainUsdcBalance(source, chainKey).catch(() => 0);
-      const gasReserve = await estimateTransferGasReserve(chainKey, source, state.count);
-      const totalNeeded = amt * state.count + gasReserve;
-      if (totalNeeded > sourceUsdcBalance) {
-        pending.delete(uid);
-        return ctx.reply(
-          `❌ Need ~${fmtUsd(totalNeeded)} total (${fmtUsd(amt * state.count)} + ~${fmtUsd(gasReserve)} possible gas top-up) but *${source.name}* only has ${fmtUsd(sourceUsdcBalance)} on ${getChain(chainKey).name}.`,
-          { parse_mode: 'Markdown', ...mainMenu() }
-        );
-      }
-
-      if (fundsInFlight.has(uid)) return ctx.reply('⏳ A batch fund run is already in progress — please wait for it to finish.');
-      if (isRateLimited(uid)) return ctx.reply('⏳ Slow down a bit — too many actions in the last minute.');
-      fundsInFlight.add(uid);
-      pending.delete(uid);
-
-      await ctx.reply(`Creating ${state.count} new wallet(s) and funding each with ${fmtUsd(amt)} on ${getChain(chainKey).name}... this may take a moment.`);
-
-      try {
-        const newWallets = [];
-        for (let i = 0; i < state.count; i++) {
-          const existingCount = getUser(uid).wallets.length;
-          const w = createWallet(`Wallet ${existingCount + 1}`);
-          addWallet(uid, w);
-          newWallets.push(w);
-        }
-
-        const results = await distributeUsdc(uid, chainKey, source, newWallets, amt);
-        const lines = results.map((r) =>
-          r.ok ? `✅ ${r.walletName}: funded (tx \`${r.txHash.slice(0, 12)}...\`)` : `❌ ${r.walletName}: ${r.error}`
-        );
-        await ctx.reply(`📤 *Batch Fund Results* — ${fmtUsd(amt)} each\n\n${lines.join('\n')}`, { parse_mode: 'Markdown', ...mainMenu() });
-      } catch (err) {
-        console.error(err);
-        await ctx.reply(`❌ Batch fund failed: ${friendlyErrorMessage(err)}`, mainMenu());
-        await sendAdminAlert(ctx.telegram, `Batch fund (new wallets) failed for user ${uid}: ${err.message}`);
-      } finally {
-        fundsInFlight.delete(uid);
-      }
-      return;
-    }
-
-    if (state.type === 'batchfund_amount') {
-      let amt;
-      try {
-        amt = parseUsdcAmountInput(text);
-      } catch (err) {
-        return ctx.reply(err.message, { parse_mode: 'Markdown' });
-      }
-
-      const source = getWallet(uid, state.sourceWalletId);
-      if (!source) { pending.delete(uid); return ctx.reply('Source wallet not found.', walletsMenu(uid)); }
-      const chainKey = getActiveChain(uid);
-
-      const sourceUsdcBalance = await getChainUsdcBalance(source, chainKey).catch(() => 0);
-      const gasReserve = await estimateTransferGasReserve(chainKey, source, state.targets.length);
-      const totalNeeded = amt * state.targets.length + gasReserve;
-      if (totalNeeded > sourceUsdcBalance) {
-        pending.delete(uid);
-        return ctx.reply(
-          `❌ Need ~${fmtUsd(totalNeeded)} total (${fmtUsd(amt * state.targets.length)} + ~${fmtUsd(gasReserve)} possible gas top-up) but *${source.name}* only has ${fmtUsd(sourceUsdcBalance)} on ${getChain(chainKey).name}.`,
-          { parse_mode: 'Markdown', ...mainMenu() }
-        );
-      }
-
-      if (fundsInFlight.has(uid)) return ctx.reply('⏳ A batch fund run is already in progress — please wait for it to finish.');
-      if (isRateLimited(uid)) return ctx.reply('⏳ Slow down a bit — too many actions in the last minute.');
-      fundsInFlight.add(uid);
-      pending.delete(uid);
-
-      await ctx.reply(`Funding ${state.targets.length} wallet(s) with ${fmtUsd(amt)} each from *${source.name}* on ${getChain(chainKey).name}... this may take a moment.`, { parse_mode: 'Markdown' });
-
-      try {
-        const results = await distributeUsdc(uid, chainKey, source, state.targets, amt);
-        const lines = results.map((r) =>
-          r.ok ? `✅ ${r.walletName}: funded (tx \`${r.txHash.slice(0, 12)}...\`)` : `❌ ${r.walletName}: ${r.error}`
-        );
-        await ctx.reply(`📤 *Batch Fund Results* — ${fmtUsd(amt)} each\n\n${lines.join('\n')}`, { parse_mode: 'Markdown', ...mainMenu() });
-      } catch (err) {
-        console.error(err);
-        await ctx.reply(`❌ Batch fund failed: ${friendlyErrorMessage(err)}`, mainMenu());
-        await sendAdminAlert(ctx.telegram, `Batch fund failed for user ${uid}: ${err.message}`);
-      } finally {
-        fundsInFlight.delete(uid);
-      }
       return;
     }
   } catch (err) {
