@@ -41,6 +41,42 @@ function isContractAddress(text) {
   return CA_REGEX.test(text) || SOLANA_ADDRESS_REGEX.test(text);
 }
 
+/**
+ * Resolves which chain a pasted CA should be traded on.
+ *
+ * Always checks liquidity across EVERY supported chain first and picks the
+ * highest-liquidity match — this matters because the same 0x... address
+ * string can be a completely unrelated token on two different EVM chains,
+ * so "does it have data on my currently active chain" is not a safe check
+ * to run first: it can silently show/trade the wrong token if the active
+ * chain happens to have some (irrelevant) liquidity at that address.
+ *
+ * Returns { chainKey, switched } where chainKey is the chain to render/trade
+ * on, and switched is true if we moved the user off their active chain.
+ * chainKey is null if the token has no data on any supported chain.
+ */
+async function resolveChainForCA(uid, tokenAddress) {
+  const activeChain = getActiveChain(uid);
+  const matches = await findTokenAcrossChains(tokenAddress).catch(() => []);
+
+  if (matches.length > 0) {
+    const best = matches[0].chainKey;
+    if (best !== activeChain) {
+      setActiveChain(uid, best);
+      return { chainKey: best, switched: true, from: activeChain };
+    }
+    return { chainKey: best, switched: false };
+  }
+
+  // findTokenAcrossChains found nothing (API hiccup, or DexScreener hasn't
+  // indexed this pair yet) — fall back to a direct check on the active
+  // chain so a real, just-unindexed-by-search token can still be traded.
+  const activeMarket = await getTokenMarketData(tokenAddress, activeChain).catch(() => null);
+  if (activeMarket) return { chainKey: activeChain, switched: false };
+
+  return { chainKey: null, switched: false };
+}
+
 bot.on('text', async (ctx) => {
   const uid = ctx.from.id;
   const state = pending.get(uid);
@@ -57,18 +93,11 @@ bot.on('text', async (ctx) => {
     pending.delete(uid);
     stopPositionsRefresh(uid);
 
-    // If the pasted address has no data on the user's currently active
-    // chain, auto-detect which supported chain it DOES live on (by
-    // liquidity) and switch the user there — this is what makes "just
-    // paste a CA" work without making the user pick a chain first.
-    const activeChain = getActiveChain(uid);
-    const activeMarket = await getTokenMarketData(text, activeChain).catch(() => null);
-    if (!activeMarket) {
-      const matches = await findTokenAcrossChains(text);
-      if (matches.length > 0 && matches[0].chainKey !== activeChain) {
-        setActiveChain(uid, matches[0].chainKey);
-        await ctx.reply(`ℹ️ No liquidity for that token on ${getChain(activeChain).name} — switched you to *${getChain(matches[0].chainKey).name}*, where it does.`, { parse_mode: 'Markdown' });
-      }
+    const { chainKey, switched, from } = await resolveChainForCA(uid, text);
+    if (switched) {
+      const toName = getChain(chainKey).name;
+      const fromName = getChain(from).name;
+      await ctx.reply(`ℹ️ Best liquidity for this token is on *${toName}* — switched you from ${fromName}.`, { parse_mode: 'Markdown' });
     }
 
     const { text: cardText, markup } = await renderTokenCard(uid, text);
