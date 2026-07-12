@@ -8,7 +8,7 @@ import {
 import { getOpenLimitOrdersForUser, cancelLimitOrder, getSettings, getActiveWallet, getActiveChain } from '../storage.js';
 import { getTokenMarketData, fmtUsd } from '../price.js';
 import { shortAddr } from '../wallet.js';
-import { chainBalanceLines, gasEstimateLine } from '../format.js';
+import { chainBalanceLines, gasEstimateLine, getUnifiedUsdBalance, formatUnifiedBalanceLines } from '../format.js';
 import { executeBuy, executeSell } from '../trade-core.js';
 import { isRateLimited } from '../ratelimit.js';
 import { getChain } from '../chains.js';
@@ -111,6 +111,11 @@ bot.action(/^limitordercancel_(.+)$/, async (ctx) => {
 });
 
 // ---------- Balance ----------
+// Leads with the unified total across every chain (Phase 3 of
+// CROSSCHAIN_BUILD_PLAN.md), then keeps the existing active-chain
+// native+stablecoin breakdown below it — the per-chain view stays because
+// it's what a user needs when actually funding a trade on a specific chain,
+// same reasoning as README's "don't just delete the per-chain view" note.
 
 bot.action('menu_balance', async (ctx) => {
   await ctx.answerCbQuery();
@@ -120,9 +125,19 @@ bot.action('menu_balance', async (ctx) => {
   if (!w) return ctx.editMessageText('No active wallet. Add one first.', walletsMenu(uid));
   const chainKey = getActiveChain(uid);
   const chain = getChain(chainKey);
-  const bal = await chainBalanceLines(w, chainKey);
+
+  const [unified, activeChainBal] = await Promise.all([
+    getUnifiedUsdBalance(w).catch(() => null),
+    chainBalanceLines(w, chainKey).catch(() => 'unavailable'),
+  ]);
+
+  const unifiedBlock = unified
+    ? `💰 *${w.name}*\n\n${formatUnifiedBalanceLines(unified)}`
+    : `💰 *${w.name}*\n\nUnified balance unavailable right now.`;
+
   await ctx.editMessageText(
-    `💰 *${w.name}* _(${chain.name})_\n\`${chainKey === 'solana' ? w.solAddress : w.address}\`\n\nBalance:\n${bal}`,
+    `${unifiedBlock}\n\n` +
+    `*Active chain (${chain.name}):*\n\`${chainKey === 'solana' ? w.solAddress : w.address}\`\n${activeChainBal}`,
     { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_main')]]) }
   );
 });
