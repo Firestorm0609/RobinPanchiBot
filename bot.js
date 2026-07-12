@@ -40,7 +40,7 @@ import {
   markPendingBridgeDone,
 } from './storage.js';
 
-import { validateEnv, provider, ethMainnetProvider, CA_REGEX, FALLBACK_GAS_LIMIT_BUY, FALLBACK_GAS_LIMIT_SELL, MAX_BATCH_FUND_NEW_WALLETS, GAS_TIERS, TERMS_TEXT, HELP_TEXT, WELCOME_TEXT } from './config.js';
+import { validateEnv, provider, ethMainnetProvider, CA_REGEX, FALLBACK_GAS_LIMIT_BUY, FALLBACK_GAS_LIMIT_SELL, MAX_BATCH_FUND_NEW_WALLETS, GAS_TIERS, MIN_BRIDGE_ETH, TERMS_TEXT, HELP_TEXT, WELCOME_TEXT } from './config.js';
 import {
   pending, fundsInFlight, lowBalanceWarned, botIdentity, gasMultiplierFor,
   autoRefreshTimers, stopAutoRefresh,
@@ -609,6 +609,13 @@ bot.action(/^bridgeall_(eth_to_robinhood|robinhood_to_eth)$/, async (ctx) => {
 
   const balanceEth = Number(ethers.formatEther(balanceWei));
 
+  if (balanceEth < MIN_BRIDGE_ETH) {
+    return ctx.editMessageText(
+      `❌ Your balance (${fmtEth(balanceEth)} ETH) is below the minimum bridgeable amount (${MIN_BRIDGE_ETH} ETH), even before gas. Add more funds first.`,
+      { parse_mode: 'Markdown', ...bridgeMenu() }
+    );
+  }
+
   // Get an initial quote against the FULL balance purely to obtain a
   // realistic gas estimate for this route (LI.FI's gas estimate for a
   // native-ETH bridge tx doesn't meaningfully change with amount).
@@ -648,6 +655,13 @@ bot.action(/^bridgeall_(eth_to_robinhood|robinhood_to_eth)$/, async (ctx) => {
   sendAmount = Number(sendAmount.toFixed(6));
   if (sendAmount <= 0) {
     return ctx.editMessageText('❌ Nothing left to bridge after gas reserve and your max bridge size cap.', { parse_mode: 'Markdown', ...bridgeMenu() });
+  }
+
+  if (sendAmount < MIN_BRIDGE_ETH) {
+    return ctx.editMessageText(
+      `❌ After reserving gas, only ${sendAmount} ETH would be sent — below the minimum bridgeable amount (${MIN_BRIDGE_ETH} ETH). Add more funds first.`,
+      { parse_mode: 'Markdown', ...bridgeMenu() }
+    );
   }
 
   // Re-quote for the actual amount we're about to offer for confirmation.
@@ -1690,6 +1704,11 @@ bot.on('text', async (ctx) => {
       }
 
       amt = Number(amt.toFixed(6));
+
+      if (amt < MIN_BRIDGE_ETH) {
+        pending.delete(uid);
+        return ctx.reply(`❌ ${fmtAmountLabel(amt, usdInput)} is below the minimum bridgeable amount (${MIN_BRIDGE_ETH} ETH). Bridges below that typically have no valid route since fees exceed the amount.`, mainMenu());
+      }
 
       const { maxBridgeEth } = getSettings(uid);
       if (amt > maxBridgeEth) {
