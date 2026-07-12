@@ -2,7 +2,7 @@ import { ethers } from 'ethers';
 import { getBridgeQuote, sendBridgeTx, chainIdsForDirection, ETH_CHAIN_ID } from './bridge.js';
 import { getSettings, createPendingBridge, markPendingBridgeSubmitted, markPendingBridgeDone, getActiveWallet } from './storage.js';
 import { sendAdminAlert } from './alerts.js';
-import { provider, ethMainnetProvider } from './config.js';
+import { provider, ethMainnetProvider, MIN_BRIDGE_ETH } from './config.js';
 import { gasMultiplierFor, bridgesInFlight } from './state.js';
 import { explorerTxUrlForChain, friendlyErrorMessage } from './format.js';
 import { mainMenu, walletsMenu, directionLabel } from './menus.js';
@@ -10,6 +10,13 @@ import { mainMenu, walletsMenu, directionLabel } from './menus.js';
 export async function executeBridge(ctx, uid, direction, amountEth) {
   const w = getActiveWallet(uid);
   if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
+
+  if (amountEth < MIN_BRIDGE_ETH) {
+    return ctx.reply(
+      `❌ ${amountEth} ETH is below the minimum bridgeable amount (${MIN_BRIDGE_ETH} ETH). Bridges below that typically have no valid route since fees exceed the amount.`,
+      mainMenu()
+    );
+  }
 
   const { maxBridgeEth } = getSettings(uid);
   if (amountEth > maxBridgeEth) {
