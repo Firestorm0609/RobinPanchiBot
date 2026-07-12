@@ -96,19 +96,42 @@ export async function transferSol(signerKeypair, toAddress, lamports) {
   return { signature };
 }
 
-/** Raw balance (bigint) + decimals for ANY SPL token mint — used to resolve exact sell amounts, mirroring erc20.js's getTokenBalance/getDecimals for EVM. */
-export async function getSplTokenBalanceRaw(mintAddress, ownerAddress) {
+/**
+ * Raw balance (bigint) + decimals for ANY SPL token mint — used to resolve
+ * exact sell amounts, mirroring erc20.js's getTokenBalance/getDecimals for EVM.
+ *
+ * RETRY NOTE: right after a buy (esp. a pump.fun bonding-curve buy, which
+ * doesn't go through Jupiter's own confirmation plumbing), the RPC endpoint
+ * serving this read can be a different node/replica than the one that just
+ * confirmed the buy tx, and can lag behind it by a block or two — even
+ * though we awaited 'confirmed' on the buy. That previously showed up as
+ * "No on-chain token balance found to sell" on a sell attempted immediately
+ * after a successful buy, even though the tokens were actually there.
+ * This retries a few times with a short backoff before returning 0n, so a
+ * transient read-your-own-write lag doesn't get reported as "no balance."
+ */
+export async function getSplTokenBalanceRaw(mintAddress, ownerAddress, { retries = 4, retryDelayMs = 500 } = {}) {
   const connection = getSolanaConnection();
   const owner = new PublicKey(ownerAddress);
   const mint = new PublicKey(mintAddress);
   const ata = await getAssociatedTokenAddress(mint, owner);
-  try {
-    const account = await getAccount(connection, ata);
-    return account.amount; // bigint
-  } catch (err) {
-    if (err instanceof TokenAccountNotFoundError) return 0n;
-    throw err;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const account = await getAccount(connection, ata);
+      return account.amount; // bigint
+    } catch (err) {
+      if (err instanceof TokenAccountNotFoundError) {
+        if (attempt < retries) {
+          await new Promise((r) => setTimeout(r, retryDelayMs));
+          continue;
+        }
+        return 0n;
+      }
+      throw err;
+    }
   }
+  return 0n;
 }
 
 export async function getSplTokenDecimals(mintAddress) {
