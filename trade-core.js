@@ -5,7 +5,10 @@ import { ensureGasReserve } from './gas.js';
 import { shortAddr } from './wallet.js';
 import { getSettings, createPendingTrade, markPendingTradeSubmitted, markPendingTradeDone, recordTrade, getPosition, getAllPositions } from './storage.js';
 import { sendAdminAlert } from './alerts.js';
-import { provider, USDC_ROBINHOOD_ADDRESS, USDC_DECIMALS, FALLBACK_GAS_LIMIT_TRANSFER } from './config.js';
+import {
+  provider, USDC_ROBINHOOD_ADDRESS, USDC_DECIMALS, FALLBACK_GAS_LIMIT_TRANSFER,
+  MIN_GAS_ETH_RESERVE, GAS_TOPUP_USDC_AMOUNT,
+} from './config.js';
 import { gasMultiplierFor, tradesInFlight } from './state.js';
 import { explorerTxUrl, friendlyErrorMessage, getFreshQuote } from './format.js';
 import { mainMenu, walletsMenu, renderTokenCard } from './menus.js';
@@ -337,10 +340,10 @@ export async function performSellCore(uid, wallet, tokenAddress, pct) {
   }
 }
 
-// ---------- Headless native ETH transfer (used by Batch Fund / Batch Collect gas sweep) ----------
+// ---------- Headless native ETH transfer (used internally for gas bookkeeping) ----------
 // Same stuck-tx protection shape as swap.js/bridge.js: resubmit with bumped
 // fees if the network is too slow, so a batch run can't hang forever.
-// NOTE: this still moves native ETH, not USDC — used internally for gas
+// NOTE: this moves native ETH, not USDC — used internally for gas
 // bookkeeping (e.g. sweeping leftover ETH during Batch Collect). User-facing
 // fund/collect flows move USDC instead; see performUsdcTransferCore below.
 
@@ -383,9 +386,10 @@ export async function performTransferCore(uid, sourceWallet, toAddress, amountEt
 }
 
 /**
- * Headless USDC transfer — used by Batch Fund / Batch Collect now that
- * balances are USDC-denominated. Ensures the source wallet has gas before
- * sending (via ensureGasReserve), then does a plain ERC-20 transfer.
+ * Headless USDC transfer — used by Batch Fund / Batch Collect (balances are
+ * USDC-denominated). Ensures the source wallet has gas before sending (via
+ * ensureGasReserve, which auto-tops-up ETH from the wallet's own USDC if
+ * needed), then does a plain ERC-20 transfer.
  */
 export async function performUsdcTransferCore(uid, sourceWallet, toAddress, usdcAmount) {
   try {
@@ -406,6 +410,25 @@ export async function distributeUsdc(uid, sourceWallet, targets, usdcAmount) {
     results.push({ ...result, walletName: target.name });
   }
   return results;
+}
+
+/**
+ * Preflight estimate of how much EXTRA USDC a batch-fund run might consume
+ * beyond the amount actually being distributed. ensureGasReserve auto-tops-up
+ * gas by swapping GAS_TOPUP_USDC_AMOUNT of the source wallet's own USDC into
+ * ETH whenever its native ETH balance drops below MIN_GAS_ETH_RESERVE — that
+ * top-up then covers many transfers, so this only needs to reserve for ONE
+ * top-up if the source is already running low, not one per transfer.
+ */
+export async function estimateTransferGasReserve(sourceWallet, count) {
+  try {
+    const ethBalance = await provider.getBalance(sourceWallet.address);
+    const ethBalanceNum = Number(ethers.formatEther(ethBalance));
+    if (ethBalanceNum >= MIN_GAS_ETH_RESERVE) return 0;
+    return GAS_TOPUP_USDC_AMOUNT;
+  } catch {
+    return GAS_TOPUP_USDC_AMOUNT; // can't check — be conservative
+  }
 }
 
 // ---------- Headless collect: sweep USDC + every tracked token from one wallet ----------

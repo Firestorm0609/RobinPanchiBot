@@ -59,24 +59,24 @@ export function exportConfirmMenu(walletId) {
 }
 
 /**
- * Settings amounts (buy presets, max buy, max bridge) are stored in ETH
- * internally, but displayed as USD (mimics FOMO-style UX). Uses the
+ * Bridging is still ETH-denominated (separate from USDC trading), so the
+ * max-bridge-size settings row still needs an ETH->USD estimate. Uses the
  * short-lived cached price since this menu builder is synchronous; falls
- * back to a raw ETH label on the rare case there's no fresh cached price.
+ * back to a raw ETH label if there's no fresh cached price yet.
  */
-function usdOrEthLabel(ethAmount) {
+function bridgeAmountLabel(ethAmount) {
   const ethUsd = getCachedEthUsdPrice();
-  return ethUsd ? fmtUsd(ethAmount * ethUsd) : `${ethAmount} ETH`;
+  return ethUsd ? `${ethAmount} ETH (${fmtUsd(ethAmount * ethUsd)})` : `${ethAmount} ETH`;
 }
 
 export function settingsMenu(uid) {
   const s = getSettings(uid);
   return Markup.inlineKeyboard([
-    [Markup.button.callback(`Buy presets: ${s.buyPresetsEth.map(usdOrEthLabel).join(', ')}`, 'settings_buy')],
+    [Markup.button.callback(`Buy presets: ${s.buyPresetsUsdc.map(fmtUsd).join(', ')}`, 'settings_buy')],
     [Markup.button.callback(`Sell presets: ${s.sellPresetsPct.join(', ')}%`, 'settings_sell')],
     [Markup.button.callback(`Slippage: ${(s.slippageBps / 100).toFixed(2)}%`, 'settings_slippage')],
-    [Markup.button.callback(`Max buy size: ${usdOrEthLabel(s.maxBuyEth)}`, 'settings_maxbuy')],
-    [Markup.button.callback(`Max bridge size: ${usdOrEthLabel(s.maxBridgeEth)}`, 'settings_maxbridge')],
+    [Markup.button.callback(`Max buy size: ${fmtUsd(s.maxBuyUsdc)}`, 'settings_maxbuy')],
+    [Markup.button.callback(`Max bridge size: ${bridgeAmountLabel(s.maxBridgeEth)}`, 'settings_maxbridge')],
     [Markup.button.callback(`Gas priority: ${s.gasTier} (tap to cycle)`, 'settings_gastier')],
     [Markup.button.callback(`Low balance alert: ${s.lowBalanceThresholdEth} ETH`, 'settings_lowbalance')],
     [Markup.button.callback(`Confirm before trade: ${s.confirmTrades ? 'ON ✅' : 'OFF ❌'}`, 'settings_toggle_confirm')],
@@ -119,17 +119,17 @@ export function directionLabel(direction) {
 }
 
 /**
- * `ethUsd` is passed in (fetched once by the caller, e.g. renderTokenCard)
- * so buy preset buttons can show USD amounts, e.g. "Buy $50", while the
- * underlying preset amount (and the buy_ callback payload) stays in ETH.
+ * Trades are USDC-denominated directly (1 USDC ≈ $1), so buy preset amounts
+ * are shown and passed through as plain USD figures — no price-feed
+ * conversion needed anymore.
  */
-export function tokenMenu(uid, tokenAddress, hasPosition, ethUsd) {
+export function tokenMenu(uid, tokenAddress, hasPosition) {
   const s = getSettings(uid);
   const user = getUser(uid);
-  const buyLabel = (amt) => (ethUsd ? `Buy ${fmtUsd(amt * ethUsd)}` : `Buy ${amt} ETH`);
+  const buyLabel = (amt) => `Buy ${fmtUsd(amt)}`;
   const rows = [
-    s.buyPresetsEth.map((amt) => Markup.button.callback(buyLabel(amt), `buy_${tokenAddress}_${amt}`)),
-    [Markup.button.callback('✏️ Custom Buy (USD or ETH)', `custombuy_${tokenAddress}`)],
+    s.buyPresetsUsdc.map((amt) => Markup.button.callback(buyLabel(amt), `buy_${tokenAddress}_${amt}`)),
+    [Markup.button.callback('✏️ Custom Buy (USD)', `custombuy_${tokenAddress}`)],
   ];
   if (hasPosition) {
     rows.push(s.sellPresetsPct.map((pct) => Markup.button.callback(`Sell ${pct}%`, `sell_${tokenAddress}_${pct}`)));
@@ -239,7 +239,7 @@ export function limitOrdersText(orders, marketByToken = new Map()) {
     const mcapLabel = o.target_mcap != null
       ? fmtUsd(o.target_mcap)
       : `$${Number(o.trigger_price).toPrecision(4)} (price)`;
-    const amountLabel = o.side === 'buy' ? `${o.amount} ETH` : `${fmtTokenAmount(Number(o.amount))} tokens`;
+    const amountLabel = o.side === 'buy' ? fmtUsd(o.amount) : `${fmtTokenAmount(Number(o.amount))} tokens`;
     const dir = o.side === 'buy' ? '≤' : '≥';
     return `*${label}* — ${o.side.toUpperCase()} ${amountLabel} @ mcap ${dir} ${mcapLabel}`;
   });
@@ -262,7 +262,6 @@ export async function renderTokenCard(uid, tokenAddress) {
   if (!w) return { text: 'No active wallet. Add one first.', markup: walletsMenu(uid) };
 
   const market = await getTokenMarketData(tokenAddress).catch(() => null);
-  const ethUsd = await getEthUsdPrice().catch(() => null);
 
   if (!market) {
     return {
@@ -278,13 +277,11 @@ export async function renderTokenCard(uid, tokenAddress) {
   let pnlLine = '';
   if (pos && pos.tokenAmount > 0) {
     const currentValueUsd = pos.tokenAmount * market.priceUsd;
-    const costUsd = ethUsd ? pos.costEth * ethUsd : null;
-    if (costUsd !== null) {
-      const pnlUsd = currentValueUsd - costUsd;
-      const pnlPct = costUsd > 0 ? (pnlUsd / costUsd) * 100 : 0;
-      const emoji = pnlUsd >= 0 ? '🟢' : '🔴';
-      pnlLine = `\n\n*Your position:*\n${fmtTokenAmount(pos.tokenAmount)} ${market.symbol}\nCost: ${fmtUsd(costUsd)} | Value: ${fmtUsd(currentValueUsd)}\nPnL: ${emoji} ${fmtUsd(pnlUsd)} (${pnlPct.toFixed(1)}%)`;
-    }
+    const costUsd = pos.costUsdc;
+    const pnlUsd = currentValueUsd - costUsd;
+    const pnlPct = costUsd > 0 ? (pnlUsd / costUsd) * 100 : 0;
+    const emoji = pnlUsd >= 0 ? '🟢' : '🔴';
+    pnlLine = `\n\n*Your position:*\n${fmtTokenAmount(pos.tokenAmount)} ${market.symbol}\nCost: ${fmtUsd(costUsd)} | Value: ${fmtUsd(currentValueUsd)}\nPnL: ${emoji} ${fmtUsd(pnlUsd)} (${pnlPct.toFixed(1)}%)`;
     if (pos.entryMcap != null) {
       pnlLine += `\nEntry mcap: ${fmtUsd(pos.entryMcap)}`;
       if (market.marketCap != null && pos.entryMcap > 0) {
@@ -318,15 +315,11 @@ export async function renderTokenCard(uid, tokenAddress) {
     gasLine +
     pnlLine;
 
-  return { text, markup: tokenMenu(uid, tokenAddress, !!(pos && pos.tokenAmount > 0), ethUsd) };
+  return { text, markup: tokenMenu(uid, tokenAddress, !!(pos && pos.tokenAmount > 0)) };
 }
 
 // ---------- Positions list rendering ----------
-// Covers every open position across ALL of the user's wallets. This used to
-// be split between a per-wallet "Positions" view and an all-wallet
-// "Portfolio" summary — they showed near-identical info, so Positions now
-// does both: a combined total up top, then each position labeled with the
-// wallet it's held in.
+// Covers every open position across ALL of the user's wallets.
 
 export async function renderPositionsView(uid) {
   const positions = getAllPositionsForUser(uid);
@@ -337,7 +330,6 @@ export async function renderPositionsView(uid) {
     };
   }
 
-  const ethUsd = await getEthUsdPrice().catch(() => null);
   const lines = [];
   let totalValueUsd = 0;
   let totalCostUsd = 0;
@@ -346,9 +338,9 @@ export async function renderPositionsView(uid) {
   for (const pos of positions) {
     const market = await getTokenMarketData(pos.tokenAddress).catch(() => null);
     const symbol = market?.symbol ?? shortAddr(pos.tokenAddress);
-    if (market && ethUsd) {
+    if (market) {
       const valueUsd = pos.tokenAmount * market.priceUsd;
-      const costUsd = pos.costEth * ethUsd;
+      const costUsd = pos.costUsdc;
       totalValueUsd += valueUsd;
       totalCostUsd += costUsd;
       const pnlUsd = valueUsd - costUsd;
