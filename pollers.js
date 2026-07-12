@@ -2,7 +2,7 @@ import { ethers } from 'ethers';
 import { getTokenMarketData } from './price.js';
 import { sendAdminAlert } from './alerts.js';
 import {
-  getStuckPendingTrades,
+  getStuckPendingTradesByKind,
   getAllActiveWallets,
   getSettings,
   updateSettings,
@@ -23,17 +23,57 @@ import { performSellCore, performBuyCore } from './trade-core.js';
 
 // ---------- Startup: crash recovery check ----------
 
+/**
+ * On restart, any pending_trades row not in a terminal state means the bot
+ * died mid-trade. Split into two buckets so the admin alert is actually
+ * actionable instead of one undifferentiated wall of "verify manually":
+ *
+ *   - bridgeStuck ('bridging' | 'bridged'): a LI.FI bridge leg was in
+ *     flight or had already landed when the bot died. Funds are very
+ *     likely fine — they're either still in transit (LI.FI itself is
+ *     tracking the route independently of this bot's uptime) or already
+ *     sitting on the destination chain waiting for the swap leg that
+ *     never got to run. This is a RESUMABLE state, not a failure: once
+ *     Phase 4 wires trade-core.js to actually resume from here, this is
+ *     where that resume logic will look. For now (Phase 2), this poller
+ *     only flags it distinctly so the admin doesn't waste time chasing it
+ *     as if funds were lost.
+ *   - swapStuck (everything else unresolved): the same "something broke
+ *     mid-swap, go look at the chain/logs" bucket that existed before
+ *     bridging existed at all — unchanged behavior for same-chain trades.
+ */
 export async function checkStuckTrades(bot) {
-  const stuck = getStuckPendingTrades();
-  if (stuck.length === 0) return;
-  const lines = stuck.map((t) =>
-    `• [${t.chain}] ${t.side} ${t.amount} on ${t.token_address} (user ${t.uid}, status: ${t.status}${t.tx_hash ? `, tx: ${t.tx_hash}` : ''})`
-  );
+  const { bridgeStuck, swapStuck } = getStuckPendingTradesByKind();
+  if (bridgeStuck.length === 0 && swapStuck.length === 0) return;
+
+  const lines = [];
+
+  if (bridgeStuck.length > 0) {
+    lines.push(`🌉 ${bridgeStuck.length} trade(s) stuck mid-bridge (likely recoverable, funds probably safe):`);
+    for (const t of bridgeStuck) {
+      lines.push(
+        `  • [${t.chain}] ${t.side} ${t.amount} on ${t.token_address} (user ${t.uid}, status: ${t.status}` +
+        `${t.bridge_from_chain ? `, from: ${t.bridge_from_chain}` : ''}${t.bridge_hash ? `, bridge tx: ${t.bridge_hash}` : ''})`
+      );
+    }
+  }
+
+  if (swapStuck.length > 0) {
+    lines.push(`⚠️ ${swapStuck.length} trade(s) stuck mid-swap (verify manually):`);
+    for (const t of swapStuck) {
+      lines.push(
+        `  • [${t.chain}] ${t.side} ${t.amount} on ${t.token_address} (user ${t.uid}, status: ${t.status}${t.tx_hash ? `, tx: ${t.tx_hash}` : ''})`
+      );
+    }
+  }
+
   await sendAdminAlert(
     bot.telegram,
-    `Bot restarted with ${stuck.length} unresolved trade(s) from before the crash — verify these manually:\n${lines.join('\n')}`
+    `Bot restarted with ${bridgeStuck.length + swapStuck.length} unresolved trade(s) from before the crash:\n${lines.join('\n')}`
   );
-  console.warn(`${stuck.length} pending trade(s) unresolved from before restart. See admin alert / pending_trades table.`);
+  console.warn(
+    `${bridgeStuck.length} bridge-stuck + ${swapStuck.length} swap-stuck trade(s) unresolved from before restart. See admin alert / pending_trades table.`
+  );
 }
 
 // ---------- Low balance (native gas token) poller ----------
