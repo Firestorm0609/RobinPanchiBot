@@ -1,10 +1,11 @@
 import { ethers } from 'ethers';
 import { getQuote, buildSwapTx, sendSwapWithGasBump } from './swap.js';
 import { ensureAllowance, getDecimals, getTokenBalance, transferToken } from './erc20.js';
+import { ensureGasReserve } from './gas.js';
 import { shortAddr } from './wallet.js';
 import { getSettings, createPendingTrade, markPendingTradeSubmitted, markPendingTradeDone, recordTrade, getPosition, getAllPositions } from './storage.js';
 import { sendAdminAlert } from './alerts.js';
-import { provider, FALLBACK_GAS_LIMIT_TRANSFER } from './config.js';
+import { provider, USDC_ROBINHOOD_ADDRESS, USDC_DECIMALS, FALLBACK_GAS_LIMIT_TRANSFER } from './config.js';
 import { gasMultiplierFor, tradesInFlight } from './state.js';
 import { explorerTxUrl, friendlyErrorMessage, getFreshQuote } from './format.js';
 import { mainMenu, walletsMenu, renderTokenCard } from './menus.js';
@@ -49,15 +50,20 @@ async function resolveSellAmountRaw(tokenAddress, walletAddress, pct) {
   return { rawAmount, decimals, humanAmount };
 }
 
+/** Converts a human USDC amount (e.g. 50, 12.5) into raw smallest-unit string for 0x. */
+function toRawUsdc(usdcAmount) {
+  return ethers.parseUnits(usdcAmount.toString(), USDC_DECIMALS).toString();
+}
+
 // ---------- Shared trade execution (interactive, ctx-based) ----------
 
-export async function executeBuy(ctx, uid, tokenAddress, ethAmount) {
+export async function executeBuy(ctx, uid, tokenAddress, usdcAmount) {
   const w = getActiveWallet(uid);
   if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
 
-  const { maxBuyEth } = getSettings(uid);
-  if (ethAmount > maxBuyEth) {
-    return ctx.reply(`❌ ${ethAmount} ETH exceeds your max buy size (${maxBuyEth} ETH). Adjust it in Settings if this was intentional.`, mainMenu());
+  const { maxBuyUsdc } = getSettings(uid);
+  if (usdcAmount > maxBuyUsdc) {
+    return ctx.reply(`❌ ${fmtUsd(usdcAmount)} exceeds your max buy size (${fmtUsd(maxBuyUsdc)}). Adjust it in Settings if this was intentional.`, mainMenu());
   }
 
   if (tradesInFlight.has(uid)) {
@@ -67,16 +73,21 @@ export async function executeBuy(ctx, uid, tokenAddress, ethAmount) {
 
   let pendingTradeId;
   try {
-    await ctx.reply(`Buying ${ethAmount} ETH worth... fetching quote.`);
-    const sellAmount = ethers.parseEther(ethAmount.toString()).toString();
-    const { slippageBps } = getSettings(uid);
-    const quoteParams = { sellToken: 'ETH', buyToken: tokenAddress, sellAmount, taker: w.address, slippageBps };
+    await ctx.reply(`Buying ${fmtUsd(usdcAmount)} worth... fetching quote.`);
+    const signer = new ethers.Wallet(w.privateKey, provider);
 
-    pendingTradeId = createPendingTrade({ uid, walletId: w.id, tokenAddress, side: 'buy', amount: ethAmount });
+    await ensureGasReserve(signer, w.address);
+
+    const sellAmount = toRawUsdc(usdcAmount);
+    const { slippageBps } = getSettings(uid);
+    const quoteParams = { sellToken: USDC_ROBINHOOD_ADDRESS, buyToken: tokenAddress, sellAmount, taker: w.address, slippageBps };
+
+    pendingTradeId = createPendingTrade({ uid, walletId: w.id, tokenAddress, side: 'buy', amount: usdcAmount });
+
+    await ensureAllowance(signer, USDC_ROBINHOOD_ADDRESS, BigInt(sellAmount));
 
     let quote = await getQuote(quoteParams);
     const fetchedAt = Date.now();
-    const signer = new ethers.Wallet(w.privateKey, provider);
     quote = await getFreshQuote(quoteParams, quote, fetchedAt);
 
     const txRequest = await buildSwapTx(signer, quote);
@@ -87,7 +98,7 @@ export async function executeBuy(ctx, uid, tokenAddress, ethAmount) {
     markPendingTradeDone(pendingTradeId, 'confirmed');
 
     const entryMarket = await getTokenMarketData(tokenAddress).catch(() => null);
-    recordTrade(uid, w.id, tokenAddress, 'buy', Number(quote.buyAmountFormatted), ethAmount, entryMarket?.marketCap ?? null);
+    recordTrade(uid, w.id, tokenAddress, 'buy', Number(quote.buyAmountFormatted), usdcAmount, entryMarket?.marketCap ?? null);
 
     const mcapLine = entryMarket?.marketCap != null ? `\nEntry mcap: ${fmtUsd(entryMarket.marketCap)}` : '';
     await ctx.reply(
@@ -122,12 +133,15 @@ export async function executeSell(ctx, uid, tokenAddress, pct) {
   // basis (still float-based — fine here since it's just PnL display, not
   // an on-chain amount). The actual sell amount is resolved separately from
   // the live on-chain balance below.
-  const costBasisSold = pos.costEth * (pct / 100);
+  const costBasisSold = pos.costUsdc * (pct / 100);
   let pendingTradeId;
   try {
     await ctx.reply(`Selling ${pct}%... fetching quote.`);
+    const signer = new ethers.Wallet(w.privateKey, provider);
 
-    const { rawAmount, decimals, humanAmount: tokenAmount } = await resolveSellAmountRaw(tokenAddress, w.address, pct);
+    await ensureGasReserve(signer, w.address);
+
+    const { rawAmount, humanAmount: tokenAmount } = await resolveSellAmountRaw(tokenAddress, w.address, pct);
     if (rawAmount <= 0n) {
       tradesInFlight.delete(uid);
       return ctx.reply('No on-chain token balance found to sell.', mainMenu());
@@ -135,14 +149,13 @@ export async function executeSell(ctx, uid, tokenAddress, pct) {
     const sellAmount = rawAmount.toString();
 
     const { slippageBps } = getSettings(uid);
-    const signer = new ethers.Wallet(w.privateKey, provider);
 
     pendingTradeId = createPendingTrade({ uid, walletId: w.id, tokenAddress, side: 'sell', amount: tokenAmount });
 
     const approvalReceipt = await ensureAllowance(signer, tokenAddress, rawAmount);
     if (approvalReceipt) await ctx.reply('Approved token for trading (one-time step). Continuing...');
 
-    const quoteParams = { sellToken: tokenAddress, buyToken: 'ETH', sellAmount, taker: w.address, slippageBps };
+    const quoteParams = { sellToken: tokenAddress, buyToken: USDC_ROBINHOOD_ADDRESS, sellAmount, taker: w.address, slippageBps };
     let quote = await getQuote(quoteParams);
     const fetchedAt = Date.now();
     quote = await getFreshQuote(quoteParams, quote, fetchedAt);
@@ -155,8 +168,8 @@ export async function executeSell(ctx, uid, tokenAddress, pct) {
     markPendingTradeDone(pendingTradeId, 'confirmed');
 
     const exitMarket = await getTokenMarketData(tokenAddress).catch(() => null);
-    const ethReceived = Number(quote.buyAmountFormatted);
-    recordTrade(uid, w.id, tokenAddress, 'sell', tokenAmount, ethReceived, exitMarket?.marketCap ?? null);
+    const usdcReceived = Number(quote.buyAmountFormatted);
+    recordTrade(uid, w.id, tokenAddress, 'sell', tokenAmount, usdcReceived, exitMarket?.marketCap ?? null);
 
     const mcapLines = [];
     if (entryMcap != null) mcapLines.push(`Entry mcap: ${fmtUsd(entryMcap)}`);
@@ -173,11 +186,11 @@ export async function executeSell(ctx, uid, tokenAddress, pct) {
     // error, etc.) should never block the trade confirmation the user
     // actually cares about.
     try {
-      const pnlEth = ethReceived - costBasisSold;
-      const pnlPct = costBasisSold > 0 ? (pnlEth / costBasisSold) * 100 : 0;
+      const pnlUsdc = usdcReceived - costBasisSold;
+      const pnlPct = costBasisSold > 0 ? (pnlUsdc / costBasisSold) * 100 : 0;
       const symbol = exitMarket?.symbol ?? shortAddr(tokenAddress);
       const cardBuffer = await generateSellPnlCard({
-        uid, symbol, pct, pnlEth, pnlPct,
+        uid, symbol, pct, pnlUsdc, pnlPct,
         entryMcap: entryMcap ?? null,
         exitMcap: exitMarket?.marketCap ?? null,
       });
@@ -214,21 +227,21 @@ export async function executeSell(ctx, uid, tokenAddress, pct) {
 
 const LOCKED_ERROR = 'Another trade is already in progress for this account — will retry.';
 
-export async function performBuyCore(uid, wallet, tokenAddress, ethAmount) {
+export async function performBuyCore(uid, wallet, tokenAddress, usdcAmount) {
   if (tradesInFlight.has(uid)) {
     return { ok: false, error: LOCKED_ERROR, locked: true, walletName: wallet.name };
   }
 
-  // Re-check maxBuyEth here too (not just at order-creation time) — settings
+  // Re-check maxBuyUsdc here too (not just at order-creation time) — settings
   // may have been lowered between when a limit order / batch buy was queued
   // and when this actually fires. Without this, headless callers (the limit
   // order poller in pollers.js) could execute a buy that bypasses the user's
   // configured spend cap entirely.
-  const { maxBuyEth } = getSettings(uid);
-  if (ethAmount > maxBuyEth) {
+  const { maxBuyUsdc } = getSettings(uid);
+  if (usdcAmount > maxBuyUsdc) {
     return {
       ok: false,
-      error: `Buy of ${ethAmount} ETH exceeds max buy size (${maxBuyEth} ETH).`,
+      error: `Buy of ${fmtUsd(usdcAmount)} exceeds max buy size (${fmtUsd(maxBuyUsdc)}).`,
       walletName: wallet.name,
     };
   }
@@ -237,15 +250,19 @@ export async function performBuyCore(uid, wallet, tokenAddress, ethAmount) {
 
   let pendingTradeId;
   try {
-    const sellAmount = ethers.parseEther(ethAmount.toString()).toString();
-    const { slippageBps } = getSettings(uid);
-    const quoteParams = { sellToken: 'ETH', buyToken: tokenAddress, sellAmount, taker: wallet.address, slippageBps };
+    const signer = new ethers.Wallet(wallet.privateKey, provider);
+    await ensureGasReserve(signer, wallet.address);
 
-    pendingTradeId = createPendingTrade({ uid, walletId: wallet.id, tokenAddress, side: 'buy', amount: ethAmount });
+    const sellAmount = toRawUsdc(usdcAmount);
+    const { slippageBps } = getSettings(uid);
+    const quoteParams = { sellToken: USDC_ROBINHOOD_ADDRESS, buyToken: tokenAddress, sellAmount, taker: wallet.address, slippageBps };
+
+    pendingTradeId = createPendingTrade({ uid, walletId: wallet.id, tokenAddress, side: 'buy', amount: usdcAmount });
+
+    await ensureAllowance(signer, USDC_ROBINHOOD_ADDRESS, BigInt(sellAmount));
 
     let quote = await getQuote(quoteParams);
     const fetchedAt = Date.now();
-    const signer = new ethers.Wallet(wallet.privateKey, provider);
     quote = await getFreshQuote(quoteParams, quote, fetchedAt);
 
     const txRequest = await buildSwapTx(signer, quote);
@@ -254,7 +271,7 @@ export async function performBuyCore(uid, wallet, tokenAddress, ethAmount) {
     markPendingTradeDone(pendingTradeId, 'confirmed');
 
     const entryMarket = await getTokenMarketData(tokenAddress).catch(() => null);
-    recordTrade(uid, wallet.id, tokenAddress, 'buy', Number(quote.buyAmountFormatted), ethAmount, entryMarket?.marketCap ?? null);
+    recordTrade(uid, wallet.id, tokenAddress, 'buy', Number(quote.buyAmountFormatted), usdcAmount, entryMarket?.marketCap ?? null);
 
     return { ok: true, txHash: txResponse.hash, walletName: wallet.name, entryMcap: entryMarket?.marketCap ?? null };
   } catch (err) {
@@ -276,6 +293,9 @@ export async function performSellCore(uid, wallet, tokenAddress, pct) {
     const pos = getPosition(uid, wallet.id, tokenAddress);
     if (!pos || pos.tokenAmount <= 0) return { ok: false, error: 'No position to sell.', walletName: wallet.name };
 
+    const signer = new ethers.Wallet(wallet.privateKey, provider);
+    await ensureGasReserve(signer, wallet.address);
+
     const { rawAmount, humanAmount: tokenAmount } = await resolveSellAmountRaw(tokenAddress, wallet.address, pct);
     if (rawAmount <= 0n) {
       return { ok: false, error: 'No on-chain token balance found to sell.', walletName: wallet.name };
@@ -283,13 +303,12 @@ export async function performSellCore(uid, wallet, tokenAddress, pct) {
     const sellAmount = rawAmount.toString();
 
     const { slippageBps } = getSettings(uid);
-    const signer = new ethers.Wallet(wallet.privateKey, provider);
 
     pendingTradeId = createPendingTrade({ uid, walletId: wallet.id, tokenAddress, side: 'sell', amount: tokenAmount });
 
     await ensureAllowance(signer, tokenAddress, rawAmount);
 
-    const quoteParams = { sellToken: tokenAddress, buyToken: 'ETH', sellAmount, taker: wallet.address, slippageBps };
+    const quoteParams = { sellToken: tokenAddress, buyToken: USDC_ROBINHOOD_ADDRESS, sellAmount, taker: wallet.address, slippageBps };
     let quote = await getQuote(quoteParams);
     const fetchedAt = Date.now();
     quote = await getFreshQuote(quoteParams, quote, fetchedAt);
@@ -306,7 +325,7 @@ export async function performSellCore(uid, wallet, tokenAddress, pct) {
       ok: true,
       txHash: txResponse.hash,
       walletName: wallet.name,
-      ethReceived: Number(quote.buyAmountFormatted),
+      usdcReceived: Number(quote.buyAmountFormatted),
       entryMcap: pos.entryMcap ?? null,
       exitMcap: exitMarket?.marketCap ?? null,
     };
@@ -318,9 +337,12 @@ export async function performSellCore(uid, wallet, tokenAddress, pct) {
   }
 }
 
-// ---------- Headless native ETH transfer (used by Batch Fund / Batch Collect) ----------
+// ---------- Headless native ETH transfer (used by Batch Fund / Batch Collect gas sweep) ----------
 // Same stuck-tx protection shape as swap.js/bridge.js: resubmit with bumped
 // fees if the network is too slow, so a batch run can't hang forever.
+// NOTE: this still moves native ETH, not USDC — used internally for gas
+// bookkeeping (e.g. sweeping leftover ETH during Batch Collect). User-facing
+// fund/collect flows move USDC instead; see performUsdcTransferCore below.
 
 export async function performTransferCore(uid, sourceWallet, toAddress, amountEth, gasMultiplier, { timeoutMs = 45_000, bumpPct = 20, maxAttempts = 4 } = {}) {
   try {
@@ -334,9 +356,6 @@ export async function performTransferCore(uid, sourceWallet, toAddress, amountEt
     let maxPriorityFeePerGas = (basePriorityFee * multBps) / 1000n;
     const value = ethers.parseEther(amountEth.toString());
 
-    // Same stuck-tx protection as swap.js/bridge.js: resubmit the same nonce
-    // with bumped fees if it doesn't confirm in time, instead of reporting a
-    // false "failed" for a transfer that may still land later.
     let lastTxResponse;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       lastTxResponse = await signer.sendTransaction({
@@ -364,45 +383,44 @@ export async function performTransferCore(uid, sourceWallet, toAddress, amountEt
 }
 
 /**
- * Estimated ETH to reserve for gas across `count` sequential native transfers,
- * so a batch fund run doesn't spend the whole source balance on principal and
- * leave nothing for the transactions themselves.
+ * Headless USDC transfer — used by Batch Fund / Batch Collect now that
+ * balances are USDC-denominated. Ensures the source wallet has gas before
+ * sending (via ensureGasReserve), then does a plain ERC-20 transfer.
  */
-export async function estimateTransferGasReserve(uid, count) {
+export async function performUsdcTransferCore(uid, sourceWallet, toAddress, usdcAmount) {
   try {
-    const mult = gasMultiplierFor(uid);
-    const feeData = await provider.getFeeData();
-    const baseFee = feeData.maxFeePerGas ?? ethers.parseUnits('30', 'gwei');
-    const maxFee = (baseFee * BigInt(Math.round(mult * 1000))) / 1000n;
-    const perTxWei = FALLBACK_GAS_LIMIT_TRANSFER * maxFee;
-    return Number(ethers.formatEther(perTxWei * BigInt(count)));
-  } catch {
-    return 0; // fee data unavailable — fall back to no reserve rather than blocking the flow
+    const signer = new ethers.Wallet(sourceWallet.privateKey, provider);
+    await ensureGasReserve(signer, sourceWallet.address);
+    const rawAmount = ethers.parseUnits(usdcAmount.toString(), USDC_DECIMALS);
+    const receipt = await transferToken(signer, USDC_ROBINHOOD_ADDRESS, toAddress, rawAmount);
+    return { ok: true, txHash: receipt.hash };
+  } catch (err) {
+    return { ok: false, error: friendlyErrorMessage(err) };
   }
 }
 
-export async function distributeEth(uid, sourceWallet, targets, amountEth) {
+export async function distributeUsdc(uid, sourceWallet, targets, usdcAmount) {
   const results = [];
-  const gasMultiplier = gasMultiplierFor(uid);
   for (const target of targets) {
-    const result = await performTransferCore(uid, sourceWallet, target.address, amountEth, gasMultiplier);
+    const result = await performUsdcTransferCore(uid, sourceWallet, target.address, usdcAmount);
     results.push({ ...result, walletName: target.name });
   }
   return results;
 }
 
-// ---------- Headless collect: sweep ETH + every tracked token from one wallet ----------
+// ---------- Headless collect: sweep USDC + every tracked token from one wallet ----------
 // Used by Batch Collect. Tokens are sent first (each its own tx, gas paid out
-// of the wallet's native balance), then whatever native ETH remains is swept
-// last, minus a gas reserve for that final transfer.
+// of the wallet's native balance via auto-top-up), then whatever USDC
+// remains is swept last.
 
-export async function performCollectCore(uid, sourceWallet, destAddress, gasMultiplier) {
+export async function performCollectCore(uid, sourceWallet, destAddress) {
   const results = [];
   const signer = new ethers.Wallet(sourceWallet.privateKey, provider);
 
   const positions = getAllPositions(uid, sourceWallet.id);
   for (const pos of positions) {
     try {
+      await ensureGasReserve(signer, sourceWallet.address);
       const onChainBalance = await getTokenBalance(provider, pos.tokenAddress, sourceWallet.address);
       if (onChainBalance <= 0n) continue;
       const receipt = await transferToken(signer, pos.tokenAddress, destAddress, onChainBalance);
@@ -413,22 +431,15 @@ export async function performCollectCore(uid, sourceWallet, destAddress, gasMult
   }
 
   try {
-    const balance = await provider.getBalance(sourceWallet.address);
-    const feeData = await provider.getFeeData();
-    const baseFee = feeData.maxFeePerGas ?? ethers.parseUnits('30', 'gwei');
-    const maxFeePerGas = (baseFee * BigInt(Math.round(gasMultiplier * 1000))) / 1000n;
-    const gasReserve = FALLBACK_GAS_LIMIT_TRANSFER * maxFeePerGas;
-    const sendable = balance - gasReserve;
-
-    if (sendable > 0n) {
-      const amountEth = Number(ethers.formatEther(sendable));
-      const result = await performTransferCore(uid, sourceWallet, destAddress, amountEth, gasMultiplier);
-      results.push(result.ok
-        ? { ok: true, label: 'Robinhood ETH', txHash: result.txHash }
-        : { ok: false, label: 'Robinhood ETH', error: result.error });
+    const { getUsdcBalance } = await import('./erc20.js');
+    const usdcBalance = await getUsdcBalance(sourceWallet.address);
+    if (usdcBalance > 0n) {
+      await ensureGasReserve(signer, sourceWallet.address);
+      const receipt = await transferToken(signer, USDC_ROBINHOOD_ADDRESS, destAddress, usdcBalance);
+      results.push({ ok: true, label: 'USDC', txHash: receipt.hash });
     }
   } catch (err) {
-    results.push({ ok: false, label: 'Robinhood ETH', error: friendlyErrorMessage(err) });
+    results.push({ ok: false, label: 'USDC', error: friendlyErrorMessage(err) });
   }
 
   return results;

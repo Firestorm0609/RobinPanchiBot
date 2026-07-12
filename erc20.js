@@ -1,4 +1,5 @@
 import { ethers } from 'ethers';
+import { provider, USDC_ROBINHOOD_ADDRESS } from './config.js';
 
 // Canonical Permit2 contract address — same on all EVM chains that have it deployed.
 export const PERMIT2_ADDRESS = '0x000000000022D473030F116dDEE9F6B43aC78BA3';
@@ -43,6 +44,17 @@ export async function getDecimals(provider, tokenAddress) {
  */
 export async function getTokenBalance(provider, tokenAddress, ownerAddress) {
   const token = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
+  return token.balanceOf(ownerAddress);
+}
+
+/**
+ * Raw on-chain USDC balance (bigint, smallest unit) for an address.
+ * Used by gas.js to decide whether an auto gas top-up (USDC -> ETH) is
+ * affordable, and anywhere else that needs the "real" USDC balance rather
+ * than the bot's locally tracked figures.
+ */
+export async function getUsdcBalance(ownerAddress) {
+  const token = new ethers.Contract(USDC_ROBINHOOD_ADDRESS, ERC20_ABI, provider);
   return token.balanceOf(ownerAddress);
 }
 

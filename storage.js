@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS positions (
   wallet_id TEXT NOT NULL,
   token_address TEXT NOT NULL,
   token_amount REAL NOT NULL,
-  cost_eth REAL NOT NULL,
+  cost_usdc REAL NOT NULL,
   entry_mcap REAL,
   PRIMARY KEY (uid, wallet_id, token_address)
 );
@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS trade_log (
   wallet_id TEXT NOT NULL,
   token_address TEXT NOT NULL,
   side TEXT NOT NULL,
-  eth_amount REAL NOT NULL,
+  usdc_amount REAL NOT NULL,
   mcap_usd REAL,
   created_at INTEGER NOT NULL
 );
@@ -96,7 +96,7 @@ CREATE TABLE IF NOT EXISTS limit_orders (
   side TEXT NOT NULL, -- 'buy' | 'sell'
   trigger_price REAL NOT NULL, -- USD price (per-token), what the poller actually checks
   target_mcap REAL, -- USD market cap the user actually typed in — display only
-  amount REAL NOT NULL, -- ETH amount for buy side, token amount for sell side
+  amount REAL NOT NULL, -- USDC amount for buy side, token amount for sell side
   status TEXT NOT NULL, -- 'open' | 'filled' | 'cancelled' | 'failed'
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
@@ -136,9 +136,23 @@ if (!positionCols.includes('entry_mcap')) {
   db.exec('ALTER TABLE positions ADD COLUMN entry_mcap REAL');
 }
 
-// Migration: add mcap_usd to trade_log (historical rows get NULL).
+// Migration: rename ETH-denominated columns to USDC-denominated ones.
+// cost_eth -> cost_usdc on positions, eth_amount -> usdc_amount on trade_log.
+// IMPORTANT: this is a rename only, NOT a currency conversion — any existing
+// ETH-denominated values are carried over as-is. If you're migrating a bot
+// that had real ETH-based history, run a one-off script to convert those
+// rows (multiply by the ETH/USD price at each trade's created_at) BEFORE
+// deploying this schema, or accept that old positions' cost basis will be
+// mislabeled as USDC while actually being an ETH figure.
+if (positionCols.includes('cost_eth') && !positionCols.includes('cost_usdc')) {
+  db.exec('ALTER TABLE positions RENAME COLUMN cost_eth TO cost_usdc');
+}
 const tradeLogCols = db.prepare("PRAGMA table_info(trade_log)").all().map((c) => c.name);
-if (!tradeLogCols.includes('mcap_usd')) {
+if (tradeLogCols.includes('eth_amount') && !tradeLogCols.includes('usdc_amount')) {
+  db.exec('ALTER TABLE trade_log RENAME COLUMN eth_amount TO usdc_amount');
+}
+if (!tradeLogCols.includes('mcap_usd') && !tradeLogCols.includes('usdc_amount')) {
+  // Fresh-ish DB from before the mcap_usd migration existed at all.
   db.exec('ALTER TABLE trade_log ADD COLUMN mcap_usd REAL');
 }
 
@@ -150,22 +164,22 @@ if (!limitOrderCols.includes('target_mcap')) {
 }
 
 const DEFAULT_SETTINGS = {
-  buyPresetsEth: [0.01, 0.05, 0.1],
+  buyPresetsUsdc: [10, 50, 100],
   sellPresetsPct: [25, 50, 100],
   slippageBps: 100, // 1%
   confirmTrades: true,
-  maxBuyEth: 1,
-  maxBridgeEth: 1, // mirrors maxBuyEth's guard, applied to bridge amounts
+  maxBuyUsdc: 1000,
+  maxBridgeEth: 1, // bridging is still ETH-denominated (separate from trading) until multichain bridging lands
   // Gas priority tier used to scale maxFeePerGas/maxPriorityFeePerGas on
-  // every trade/bridge tx. See GAS_TIER_MULTIPLIERS in bot.js.
+  // every trade/bridge tx. See GAS_TIER_MULTIPLIERS in config.js.
   gasTier: 'normal', // 'slow' | 'normal' | 'fast'
   // Auto-buy/auto-sell (take-profit / stop-loss). Rules are per-position
   // (auto_rules table) — this flag is currently informational only.
   autoTradeEnabled: false,
-  // DM once when active wallet ETH balance drops below this. Set to 0 to disable.
+  // DM once when active wallet ETH (gas) balance drops below this. Set to 0 to disable.
   lowBalanceThresholdEth: 0.01,
-  // How PnL cards (sell card, /flex) display profit/loss: 'eth' | 'usd' | 'hidden'
-  flexPnlMode: 'eth',
+  // How PnL cards (sell card, /flex) display profit/loss: 'usdc' | 'hidden'
+  flexPnlMode: 'usdc',
 };
 
 function ensureUserRow(uid) {
@@ -243,8 +257,8 @@ export function getWallet(uid, walletId) {
 
 /**
  * Every user's currently-active wallet (uid + address only, no decrypted key).
- * Used by the low-balance poller in bot.js so it doesn't have to decrypt
- * every wallet's private key just to read a balance.
+ * Used by the low-balance poller so it doesn't have to decrypt every
+ * wallet's private key just to read a gas balance.
  */
 export function getAllActiveWallets() {
   return db.prepare(`
@@ -255,17 +269,18 @@ export function getAllActiveWallets() {
 }
 
 // ---------- Positions / PnL ----------
-// Simple running-average cost basis per (wallet, token). entry_mcap tracks
-// the token's market cap (USD) at the time of entry, weighted by ETH spent
-// across buys (same weighting model as cost_eth). It is NOT adjusted on
-// sells — it represents "what mcap you got in at", not a live figure.
+// Simple running-average cost basis per (wallet, token), in USDC.
+// entry_mcap tracks the token's market cap (USD) at the time of entry,
+// weighted by USDC spent across buys (same weighting model as cost_usdc).
+// It is NOT adjusted on sells — it represents "what mcap you got in at",
+// not a live figure.
 
 /**
  * @param {number|null} mcapUsd - token's market cap (USD) at the moment of
  *   this trade. Pass null if unavailable (e.g. price feed down) — entry_mcap
  *   will simply stay whatever it was (or remain null on a fresh position).
  */
-export function recordTrade(uid, walletId, tokenAddress, side, tokenAmount, ethAmount, mcapUsd = null) {
+export function recordTrade(uid, walletId, tokenAddress, side, tokenAmount, usdcAmount, mcapUsd = null) {
   uid = String(uid);
   const key = tokenAddress.toLowerCase();
   const existing = db.prepare(
@@ -273,41 +288,41 @@ export function recordTrade(uid, walletId, tokenAddress, side, tokenAmount, ethA
   ).get(uid, walletId, key);
 
   let pos = existing
-    ? { token_amount: existing.token_amount, cost_eth: existing.cost_eth, entry_mcap: existing.entry_mcap }
-    : { token_amount: 0, cost_eth: 0, entry_mcap: null };
+    ? { token_amount: existing.token_amount, cost_usdc: existing.cost_usdc, entry_mcap: existing.entry_mcap }
+    : { token_amount: 0, cost_usdc: 0, entry_mcap: null };
 
   if (side === 'buy') {
     if (mcapUsd != null) {
-      if (pos.cost_eth > 0 && pos.entry_mcap != null) {
-        // Weighted average entry mcap, weighted by ETH spent (mirrors cost basis math).
-        pos.entry_mcap = (pos.entry_mcap * pos.cost_eth + mcapUsd * ethAmount) / (pos.cost_eth + ethAmount);
+      if (pos.cost_usdc > 0 && pos.entry_mcap != null) {
+        // Weighted average entry mcap, weighted by USDC spent (mirrors cost basis math).
+        pos.entry_mcap = (pos.entry_mcap * pos.cost_usdc + mcapUsd * usdcAmount) / (pos.cost_usdc + usdcAmount);
       } else {
         pos.entry_mcap = mcapUsd;
       }
     }
     pos.token_amount += tokenAmount;
-    pos.cost_eth += ethAmount;
+    pos.cost_usdc += usdcAmount;
   } else {
     const fraction = pos.token_amount > 0 ? Math.min(tokenAmount / pos.token_amount, 1) : 0;
-    pos.cost_eth -= pos.cost_eth * fraction;
+    pos.cost_usdc -= pos.cost_usdc * fraction;
     pos.token_amount = Math.max(pos.token_amount - tokenAmount, 0);
     if (pos.token_amount <= 0) pos.entry_mcap = null; // position closed — clear entry mcap
   }
 
   db.prepare(`
-    INSERT INTO positions (uid, wallet_id, token_address, token_amount, cost_eth, entry_mcap)
+    INSERT INTO positions (uid, wallet_id, token_address, token_amount, cost_usdc, entry_mcap)
     VALUES (?, ?, ?, ?, ?, ?)
     ON CONFLICT(uid, wallet_id, token_address) DO UPDATE SET
       token_amount = excluded.token_amount,
-      cost_eth = excluded.cost_eth,
+      cost_usdc = excluded.cost_usdc,
       entry_mcap = excluded.entry_mcap
-  `).run(uid, walletId, key, pos.token_amount, pos.cost_eth, pos.entry_mcap);
+  `).run(uid, walletId, key, pos.token_amount, pos.cost_usdc, pos.entry_mcap);
 
-  // ethAmount is always the ETH-side value of the trade (spent on buy, received on sell)
+  // usdcAmount is always the USDC-side value of the trade (spent on buy, received on sell)
   db.prepare(`
-    INSERT INTO trade_log (uid, wallet_id, token_address, side, eth_amount, mcap_usd, created_at)
+    INSERT INTO trade_log (uid, wallet_id, token_address, side, usdc_amount, mcap_usd, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(uid, walletId, key, side, ethAmount, mcapUsd, Date.now());
+  `).run(uid, walletId, key, side, usdcAmount, mcapUsd, Date.now());
 }
 
 export function getPosition(uid, walletId, tokenAddress) {
@@ -319,7 +334,7 @@ export function getPosition(uid, walletId, tokenAddress) {
     walletId: row.wallet_id,
     tokenAddress: row.token_address,
     tokenAmount: row.token_amount,
-    costEth: row.cost_eth,
+    costUsdc: row.cost_usdc,
     entryMcap: row.entry_mcap,
   };
 }
@@ -332,7 +347,7 @@ export function getAllPositions(uid, walletId) {
     walletId: row.wallet_id,
     tokenAddress: row.token_address,
     tokenAmount: row.token_amount,
-    costEth: row.cost_eth,
+    costUsdc: row.cost_usdc,
     entryMcap: row.entry_mcap,
   }));
 }
@@ -355,7 +370,7 @@ export function getAllPositionsForUser(uid) {
     walletAddress: row.wallet_address,
     tokenAddress: row.token_address,
     tokenAmount: row.token_amount,
-    costEth: row.cost_eth,
+    costUsdc: row.cost_usdc,
     entryMcap: row.entry_mcap,
   }));
 }
@@ -374,7 +389,7 @@ export function getAllPositionsForUser(uid) {
 export function getRealizedPnl(uid, walletId, tokenAddress) {
   const key = tokenAddress.toLowerCase();
   const rows = db.prepare(`
-    SELECT side, eth_amount, mcap_usd, created_at
+    SELECT side, usdc_amount, mcap_usd, created_at
     FROM trade_log
     WHERE uid = ? AND wallet_id = ? AND token_address = ?
     ORDER BY created_at ASC
@@ -382,22 +397,22 @@ export function getRealizedPnl(uid, walletId, tokenAddress) {
 
   if (rows.length === 0) return null;
 
-  let totalBuyEth = 0;
-  let totalSellEth = 0;
+  let totalBuyUsdc = 0;
+  let totalSellUsdc = 0;
   let entryMcap = null;
   let exitMcap = null;
 
   for (const row of rows) {
     if (row.side === 'buy') {
-      totalBuyEth += row.eth_amount;
+      totalBuyUsdc += row.usdc_amount;
       if (entryMcap === null && row.mcap_usd != null) entryMcap = row.mcap_usd;
     } else {
-      totalSellEth += row.eth_amount;
+      totalSellUsdc += row.usdc_amount;
       if (row.mcap_usd != null) exitMcap = row.mcap_usd; // last non-null sell mcap wins
     }
   }
 
-  return { totalBuyEth, totalSellEth, entryMcap, exitMcap };
+  return { totalBuyUsdc, totalSellUsdc, entryMcap, exitMcap };
 }
 
 // ---------- Settings ----------
@@ -451,6 +466,8 @@ export function getStuckPendingTrades() {
 }
 
 // ---------- Pending bridges (cross-chain, async) ----------
+// Bridging remains ETH-denominated for now — this covers moving native ETH
+// between Ethereum mainnet and Robinhood Chain, separate from USDC trading.
 // Unlike trades, a bridge can take minutes to settle on the destination chain,
 // so the flow is: create row -> mark submitted (source tx confirmed) ->
 // background poller checks LI.FI status periodically -> mark done/failed.
@@ -542,7 +559,7 @@ export function getActiveAutoRulesForUser(uid) {
 // at creation time via mcapToPrice() in format.js.
 // side='buy' fires when market price drops to or below trigger_price;
 // side='sell' fires when it rises to or above it.
-// amount is an ETH amount for buy orders, a token amount for sell orders.
+// amount is a USDC amount for buy orders, a token amount for sell orders.
 
 export function createLimitOrder({ uid, walletId, tokenAddress, side, triggerPrice, amount, targetMcap = null }) {
   const id = `lo_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -585,10 +602,10 @@ export function getStats() {
   const totalUsers = db.prepare('SELECT COUNT(*) c FROM users').get().c;
   const totalWallets = db.prepare('SELECT COUNT(*) c FROM wallets').get().c;
   const totalTrades = db.prepare('SELECT COUNT(*) c FROM trade_log').get().c;
-  const totalVolumeEth = db.prepare('SELECT COALESCE(SUM(eth_amount), 0) v FROM trade_log').get().v;
+  const totalVolumeUsdc = db.prepare('SELECT COALESCE(SUM(usdc_amount), 0) v FROM trade_log').get().v;
   const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
   const activeUsers24h = db.prepare('SELECT COUNT(DISTINCT uid) c FROM trade_log WHERE created_at > ?').get(dayAgo).c;
-  const volume24hEth = db.prepare('SELECT COALESCE(SUM(eth_amount), 0) v FROM trade_log WHERE created_at > ?').get(dayAgo).v;
+  const volume24hUsdc = db.prepare('SELECT COALESCE(SUM(usdc_amount), 0) v FROM trade_log WHERE created_at > ?').get(dayAgo).v;
   const openPositions = db.prepare('SELECT COUNT(*) c FROM positions WHERE token_amount > 0').get().c;
   const totalReferrals = db.prepare('SELECT COUNT(*) c FROM referrals').get().c;
   const totalBridges = db.prepare('SELECT COUNT(*) c FROM pending_bridges').get().c;
@@ -596,7 +613,7 @@ export function getStats() {
   const activeAutoRules = db.prepare(`SELECT COUNT(*) c FROM auto_rules WHERE status = 'active'`).get().c;
   const openLimitOrders = db.prepare(`SELECT COUNT(*) c FROM limit_orders WHERE status = 'open'`).get().c;
   return {
-    totalUsers, totalWallets, totalTrades, totalVolumeEth, activeUsers24h, volume24hEth,
+    totalUsers, totalWallets, totalTrades, totalVolumeUsdc, activeUsers24h, volume24hUsdc,
     openPositions, totalReferrals, totalBridges, totalBridgeVolumeEth, activeAutoRules, openLimitOrders,
   };
 }
