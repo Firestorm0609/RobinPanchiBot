@@ -2,7 +2,7 @@ import sharp from 'sharp';
 import path from 'path';
 import crypto from 'crypto';
 import { getActiveWallet, getPosition, getRealizedPnl, getSettings } from './storage.js';
-import { getTokenMarketData, getEthUsdPrice, fmtUsd, fmtTokenAmount } from './price.js';
+import { getTokenMarketData, fmtUsd, fmtTokenAmount } from './price.js';
 import { shortAddr } from './wallet.js';
 
 const NFT_DIR = path.join(process.cwd(), 'assets', 'nft-cards');
@@ -19,24 +19,19 @@ function escapeXml(str) {
 }
 
 /**
- * Builds the PnL VALUE label string (ETH or USD amount) according to the
- * user's flexPnlMode setting. mode: 'eth' | 'usd' | 'hidden'
- * Returns null if the mode is 'hidden' or the required figure isn't available.
+ * Builds the PnL VALUE label string (USD amount) according to the user's
+ * flexPnlMode setting: 'usdc' | 'hidden'. Returns null if the mode is
+ * 'hidden' or the figure isn't available.
  * NOTE: this only controls the value shown top-right — the PnL percentage
- * stat at the bottom of the card is shown regardless of mode (see
- * buildOverlaySvg callers below), since "hidden" only means "don't show my
- * exact ETH/USD amount", not "don't show my % return".
+ * stat at the bottom of the card is shown regardless of mode, since
+ * "hidden" only means "don't show my exact USD amount", not "don't show
+ * my % return".
  */
-function formatPnlLabel(mode, { pnlEth, pnlUsd }) {
+function formatPnlLabel(mode, pnlUsdc) {
   if (mode === 'hidden') return null;
-  if (mode === 'usd') {
-    if (pnlUsd == null) return null;
-    const sign = pnlUsd >= 0 ? '+' : '-';
-    return `${sign}${fmtUsd(Math.abs(pnlUsd))}`;
-  }
-  // default: 'eth'
-  if (pnlEth == null) return null;
-  return `${pnlEth >= 0 ? '+' : ''}${pnlEth.toFixed(3)} ETH`;
+  if (pnlUsdc == null) return null;
+  const sign = pnlUsdc >= 0 ? '+' : '-';
+  return `${sign}${fmtUsd(Math.abs(pnlUsdc))}`;
 }
 
 function buildOverlaySvg({ symbol, subtitle, pnlLabel, isWin, stats, footerLeft, footerRight }) {
@@ -102,20 +97,13 @@ async function renderCard({ symbol, subtitle, pnlLabel, isWin, stats }) {
 /**
  * Realized-PnL card for a completed sell. Pass everything already computed
  * by the caller (trade-core.js) — this module doesn't re-fetch trade data.
- * Respects the user's flexPnlMode setting: 'eth' | 'usd' | 'hidden'.
- * 'hidden' only suppresses the exact ETH/USD PnL value — the % return stat
- * still shows either way.
+ * Respects the user's flexPnlMode setting: 'usdc' | 'hidden'. 'hidden' only
+ * suppresses the exact USD PnL value — the % return stat still shows either way.
  */
-export async function generateSellPnlCard({ uid, symbol, pct, pnlEth, pnlPct, entryMcap, exitMcap }) {
+export async function generateSellPnlCard({ uid, symbol, pct, pnlUsdc, pnlPct, entryMcap, exitMcap }) {
   const { flexPnlMode } = getSettings(uid);
-  const isWin = pnlEth >= 0;
-
-  let pnlUsd = null;
-  if (flexPnlMode === 'usd') {
-    const ethUsd = await getEthUsdPrice().catch(() => null);
-    if (ethUsd != null) pnlUsd = pnlEth * ethUsd;
-  }
-  const pnlLabel = formatPnlLabel(flexPnlMode, { pnlEth, pnlUsd });
+  const isWin = pnlUsdc >= 0;
+  const pnlLabel = formatPnlLabel(flexPnlMode, pnlUsdc);
 
   const stats = [
     { label: 'Entry mcap', value: entryMcap != null ? fmtUsd(entryMcap) : 'n/a' },
@@ -133,18 +121,16 @@ export async function generateSellPnlCard({ uid, symbol, pct, pnlEth, pnlPct, en
  */
 async function generateOpenPositionFlexCard(uid, wallet, tokenAddress, pos) {
   const market = await getTokenMarketData(tokenAddress).catch(() => null);
-  const ethUsd = await getEthUsdPrice().catch(() => null);
-  if (!market || !ethUsd) return null;
+  if (!market) return null;
 
   const { flexPnlMode } = getSettings(uid);
 
   const valueUsd = pos.tokenAmount * market.priceUsd;
-  const costUsd = pos.costEth * ethUsd;
-  const pnlUsd = valueUsd - costUsd;
-  const pnlEth = pnlUsd / ethUsd;
-  const pnlPct = costUsd > 0 ? (pnlUsd / costUsd) * 100 : 0;
-  const isWin = pnlUsd >= 0;
-  const pnlLabel = formatPnlLabel(flexPnlMode, { pnlEth, pnlUsd });
+  const costUsd = pos.costUsdc;
+  const pnlUsdc = valueUsd - costUsd;
+  const pnlPct = costUsd > 0 ? (pnlUsdc / costUsd) * 100 : 0;
+  const isWin = pnlUsdc >= 0;
+  const pnlLabel = formatPnlLabel(flexPnlMode, pnlUsdc);
 
   const stats = [
     { label: 'Holding', value: fmtTokenAmount(pos.tokenAmount) },
@@ -168,21 +154,15 @@ async function generateOpenPositionFlexCard(uid, wallet, tokenAddress, pos) {
  */
 async function generateClosedPositionFlexCard(uid, wallet, tokenAddress) {
   const realized = getRealizedPnl(uid, wallet.id, tokenAddress);
-  if (!realized || realized.totalBuyEth <= 0) return null;
+  if (!realized || realized.totalBuyUsdc <= 0) return null;
 
   const { flexPnlMode } = getSettings(uid);
 
-  const { totalBuyEth, totalSellEth, entryMcap, exitMcap } = realized;
-  const pnlEth = totalSellEth - totalBuyEth;
-  const pnlPct = (pnlEth / totalBuyEth) * 100;
-  const isWin = pnlEth >= 0;
-
-  let pnlUsd = null;
-  if (flexPnlMode === 'usd') {
-    const ethUsd = await getEthUsdPrice().catch(() => null);
-    if (ethUsd != null) pnlUsd = pnlEth * ethUsd;
-  }
-  const pnlLabel = formatPnlLabel(flexPnlMode, { pnlEth, pnlUsd });
+  const { totalBuyUsdc, totalSellUsdc, entryMcap, exitMcap } = realized;
+  const pnlUsdc = totalSellUsdc - totalBuyUsdc;
+  const pnlPct = (pnlUsdc / totalBuyUsdc) * 100;
+  const isWin = pnlUsdc >= 0;
+  const pnlLabel = formatPnlLabel(flexPnlMode, pnlUsdc);
 
   const market = await getTokenMarketData(tokenAddress).catch(() => null);
   const symbol = market?.symbol ?? shortAddr(tokenAddress);
