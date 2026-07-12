@@ -86,6 +86,56 @@ export async function allChainsBalanceSummary(wallet) {
   return lines.join('\n');
 }
 
+// ---------------------------------------------------------------------------
+// Unified balance (Phase 3 of CROSSCHAIN_BUILD_PLAN.md) — "FOMO-style" single
+// USD number across every chain. This is a DISPLAY-ONLY snapshot sum: each
+// chain's stablecoin balance is fetched live (same calls as
+// allChainsBalanceSummary) and added together. It is NOT an atomic or
+// spendable balance — chains can't be pooled without actually bridging
+// (that's Phase 4's job), so this number can be higher than what's usable
+// on any single chain if funds are spread out. Every chain's settlement
+// stablecoin (USDC, or USDG on Robinhood) is ~1:1 USD-pegged, so summing
+// raw balances across chains is a reasonable USD total without needing a
+// price feed.
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns { totalUsd, chains, anyUnavailable }.
+ * `chains` is every supported chain's stablecoin balance, in ALL_CHAIN_KEYS
+ * order, always present (0 or the fetched value) — a chain that errored out
+ * has `usd: null` and doesn't contribute to totalUsd, but still gets a row
+ * so the per-chain breakdown doesn't silently drop it.
+ */
+export async function getUnifiedUsdBalance(wallet) {
+  const results = await Promise.all(
+    ALL_CHAIN_KEYS.map(async (chainKey) => {
+      const chain = getChain(chainKey);
+      const symbol = stableSymbolFor(chainKey);
+      try {
+        const usd = await getChainUsdcBalance(wallet, chainKey);
+        return { chainKey, name: chain.name, symbol, usd };
+      } catch (err) {
+        dbg('getUnifiedUsdBalance: chain failed', { chainKey, message: err.message });
+        return { chainKey, name: chain.name, symbol, usd: null };
+      }
+    })
+  );
+
+  const totalUsd = results.reduce((sum, r) => sum + (r.usd ?? 0), 0);
+  const anyUnavailable = results.some((r) => r.usd === null);
+
+  return { totalUsd, chains: results, anyUnavailable };
+}
+
+/** Formats getUnifiedUsdBalance()'s result into the "Total: $X\nChain: $Y ..." block used on Balance/Wallets views. */
+export function formatUnifiedBalanceLines(unified) {
+  const chainLines = unified.chains
+    .map((c) => `  ${c.name}: ${c.usd === null ? 'unavailable' : `${fmtUsd(c.usd)} ${c.symbol}`}`)
+    .join('\n');
+  const disclaimer = unified.anyUnavailable ? '\n_Total excludes chains with unavailable balances._' : '';
+  return `*Total: ${fmtUsd(unified.totalUsd)}*${disclaimer}\n\n${chainLines}`;
+}
+
 export async function gasEstimateLine(chainKey, uid, fallbackGasLimit) {
   if (isSolanaChain(chainKey)) {
     return '\nEst. network fee: ~$0.01 (Solana)';
