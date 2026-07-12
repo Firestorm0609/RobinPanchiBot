@@ -555,7 +555,7 @@ bot.action('menu_bridge', async (ctx) => {
     `Move ETH between Ethereum mainnet and Robinhood Chain.\n` +
     `Active wallet: *${w.name}* (\`${shortAddr(w.address)}\`)\n\n` +
     `*Your balances:*\n${balanceLinesArr.join('\n')}\n\n` +
-    `You'll be able to enter the amount in USD or ETH.`,
+    `You'll be able to enter the amount in USD or ETH, or use 💯 Bridge All to send your full balance minus gas.`,
     { parse_mode: 'Markdown', ...bridgeMenu() }
   );
 });
@@ -576,6 +576,103 @@ bot.action(/^bridge_dir_(eth_to_robinhood|robinhood_to_eth)$/, async (ctx) => {
   await ctx.editMessageText(
     `Send the amount to bridge (${directionLabel(direction)}) — USD like \`100\`, or ETH like \`0.05 eth\`:${sourceBalanceLine}`,
     { parse_mode: 'Markdown' }
+  );
+});
+
+// ---------- Bridge All ----------
+// Reads the wallet's live source-chain balance, gets a bridge quote to work
+// out the actual gas cost, reserves gas (+20% buffer so a congestion-driven
+// fee bump at send time doesn't push the tx over the reserved amount), caps
+// at the user's maxBridgeEth if needed, then hands off to the SAME confirm
+// screen / bridge_confirm_ handler as a manual amount — no new send path.
+bot.action(/^bridgeall_(eth_to_robinhood|robinhood_to_eth)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const dirKey = ctx.match[1];
+  const direction = dirKey === 'eth_to_robinhood' ? BRIDGE_DIRECTION.ETH_TO_ROBINHOOD : BRIDGE_DIRECTION.ROBINHOOD_TO_ETH;
+  const uid = ctx.from.id;
+
+  const w = getActiveWallet(uid);
+  if (!w) return ctx.editMessageText('No active wallet. Add one first.', walletsMenu(uid));
+
+  await ctx.editMessageText(`🌉 *${directionLabel(direction)}* — Bridge All\n\nCalculating your full balance minus gas...`, { parse_mode: 'Markdown' });
+
+  const { fromChain } = chainIdsForDirection(direction);
+  const sourceProvider = fromChain === ETH_CHAIN_ID ? ethMainnetProvider : provider;
+
+  const balanceWei = await sourceProvider.getBalance(w.address).catch(() => null);
+  if (balanceWei === null) {
+    return ctx.editMessageText('❌ Could not read your balance right now — try again shortly.', { parse_mode: 'Markdown', ...bridgeMenu() });
+  }
+  if (balanceWei <= 0n) {
+    return ctx.editMessageText('You have no balance on the source chain to bridge.', { parse_mode: 'Markdown', ...bridgeMenu() });
+  }
+
+  const balanceEth = Number(ethers.formatEther(balanceWei));
+
+  // Get an initial quote against the FULL balance purely to obtain a
+  // realistic gas estimate for this route (LI.FI's gas estimate for a
+  // native-ETH bridge tx doesn't meaningfully change with amount).
+  let probeQuote;
+  try {
+    probeQuote = await getBridgeQuote({ direction, amountEth: balanceEth, fromAddress: w.address });
+  } catch (err) {
+    return ctx.editMessageText(`❌ Couldn't get a bridge quote: ${friendlyErrorMessage(err)}`, { parse_mode: 'Markdown', ...bridgeMenu() });
+  }
+
+  const gasMultiplier = gasMultiplierFor(uid);
+  const gasEth = await estimateBridgeGasEth(sourceProvider, probeQuote, gasMultiplier).catch(() => null);
+  if (gasEth === null) {
+    return ctx.editMessageText('❌ Could not estimate gas for this route right now — try a manual amount instead.', { parse_mode: 'Markdown', ...bridgeMenu() });
+  }
+
+  // 20% buffer on top of the estimate — sendBridgeTx can resubmit with
+  // bumped fees if the network is congested, so leave room for that instead
+  // of the tx failing from insufficient balance after "bridge all".
+  const gasReserve = gasEth * 1.2;
+  let sendAmount = balanceEth - gasReserve;
+
+  if (sendAmount <= 0) {
+    return ctx.editMessageText(
+      `❌ Balance too low to cover gas.\nBalance: ${fmtEth(balanceEth)} ETH\nEst. gas reserve needed: ~${gasReserve.toFixed(6)} ETH`,
+      { parse_mode: 'Markdown', ...bridgeMenu() }
+    );
+  }
+
+  const { maxBridgeEth } = getSettings(uid);
+  let cappedNote = '';
+  if (sendAmount > maxBridgeEth) {
+    sendAmount = maxBridgeEth;
+    cappedNote = `\n_Capped at your max bridge size (${maxBridgeEth} ETH) — adjust in Settings if you want to send more._`;
+  }
+
+  sendAmount = Number(sendAmount.toFixed(6));
+  if (sendAmount <= 0) {
+    return ctx.editMessageText('❌ Nothing left to bridge after gas reserve and your max bridge size cap.', { parse_mode: 'Markdown', ...bridgeMenu() });
+  }
+
+  // Re-quote for the actual amount we're about to offer for confirmation.
+  let finalQuote;
+  try {
+    finalQuote = await getBridgeQuote({ direction, amountEth: sendAmount, fromAddress: w.address });
+  } catch (err) {
+    return ctx.editMessageText(`❌ Couldn't get a bridge quote: ${friendlyErrorMessage(err)}`, { parse_mode: 'Markdown', ...bridgeMenu() });
+  }
+
+  const ethUsd = await getEthUsdPrice().catch(() => null);
+  const sendLabel = fmtAmountLabel(sendAmount, ethUsd ? sendAmount * ethUsd : null);
+
+  await ctx.editMessageText(
+    `🌉 *${directionLabel(direction)}* — Bridge All\n\n` +
+    `Balance: ${fmtEth(balanceEth)} ETH\n` +
+    `Reserved for gas: ~${gasReserve.toFixed(6)} ETH\n` +
+    `Send: ${sendLabel}\n` +
+    `Receive (est.): ${Number(finalQuote.toAmountFormatted).toFixed(4)} ETH\n` +
+    `Fees (est.): ${fmtUsd(finalQuote.feesUsd)}\n` +
+    `Via: ${finalQuote.tool || 'best available route'}\n` +
+    `ETA: ~${finalQuote.estimatedDurationSeconds ? Math.ceil(finalQuote.estimatedDurationSeconds / 60) + ' min' : 'a few minutes'}` +
+    cappedNote +
+    `\n\nConfirm?`,
+    { parse_mode: 'Markdown', ...bridgeConfirmMenu(dirKey, sendAmount) }
   );
 });
 
