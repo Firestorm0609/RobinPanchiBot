@@ -1,14 +1,12 @@
 import { ethers } from 'ethers';
 import { getQuote, buildSwapTx, sendSwapWithGasBump } from './swap.js';
-import { getUsdcBalance } from './erc20.js';
+import { getUsdcBalance, ensureAllowance } from './erc20.js';
 import { getChain, getStableDecimals } from './chains.js';
 import { getSolBalance } from './solana.js';
 import { MIN_GAS_ETH_RESERVE, GAS_TOPUP_USDC_AMOUNT, MIN_SOL_GAS_RESERVE } from './config.js';
 
 // Minimum stablecoin amount worth bothering to swap for a gas top-up — below
-// this, 0x's fee + slippage would eat too much of it to be worth attempting,
-// and (more importantly) it's the floor that prevents us from ever trying to
-// swap MORE than the wallet actually holds. See note in ensureGasReserve.
+// this, 0x's fee + slippage would eat too much of it to be worth attempting.
 const MIN_TOPUP_USDC_AMOUNT = 1;
 
 /**
@@ -17,13 +15,17 @@ const MIN_TOPUP_USDC_AMOUNT = 1;
  * `provider` point to. If native balance is low, swaps stablecoin into the
  * native token via a normal 0x quote, and waits for it.
  *
- * IMPORTANT: the swap amount is capped to min(GAS_TOPUP_USDC_AMOUNT, actual
- * on-chain stablecoin balance) — NOT a fixed GAS_TOPUP_USDC_AMOUNT
- * regardless of balance. Previously this always tried to swap a flat 5
- * USDC/USDG, which could exceed what the wallet actually held (e.g. a user
- * withdrawing their entire ~$2 balance), causing an opaque on-chain revert
- * (Permit2/transferFrom failing to pull funds that weren't there) instead of
- * a clear error message.
+ * Two bugs fixed here vs. the original:
+ *   1. The swap amount is capped to min(GAS_TOPUP_USDC_AMOUNT, actual
+ *      on-chain balance) — never requests more than the wallet holds.
+ *   2. ensureAllowance() is now called before building/sending the swap tx.
+ *      This was MISSING before — performSwapBuy/performSellCore in
+ *      trade-core.js always approve Permit2 first, but this function built
+ *      and sent the swap tx directly with zero allowance, causing a silent
+ *      CALL_EXCEPTION (transferFrom failing with no revert reason) even
+ *      when the wallet had plenty of balance. This is what was breaking
+ *      gas top-ups (and therefore withdrawals/trades that needed one) on
+ *      Robinhood Chain.
  */
 export async function ensureGasReserve(chainKey, signer, walletAddress) {
   const chain = getChain(chainKey);
@@ -51,12 +53,15 @@ export async function ensureGasReserve(chainKey, signer, walletAddress) {
     );
   }
 
-  // Cap the swap amount to what's actually available — never request more
-  // than the wallet holds, even if GAS_TOPUP_USDC_AMOUNT is bigger.
+  // Cap the swap amount to what's actually available.
   const topupAmount = Math.min(GAS_TOPUP_USDC_AMOUNT, usdcBalanceNum);
-
   const sellAmount = ethers.parseUnits(topupAmount.toFixed(usdcDecimals), usdcDecimals).toString();
+
   console.log(`[gas debug] attempting top-up swap of ${topupAmount} ${chain.stableSymbol || 'USDC'} -> ${chain.nativeSymbol} on ${chain.name}`);
+
+  // THE FIX: approve Permit2 to pull the stablecoin before building/sending
+  // the swap tx — this was missing entirely before.
+  await ensureAllowance(signer, chain.usdcAddress, BigInt(sellAmount));
 
   const quote = await getQuote({
     chainKey,
