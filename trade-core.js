@@ -471,6 +471,18 @@ export async function executeSell(ctx, uid, tokenAddress, pct) {
   await ctx.reply(text, { parse_mode: 'Markdown', ...markup });
 }
 
+/**
+ * Sends a stablecoin transfer (withdrawal) on `chainKey`. Unlike buy/sell,
+ * this doesn't go through 0x/Jupiter at all — it's a plain token transfer
+ * (or native SPL transfer on Solana) — so "no quotes available" /
+ * "slippage" style errors CANNOT apply here. If this fails, it's an
+ * on-chain revert (balance, allowance-irrelevant since transfer() doesn't
+ * need one, or a decimals/amount mismatch) or a gas-reserve top-up failure
+ * upstream. The raw error is logged here (with err.reason / err.code /
+ * err.shortMessage if present) specifically because friendlyErrorMessage()
+ * collapses everything into a generic, swap-flavored message that doesn't
+ * help diagnose a transfer failure — see README/runbook note.
+ */
 export async function performUsdcTransferCore(uid, chainKey, sourceWallet, toAddress, usdcAmount) {
   try {
     if (isSolanaChain(chainKey)) {
@@ -487,10 +499,40 @@ export async function performUsdcTransferCore(uid, chainKey, sourceWallet, toAdd
     await ensureGasReserve(chainKey, signer, sourceWallet.address);
     const decimals = await getStableDecimals(chainKey);
     const rawAmount = ethers.parseUnits(usdcAmount.toString(), decimals);
+
+    // Extra diagnostic: confirm on-chain balance actually covers rawAmount
+    // BEFORE attempting the transfer, so a decimals mismatch or a gas
+    // top-up that ate into the balance shows up clearly in logs instead of
+    // surfacing only as an opaque revert from the token contract.
+    const { getUsdcBalance } = await import('./erc20.js');
+    const preBalance = await getUsdcBalance(getEvmProvider(chainKey), chain.usdcAddress, sourceWallet.address).catch(() => null);
+    console.log(
+      `[withdraw debug] uid=${uid} chain=${chainKey} decimals=${decimals} ` +
+      `requestedRaw=${rawAmount.toString()} onChainBalanceRaw=${preBalance !== null ? preBalance.toString() : 'unknown'}`
+    );
+    if (preBalance !== null && preBalance < rawAmount) {
+      console.error(
+        `[withdraw] Insufficient on-chain balance: have ${preBalance.toString()}, need ${rawAmount.toString()} ` +
+        `(decimals=${decimals}). Likely cause: gas top-up (ensureGasReserve) consumed part of the balance just now, ` +
+        `or getStableDecimals() resolved a wrong decimals value for this chain's stablecoin.`
+      );
+    }
+
     const { transferToken } = await import('./erc20.js');
     const receipt = await transferToken(signer, chain.usdcAddress, toAddress, rawAmount);
     return { ok: true, txHash: receipt.hash };
   } catch (err) {
+    console.error(
+      `[withdraw] Raw transfer error for uid=${uid} chain=${chainKey} amount=${usdcAmount}:`,
+      {
+        message: err.message,
+        code: err.code,
+        reason: err.reason,
+        shortMessage: err.shortMessage,
+        data: err.data,
+        info: err.info,
+      }
+    );
     return { ok: false, error: friendlyErrorMessage(err) };
   }
 }
