@@ -1,7 +1,7 @@
 import { ethers } from 'ethers';
 import { getQuote } from './swap.js';
 import { fmtUsd } from './price.js';
-import { getChain, getEvmProvider, explorerTxUrl, isSolanaChain, isEvmChain, ALL_CHAIN_KEYS } from './chains.js';
+import { getChain, getEvmProvider, explorerTxUrl, isSolanaChain, isEvmChain, ALL_CHAIN_KEYS, getStableDecimals, stableSymbolFor } from './chains.js';
 import { getSolBalance, getSolanaUsdcBalance } from './solana.js';
 import { getUsdcBalance } from './erc20.js';
 import { gasMultiplierFor, botIdentity } from './state.js';
@@ -18,12 +18,15 @@ export function referralLink(code) {
 }
 
 /**
- * Native gas balance + USDC balance on ONE chain for a wallet — the unit
- * shown to the user before/while trading on that chain specifically.
- * `wallet` must have both .address (EVM) and .solAddress (Solana).
+ * Native gas balance + settlement-stablecoin balance on ONE chain for a
+ * wallet — the unit shown to the user before/while trading on that chain
+ * specifically. `wallet` must have both .address (EVM) and .solAddress
+ * (Solana). The stablecoin label is per-chain (USDC everywhere except
+ * Robinhood Chain, which shows USDG) via stableSymbolFor().
  */
 export async function chainBalanceLines(wallet, chainKey) {
   const chain = getChain(chainKey);
+  const symbol = stableSymbolFor(chainKey);
 
   if (isSolanaChain(chainKey)) {
     const [sol, usdc] = await Promise.all([
@@ -31,39 +34,42 @@ export async function chainBalanceLines(wallet, chainKey) {
       getSolanaUsdcBalance(wallet.solAddress).catch(() => null),
     ]);
     const solLine = sol === null ? 'SOL: unavailable' : `SOL: ${sol.toFixed(4)}`;
-    const usdcLine = usdc === null ? 'USDC: unavailable' : `USDC: ${fmtUsd(usdc)}`;
+    const usdcLine = usdc === null ? `${symbol}: unavailable` : `${symbol}: ${fmtUsd(usdc)}`;
     return `${solLine}\n${usdcLine}`;
   }
 
   const provider = getEvmProvider(chainKey);
-  const [native, usdcRaw] = await Promise.all([
+  const [native, decimals, usdcRaw] = await Promise.all([
     provider.getBalance(wallet.address).then((b) => Number(ethers.formatEther(b))).catch(() => null),
+    getStableDecimals(chainKey).catch(() => 6),
     getUsdcBalance(provider, chain.usdcAddress, wallet.address).catch(() => null),
   ]);
   const nativeLine = native === null ? `${chain.nativeSymbol}: unavailable` : `${chain.nativeSymbol}: ${fmtEth(native)}`;
-  const usdcLine = usdcRaw === null ? 'USDC: unavailable' : `USDC: ${fmtUsd(Number(ethers.formatUnits(usdcRaw, chain.usdcDecimals)))}`;
+  const usdcLine = usdcRaw === null ? `${symbol}: unavailable` : `${symbol}: ${fmtUsd(Number(ethers.formatUnits(usdcRaw, decimals)))}`;
   return `${nativeLine}\n${usdcLine}`;
 }
 
-/** USDC balance only, on one chain — the number that actually matters for sizing a trade. */
+/** Stablecoin balance only, on one chain — the number that actually matters for sizing a trade. */
 export async function getChainUsdcBalance(wallet, chainKey) {
   if (isSolanaChain(chainKey)) {
     return getSolanaUsdcBalance(wallet.solAddress);
   }
   const chain = getChain(chainKey);
   const provider = getEvmProvider(chainKey);
+  const decimals = await getStableDecimals(chainKey);
   const raw = await getUsdcBalance(provider, chain.usdcAddress, wallet.address);
-  return Number(ethers.formatUnits(raw, chain.usdcDecimals));
+  return Number(ethers.formatUnits(raw, decimals));
 }
 
-/** Summary line across every supported chain — used on the Balance / Wallets views. */
+/** Summary line across every supported chain — used on the Balance / Wallets views. Each chain shows its own stablecoin symbol. */
 export async function allChainsBalanceSummary(wallet) {
   const lines = await Promise.all(
     ALL_CHAIN_KEYS.map(async (chainKey) => {
       const chain = getChain(chainKey);
+      const symbol = stableSymbolFor(chainKey);
       try {
         const usdc = await getChainUsdcBalance(wallet, chainKey);
-        return `${chain.name}: ${fmtUsd(usdc)} USDC`;
+        return `${chain.name}: ${fmtUsd(usdc)} ${symbol}`;
       } catch {
         return `${chain.name}: unavailable`;
       }
@@ -95,7 +101,7 @@ export function friendlyErrorMessage(err) {
   const raw = `${err?.message || ''} ${err?.shortMessage || ''} ${err?.reason || ''}`.toLowerCase();
 
   if (code === 'INSUFFICIENT_FUNDS' || raw.includes('insufficient funds')) {
-    return 'Insufficient balance to cover this trade plus gas. Add more USDC (and a little of the native gas token) to your wallet on this chain and try again.';
+    return 'Insufficient balance to cover this trade plus gas. Add more of this chain\'s stablecoin (and a little of the native gas token) to your wallet and try again.';
   }
   if (raw.includes('gas required exceeds allowance') || raw.includes('out of gas') || raw.includes('intrinsic gas too low')) {
     return 'Not enough native gas token to cover network fees. Add a bit more and try again.';
@@ -125,12 +131,13 @@ export async function getFreshQuote(chainKey, quoteParams, quote, fetchedAt) {
 }
 
 /**
- * Parses a USDC trade amount. USDC is pegged ~1:1 to USD, so a bare number
- * like `100` or `$100` IS the USDC amount directly — no price feed needed,
- * on any chain.
+ * Parses a stablecoin trade amount. Every supported chain's settlement
+ * stablecoin (USDC, or USDG on Robinhood Chain) is pegged ~1:1 to USD, so a
+ * bare number like `100` or `$100` IS the amount directly — no price feed
+ * needed, on any chain.
  */
 export function parseUsdcAmountInput(text) {
-  const trimmed = text.trim().replace(/^\$/, '').replace(/\s*usdc?$/i, '');
+  const trimmed = text.trim().replace(/^\$/, '').replace(/\s*usdc?g?$/i, '');
   const amt = parseFloat(trimmed.replace(/,/g, ''));
   if (isNaN(amt) || amt <= 0) {
     throw new Error('Send a valid positive USD amount, e.g. `100`');

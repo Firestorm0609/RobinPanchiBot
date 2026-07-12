@@ -1,7 +1,7 @@
 import { ethers } from 'ethers';
 import { getQuote, buildSwapTx, sendSwapWithGasBump } from './swap.js';
 import { getUsdcBalance } from './erc20.js';
-import { getChain } from './chains.js';
+import { getChain, getStableDecimals } from './chains.js';
 import { getSolBalance } from './solana.js';
 import { MIN_GAS_ETH_RESERVE, GAS_TOPUP_USDC_AMOUNT, MIN_SOL_GAS_RESERVE } from './config.js';
 
@@ -9,7 +9,8 @@ import { MIN_GAS_ETH_RESERVE, GAS_TOPUP_USDC_AMOUNT, MIN_SOL_GAS_RESERVE } from 
  * EVM only. Ensures `signer`'s wallet has enough native gas token to pay for
  * the trade it's about to make, on whatever chain `signer`/`provider` point
  * to. If native balance is low, swaps GAS_TOPUP_USDC_AMOUNT of that chain's
- * own USDC into the native token via a normal 0x quote, and waits for it.
+ * own settlement stablecoin (USDC everywhere except Robinhood Chain, which
+ * uses USDG) into the native token via a normal 0x quote, and waits for it.
  */
 export async function ensureGasReserve(chainKey, signer, walletAddress) {
   const chain = getChain(chainKey);
@@ -21,17 +22,18 @@ export async function ensureGasReserve(chainKey, signer, walletAddress) {
     return { toppedUp: false };
   }
 
+  const usdcDecimals = await getStableDecimals(chainKey);
   const usdcBalance = await getUsdcBalance(provider, chain.usdcAddress, walletAddress);
-  const usdcBalanceNum = Number(ethers.formatUnits(usdcBalance, chain.usdcDecimals));
+  const usdcBalanceNum = Number(ethers.formatUnits(usdcBalance, usdcDecimals));
 
   if (usdcBalanceNum < GAS_TOPUP_USDC_AMOUNT) {
     throw new Error(
-      `Wallet is low on ${chain.nativeSymbol} (${nativeBalanceNum.toFixed(5)}) and doesn't hold enough USDC ` +
-      `(${usdcBalanceNum.toFixed(2)}) on ${chain.name} to auto-top-up. Add USDC to this wallet on ${chain.name}.`
+      `Wallet is low on ${chain.nativeSymbol} (${nativeBalanceNum.toFixed(5)}) and doesn't hold enough ${chain.stableSymbol || 'USDC'} ` +
+      `(${usdcBalanceNum.toFixed(2)}) on ${chain.name} to auto-top-up. Add ${chain.stableSymbol || 'USDC'} to this wallet on ${chain.name}.`
     );
   }
 
-  const sellAmount = ethers.parseUnits(GAS_TOPUP_USDC_AMOUNT.toString(), chain.usdcDecimals).toString();
+  const sellAmount = ethers.parseUnits(GAS_TOPUP_USDC_AMOUNT.toString(), usdcDecimals).toString();
   const quote = await getQuote({
     chainKey,
     sellToken: chain.usdcAddress,

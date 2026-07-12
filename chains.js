@@ -2,13 +2,28 @@ import { ethers } from 'ethers';
 
 // ---------------------------------------------------------------------------
 // Central chain registry. This is the single source of truth for every chain
-// the bot can trade USDC on. Adding a new EVM chain is just adding an entry
-// here (plus its RPC url + USDC address in .env) — no other file should ever
-// hardcode a chainId, RPC url, or USDC address again.
+// the bot can trade in-its-native-stablecoin on. Adding a new EVM chain is
+// just adding an entry here (plus its RPC url + stablecoin address in .env)
+// — no other file should ever hardcode a chainId, RPC url, or stablecoin
+// address again.
 //
 // IMPORTANT: BSC's native USDC deployment uses 18 decimals, not 6 like every
 // other chain's native USDC. That's why usdcDecimals is per-chain, not a
-// global constant like the old USDC_DECIMALS in config.js.
+// global constant.
+//
+// IMPORTANT #2: Robinhood Chain does NOT have a native USDC deployment —
+// Circle has not issued USDC there. Robinhood Chain's actual settlement
+// stablecoin is USDG (Global Dollar, issued by Paxos), which is what
+// Robinhood Earn and every reported DEX volume figure on that chain are
+// denominated in. So `robinhood.usdcAddress` below points at USDG, and
+// `stableSymbol` is 'USDG' instead of the 'USDC' every other chain uses —
+// UI text should read from `stableSymbol`, not hardcode "USDC".
+//
+// `usdcDecimals: null` means "don't guess — resolve it on-chain via
+// decimals() the first time it's needed" (see getStableDecimals below).
+// This is deliberate: USDG's decimals weren't confirmed from official docs
+// at the time this was wired up, and guessing a wrong decimals value here
+// would silently corrupt every trade amount on that chain.
 // ---------------------------------------------------------------------------
 
 export const CHAIN_KIND = { EVM: 'evm', SOLANA: 'solana' };
@@ -23,6 +38,7 @@ export const CHAINS = {
     fallbackRpc: 'https://cloudflare-eth.com',
     usdcAddress: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
     usdcDecimals: 6,
+    stableSymbol: 'USDC',
     explorerBase: 'https://etherscan.io',
     nativeSymbol: 'ETH',
   },
@@ -35,6 +51,7 @@ export const CHAINS = {
     fallbackRpc: 'https://mainnet.base.org',
     usdcAddress: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
     usdcDecimals: 6,
+    stableSymbol: 'USDC',
     explorerBase: 'https://basescan.org',
     nativeSymbol: 'ETH',
   },
@@ -47,6 +64,7 @@ export const CHAINS = {
     fallbackRpc: 'https://arb1.arbitrum.io/rpc',
     usdcAddress: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',
     usdcDecimals: 6,
+    stableSymbol: 'USDC',
     explorerBase: 'https://arbiscan.io',
     nativeSymbol: 'ETH',
   },
@@ -59,6 +77,7 @@ export const CHAINS = {
     fallbackRpc: 'https://bsc-dataseed.binance.org',
     usdcAddress: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d',
     usdcDecimals: 18, // NOTE: BSC's native USDC is 18 decimals, unlike everywhere else
+    stableSymbol: 'USDC',
     explorerBase: 'https://bscscan.com',
     nativeSymbol: 'BNB',
   },
@@ -69,8 +88,13 @@ export const CHAINS = {
     chainId: Number(process.env.CHAIN_ID || 4663),
     rpcEnvVar: 'RPC_URL',
     fallbackRpc: null, // no public fallback — this one's required in .env
-    usdcAddress: process.env.USDC_ROBINHOOD_ADDRESS,
-    usdcDecimals: 6,
+    // USDG (Global Dollar, Paxos) — Robinhood Chain's official contracts page
+    // lists no USDC deployment at all. This address is from Robinhood's own
+    // docs (docs.robinhood.com/chain/contracts). Verify against that page
+    // if Robinhood ever redeploys or adds a second stablecoin.
+    usdcAddress: '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168',
+    usdcDecimals: null, // resolved on-chain on first use — see getStableDecimals()
+    stableSymbol: 'USDG',
     explorerBase: (process.env.EXPLORER_BASE_URL || '').replace(/\/$/, ''),
     nativeSymbol: 'ETH',
   },
@@ -82,6 +106,7 @@ export const CHAINS = {
     fallbackRpc: 'https://api.mainnet-beta.solana.com',
     usdcMint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
     usdcDecimals: 6,
+    stableSymbol: 'USDC',
     explorerBase: 'https://solscan.io',
     nativeSymbol: 'SOL',
   },
@@ -102,6 +127,11 @@ export function isEvmChain(chainKey) {
 
 export function isSolanaChain(chainKey) {
   return getChain(chainKey).kind === CHAIN_KIND.SOLANA;
+}
+
+/** Display label for whatever this chain's settlement stablecoin is — 'USDC' everywhere except Robinhood Chain ('USDG'). */
+export function stableSymbolFor(chainKey) {
+  return getChain(chainKey).stableSymbol || 'USDC';
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +155,30 @@ export function getEvmProvider(chainKey) {
   return provider;
 }
 
+// ---------------------------------------------------------------------------
+// Stablecoin decimals — hardcoded per chain where known, resolved on-chain
+// (and cached) where not. This is what lets Robinhood Chain's USDG entry
+// have `usdcDecimals: null` above instead of a guessed value.
+// ---------------------------------------------------------------------------
+
+const DECIMALS_ABI = ['function decimals() view returns (uint8)'];
+const decimalsCache = new Map(); // chainKey -> resolved decimals (number)
+
+export async function getStableDecimals(chainKey) {
+  const chain = getChain(chainKey);
+
+  if (isSolanaChain(chainKey)) return chain.usdcDecimals;
+  if (typeof chain.usdcDecimals === 'number') return chain.usdcDecimals;
+
+  if (decimalsCache.has(chainKey)) return decimalsCache.get(chainKey);
+
+  const provider = getEvmProvider(chainKey);
+  const token = new ethers.Contract(chain.usdcAddress, DECIMALS_ABI, provider);
+  const decimals = Number(await token.decimals());
+  decimalsCache.set(chainKey, decimals);
+  return decimals;
+}
+
 export function explorerTxUrl(chainKey, txHash) {
   const chain = getChain(chainKey);
   if (chain.kind === CHAIN_KIND.SOLANA) return `${chain.explorerBase}/tx/${txHash}`;
@@ -142,7 +196,6 @@ export function explorerAddressUrl(chainKey, address) {
 /** Validates that required env vars are present for every chain marked required (Robinhood always is). */
 export function validateChainEnv() {
   const problems = [];
-  if (!CHAINS.robinhood.usdcAddress) problems.push('USDC_ROBINHOOD_ADDRESS is not set');
   if (!process.env.RPC_URL) problems.push('RPC_URL is not set (required for Robinhood Chain)');
   return problems;
 }

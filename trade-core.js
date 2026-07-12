@@ -10,7 +10,7 @@ import {
   recordTrade, getPosition, getAllPositions, getActiveWallet, getActiveChain,
 } from './storage.js';
 import { sendAdminAlert } from './alerts.js';
-import { getChain, getEvmProvider, isSolanaChain, explorerTxUrl } from './chains.js';
+import { getChain, getEvmProvider, isSolanaChain, explorerTxUrl, getStableDecimals } from './chains.js';
 import {
   keypairFromPrivateKey, getSplTokenBalanceRaw, getSplTokenDecimals, transferSolanaUsdc,
 } from './solana.js';
@@ -24,8 +24,9 @@ function walletAddressForChain(wallet, chainKey) {
   return isSolanaChain(chainKey) ? wallet.solAddress : wallet.address;
 }
 
-function toRawUsdc(chainKey, usdcAmount) {
-  const decimals = getChain(chainKey).usdcDecimals;
+/** Converts a human-readable USD amount into the chain's stablecoin's raw (smallest-unit) amount. Decimals are resolved per chain — hardcoded for known stablecoins, fetched on-chain (and cached) otherwise. */
+async function toRawUsdc(chainKey, usdcAmount) {
+  const decimals = await getStableDecimals(chainKey);
   if (isSolanaChain(chainKey)) return BigInt(Math.round(usdcAmount * 10 ** decimals));
   return ethers.parseUnits(usdcAmount.toString(), decimals).toString();
 }
@@ -72,7 +73,7 @@ export async function performBuyCore(uid, wallet, chainKey, tokenAddress, usdcAm
     if (isSolanaChain(chainKey)) {
       await ensureSolanaGasReserve(address);
       const keypair = keypairFromPrivateKey(wallet.solPrivateKey);
-      const sellAmountRaw = toRawUsdc(chainKey, usdcAmount);
+      const sellAmountRaw = await toRawUsdc(chainKey, usdcAmount);
 
       const quote = await getSolanaQuote({ sellToken: 'USDC', buyToken: tokenAddress, sellAmountRaw });
       const tx = await buildSolanaSwapTx(quote, keypair.publicKey);
@@ -92,7 +93,7 @@ export async function performBuyCore(uid, wallet, chainKey, tokenAddress, usdcAm
     const signer = new ethers.Wallet(wallet.privateKey, getEvmProvider(chainKey));
     await ensureGasReserve(chainKey, signer, address);
 
-    const sellAmount = toRawUsdc(chainKey, usdcAmount);
+    const sellAmount = await toRawUsdc(chainKey, usdcAmount);
     const { slippageBps } = getSettings(uid);
     const quoteParams = { sellToken: chain.usdcAddress, buyToken: tokenAddress, sellAmount, taker: address, slippageBps };
 
@@ -265,7 +266,7 @@ export async function performUsdcTransferCore(uid, chainKey, sourceWallet, toAdd
     if (isSolanaChain(chainKey)) {
       const keypair = keypairFromPrivateKey(sourceWallet.solPrivateKey);
       await ensureSolanaGasReserve(sourceWallet.solAddress);
-      const rawAmount = toRawUsdc(chainKey, usdcAmount);
+      const rawAmount = await toRawUsdc(chainKey, usdcAmount);
       const { signature } = await transferSolanaUsdc(keypair, toAddress, rawAmount);
       return { ok: true, txHash: signature };
     }
@@ -273,7 +274,8 @@ export async function performUsdcTransferCore(uid, chainKey, sourceWallet, toAdd
     const chain = getChain(chainKey);
     const signer = new ethers.Wallet(sourceWallet.privateKey, getEvmProvider(chainKey));
     await ensureGasReserve(chainKey, signer, sourceWallet.address);
-    const rawAmount = ethers.parseUnits(usdcAmount.toString(), chain.usdcDecimals);
+    const decimals = await getStableDecimals(chainKey);
+    const rawAmount = ethers.parseUnits(usdcAmount.toString(), decimals);
     const { transferToken } = await import('./erc20.js');
     const receipt = await transferToken(signer, chain.usdcAddress, toAddress, rawAmount);
     return { ok: true, txHash: receipt.hash };
@@ -375,10 +377,10 @@ export async function performCollectCore(uid, chainKey, sourceWallet, destAddres
     if (usdcBalance > 0n) {
       await ensureGasReserve(chainKey, signer, sourceWallet.address);
       const receipt = await transferToken(signer, chain.usdcAddress, destAddress, usdcBalance);
-      results.push({ ok: true, label: 'USDC', txHash: receipt.hash });
+      results.push({ ok: true, label: chain.stableSymbol || 'USDC', txHash: receipt.hash });
     }
   } catch (err) {
-    results.push({ ok: false, label: 'USDC', error: friendlyErrorMessage(err) });
+    results.push({ ok: false, label: chain.stableSymbol || 'USDC', error: friendlyErrorMessage(err) });
   }
 
   return results;

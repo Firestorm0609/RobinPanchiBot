@@ -59,7 +59,7 @@ export const MIN_SOL_GAS_RESERVE = 0.01; // ~enough for dozens of swaps + rent-e
 
 export const TERMS_TEXT =
   '⚠️ *Before you trade*\n\n' +
-  'This bot lets you swap tokens — including low-cap memecoins — directly with your own funds, on any supported chain, entirely in USDC. ' +
+  'This bot lets you swap tokens — including low-cap memecoins — directly with your own funds, on any supported chain, entirely in that chain\'s dollar-pegged settlement stablecoin (USDC, or USDG on Robinhood Chain). ' +
   'By using it you accept that:\n\n' +
   '• Memecoins carry high rug-pull and total-loss risk\n' +
   '• Trades are final once confirmed on-chain\n' +
@@ -70,17 +70,17 @@ export const TERMS_TEXT =
 export const HELP_TEXT =
   '❓ *Help & FAQ*\n\n' +
   '*How do I use this bot?*\n' +
-  'Create or import a wallet under 💼 Wallets, pick a chain under 🔗 Chain, deposit USDC on that chain, then paste any token contract address (or Solana mint) to pull up its price and trade it.\n\n' +
+  'Create or import a wallet under 💼 Wallets, pick a chain under 🔗 Chain, deposit that chain\'s stablecoin, then paste any token contract address (or Solana mint) to pull up its price and trade it.\n\n' +
   '*Do I need to bridge?*\n' +
-  'No. Your wallet works on every supported chain already (same address on all EVM chains; a separate Solana address for Solana). Just deposit USDC directly on whichever chain you want to trade on — no bridging step, ever.\n\n' +
+  'No. Your wallet works on every supported chain already (same address on all EVM chains; a separate Solana address for Solana). Just deposit the stablecoin directly on whichever chain you want to trade on — no bridging step, ever.\n\n' +
   '*Which chains are supported?*\n' +
-  'Ethereum, Base, Arbitrum, BNB Chain, Robinhood Chain, and Solana — all trading directly in native USDC on that chain.\n\n' +
+  'Ethereum, Base, Arbitrum, BNB Chain, Robinhood Chain, and Solana. Deposit USDC on every chain except Robinhood Chain, where the settlement stablecoin is USDG (Robinhood does not have a native USDC deployment — check your active chain under 🔗 Chain to see which one applies).\n\n' +
   '*Where\'s my referral link?*\n' +
   'Open 🎟 Rewards from the main menu.\n\n' +
   '*What are the fees?*\n' +
   `A ${(Number(process.env.AFFILIATE_FEE_BPS || 0) / 100).toFixed(2)}% fee applies on swaps, taken from the trade itself. No subscription, no feature is paywalled.\n\n` +
   '*Do I need to hold the native gas token?*\n' +
-  'On EVM chains, no — the bot automatically converts a small amount of your USDC into the native gas token behind the scenes. On Solana, you\'ll want a small SOL balance (a few cents worth) since gas there is a flat, tiny fee.\n\n' +
+  'On EVM chains, no — the bot automatically converts a small amount of your chain stablecoin into the native gas token behind the scenes. On Solana, you\'ll want a small SOL balance (a few cents worth) since gas there is a flat, tiny fee.\n\n' +
   '*Security tips*\n' +
   '• This bot never DMs you first — if you receive an unsolicited message claiming to be us, it\'s a scammer\n' +
   '• We will never ask you to "verify" your wallet by sending funds or signing a message elsewhere\n' +
@@ -88,10 +88,10 @@ export const HELP_TEXT =
   '• Anyone who private-messages you offering "support" and asks for your private key or seed phrase is trying to steal your funds\n\n' +
   '*Common trade failures*\n' +
   '• *Slippage exceeded* — raise your slippage tolerance in Settings, or trade a smaller size\n' +
-  '• *Insufficient balance* — you need enough USDC to cover the trade; add funds or reduce the amount\n' +
+  '• *Insufficient balance* — you need enough of the chain\'s stablecoin to cover the trade; add funds or reduce the amount\n' +
   '• *Timed out* — the network was congested; the bot automatically resubmits with higher gas (EVM) or resends (Solana), but if it still fails, try again in a moment\n\n' +
   '*Why does my PnL look off?*\n' +
-  'PnL is based on your running average USDC cost basis and the live price, so it can shift with volatility between refreshes.\n\n' +
+  'PnL is based on your running average cost basis (in that chain\'s stablecoin) and the live price, so it can shift with volatility between refreshes.\n\n' +
   '*Auto TP/SL*\n' +
   'On any open position, tap 🎯 Set TP/SL to have the bot automatically sell 100% of that position once it hits your target gain (take-profit) or loss (stop-loss). One active rule per position — setting a new one replaces the old.\n\n' +
   '*Limit orders*\n' +
@@ -103,6 +103,6 @@ export const HELP_TEXT =
 
 export const WELCOME_TEXT =
   '🌴 *RobinPanchi Trading Bot*\n' +
-  'Trade any chain, entirely in USDC — no bridging, ever 🍃\n\n' +
+  'Trade any chain, entirely in that chain\'s stablecoin — no bridging, ever 🍃\n\n' +
   'Paste a token contract address (or Solana mint) to trade it, or pick a chain first under 🔗 Chain.\n\n' +
   '_Support: panchi.eth@gmail.com_';
