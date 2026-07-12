@@ -68,12 +68,39 @@ const DEXSCREENER_CHAIN_SLUG = {
   robinhood: process.env.DEXSCREENER_ROBINHOOD_SLUG || 'robinhoodchain',
 };
 
+// ---------------------------------------------------------------------------
+// DEBUG: set PRICE_DEBUG=1 in .env to log each price-resolution step (which
+// source was tried, what it returned/why it was skipped). Off by default —
+// this is diagnostic only, not meant to run in normal production logging.
+// ---------------------------------------------------------------------------
+const DEBUG = process.env.PRICE_DEBUG === '1';
+function dbg(...args) {
+  if (DEBUG) console.log('[price debug]', ...args);
+}
+
 async function getDexScreenerMarketData(tokenAddress, chainKey) {
   const res = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`);
   const allPairs = res.data?.pairs || [];
   const slug = DEXSCREENER_CHAIN_SLUG[chainKey];
   const pairs = slug ? allPairs.filter((p) => p.chainId === slug) : allPairs;
-  if (pairs.length === 0) return null;
+
+  dbg('DexScreener', {
+    tokenAddress,
+    chainKey,
+    expectedSlug: slug,
+    totalPairsReturned: allPairs.length,
+    distinctChainIdsSeen: [...new Set(allPairs.map((p) => p.chainId))],
+    pairsMatchingSlug: pairs.length,
+  });
+
+  if (pairs.length === 0) {
+    if (allPairs.length > 0) {
+      dbg('DexScreener: pairs exist for this token but NONE matched expectedSlug — likely DEXSCREENER_ROBINHOOD_SLUG (or equivalent) is wrong. Compare against distinctChainIdsSeen above.');
+    } else {
+      dbg('DexScreener: no pairs at all for this token address (not indexed, or wrong address).');
+    }
+    return null;
+  }
 
   const best = pairs.reduce((a, b) => (b.liquidity?.usd ?? 0) > (a.liquidity?.usd ?? 0) ? b : a);
   return {
@@ -110,7 +137,8 @@ async function getPumpFunMarketData(mintAddress) {
   let res;
   try {
     res = await axios.get(`${PUMPFUN_COIN_URL}/${mintAddress}`, { timeout: 8000 });
-  } catch {
+  } catch (err) {
+    dbg('pump.fun: request failed', err.message);
     return null;
   }
 
@@ -195,21 +223,33 @@ async function fetchUniswapQuote({ chain, tokenIn, tokenOut, amountRaw, apiKey }
       }
     );
     const data = res.data;
-    return (
+    const amountOut =
       data?.quote?.output?.amount ??
       data?.output?.amount ??
       data?.quote?.amountOut ??
       data?.amountOut ??
-      null
-    );
-  } catch {
+      null;
+
+    dbg('Uniswap quote OK', { tokenIn, tokenOut, amountOut });
+    return amountOut;
+  } catch (err) {
+    dbg('Uniswap quote FAILED', {
+      tokenIn,
+      tokenOut,
+      status: err.response?.status,
+      data: err.response?.data,
+      message: err.message,
+    });
     return null;
   }
 }
 
 async function getUniswapV3MarketData(tokenAddress, chainKey) {
   const apiKey = process.env.UNISWAP_API_KEY;
-  if (!apiKey) return null;
+  if (!apiKey) {
+    dbg('Uniswap fallback SKIPPED: UNISWAP_API_KEY not set in .env');
+    return null;
+  }
   if (!isEvmChain(chainKey)) return null;
 
   const chain = getChain(chainKey);
@@ -233,27 +273,37 @@ async function getUniswapV3MarketData(tokenAddress, chainKey) {
     const usdcDecimals = chain.usdcDecimals ?? 6;
     const candidate = Number(ethers.formatUnits(usdcOutRaw, usdcDecimals));
     if (Number.isFinite(candidate) && candidate > 0) priceUsd = candidate;
+  } else {
+    dbg('Uniswap attempt 1 (token -> stablecoin) returned nothing, trying WETH leg next');
   }
 
   // Attempt 2: token -> wrapped native, converted via live native USD price.
   if (priceUsd === null) {
     const wrappedNative = WRAPPED_NATIVE_ADDRESS[chainKey];
-    if (wrappedNative) {
+    if (!wrappedNative) {
+      dbg('Uniswap attempt 2 SKIPPED: no WRAPPED_NATIVE_ADDRESS entry for chain', chainKey);
+    } else {
       const wethOutRaw = await fetchUniswapQuote({
         chain, tokenIn: tokenAddress, tokenOut: wrappedNative, amountRaw: oneTokenRaw, apiKey,
       });
       if (wethOutRaw) {
         const nativeUsd = await getNativeUsdPrice(chain.nativeSymbol).catch(() => null);
+        dbg('Uniswap attempt 2: got WETH-leg quote, native USD price =', nativeUsd);
         if (nativeUsd) {
           const wethAmount = Number(ethers.formatUnits(wethOutRaw, 18)); // WETH/WBNB are always 18 decimals
           const candidate = wethAmount * nativeUsd;
           if (Number.isFinite(candidate) && candidate > 0) priceUsd = candidate;
         }
+      } else {
+        dbg('Uniswap attempt 2 (token -> WETH) also returned nothing — no route exists via canonical Uniswap V3 for this token/chain, or the pool fee tier isn\'t one the API routes through.');
       }
     }
   }
 
-  if (priceUsd === null) return null;
+  if (priceUsd === null) {
+    dbg('Uniswap fallback: no price resolved after both attempts.');
+    return null;
+  }
 
   let marketCap = null;
   if (totalSupplyRaw) {
@@ -284,16 +334,31 @@ async function getUniswapV3MarketData(tokenAddress, chainKey) {
  * no indexed pair and UNISWAP_API_KEY is set.
  */
 export async function getTokenMarketData(tokenAddress, chainKey) {
+  dbg('getTokenMarketData start', { tokenAddress, chainKey });
+
   if (isSolanaChain(chainKey)) {
     const pumpData = await getPumpFunMarketData(tokenAddress).catch(() => null);
-    if (pumpData) return pumpData;
-    return getDexScreenerMarketData(tokenAddress, chainKey).catch(() => null);
+    if (pumpData) {
+      dbg('resolved via pump.fun');
+      return pumpData;
+    }
+    const dex = await getDexScreenerMarketData(tokenAddress, chainKey).catch(() => null);
+    dbg(dex ? 'resolved via DexScreener (Solana)' : 'no data found (Solana): pump.fun and DexScreener both empty');
+    return dex;
   }
 
   const dexData = await getDexScreenerMarketData(tokenAddress, chainKey).catch(() => null);
-  if (dexData) return dexData;
+  if (dexData) {
+    dbg('resolved via DexScreener');
+    return dexData;
+  }
 
-  return getUniswapV3MarketData(tokenAddress, chainKey).catch(() => null);
+  const uniData = await getUniswapV3MarketData(tokenAddress, chainKey).catch((err) => {
+    dbg('Uniswap fallback threw an error:', err.message);
+    return null;
+  });
+  dbg(uniData ? 'resolved via Uniswap fallback' : 'no data found: DexScreener and Uniswap fallback both empty');
+  return uniData;
 }
 
 /**
@@ -375,4 +440,4 @@ export function fmtTokenAmount(n) {
   if (abs >= 1_000) return `${(n / 1_000).toFixed(2)}K`;
   if (abs >= 1) return n.toFixed(4);
   return n.toFixed(6);
-}
+                               }
