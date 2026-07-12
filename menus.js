@@ -32,10 +32,7 @@ export function walletsMenu(uid) {
     const active = w.id === user.activeWalletId ? '✅ ' : '';
     return [Markup.button.callback(`${active}${w.name} (${shortAddr(w.address)})`, `wallet_${w.id}`)];
   });
-  rows.push([
-    Markup.button.callback('➕ Create New', 'wallet_create'),
-    Markup.button.callback('📥 Import', 'wallet_import'),
-  ]);
+  rows.push([Markup.button.callback('➕ Create New', 'wallet_create')]);
   rows.push([Markup.button.callback('📤 Batch Fund', 'batchfund_start')]);
   rows.push([Markup.button.callback('📥 Batch Collect', 'collect_start')]);
   rows.push([Markup.button.callback('⬅️ Back', 'menu_main')]);
