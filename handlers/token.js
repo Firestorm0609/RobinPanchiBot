@@ -8,21 +8,38 @@ import {
 import { getOpenLimitOrdersForUser, cancelLimitOrder, getSettings, getActiveWallet, getActiveChain } from '../storage.js';
 import { getTokenMarketData, fmtUsd } from '../price.js';
 import { shortAddr } from '../wallet.js';
-import { chainBalanceLines, gasEstimateLine, getUnifiedUsdBalance, formatUnifiedBalanceLines } from '../format.js';
+import { getUnifiedUsdBalance, formatUnifiedBalanceLines, gasEstimateLine } from '../format.js';
 import { executeBuy, executeSell } from '../trade-core.js';
 import { isRateLimited } from '../ratelimit.js';
 import { getChain } from '../chains.js';
-import { FALLBACK_GAS_LIMIT_BUY, FALLBACK_GAS_LIMIT_SELL } from '../config.js';
+import { FALLBACK_GAS_LIMIT_BUY, FALLBACK_GAS_LIMIT_SELL, TOKEN_ADDR_SRC } from '../config.js';
+
+// All buttons below are keyed off a pasted token address, which can be
+// either an EVM address (0x...) or a Solana mint. The regexes previously
+// only matched 0x..., so every button silently no-op'd once the user
+// switched to a Solana token (Telegraf found no matching bot.action at
+// all for that callback_data). TOKEN_ADDR_SRC (config.js) matches either.
+
+const custombuyRe = new RegExp(`^custombuy_(${TOKEN_ADDR_SRC})$`);
+const customsellRe = new RegExp(`^customsell_(${TOKEN_ADDR_SRC})$`);
+const tpslRe = new RegExp(`^tpsl_(${TOKEN_ADDR_SRC})$`);
+const limitbuyRe = new RegExp(`^limitbuy_(${TOKEN_ADDR_SRC})$`);
+const limitsellRe = new RegExp(`^limitsell_(${TOKEN_ADDR_SRC})$`);
+const refreshRe = new RegExp(`^refresh_(${TOKEN_ADDR_SRC})$`);
+const buyRe = new RegExp(`^buy_(${TOKEN_ADDR_SRC})_([\\d.]+)$`);
+const sellRe = new RegExp(`^sell_(${TOKEN_ADDR_SRC})_([\\d.]+)$`);
+const confirmBuyRe = new RegExp(`^confirm_buy_(${TOKEN_ADDR_SRC})_([\\d.]+)$`);
+const confirmSellRe = new RegExp(`^confirm_sell_(${TOKEN_ADDR_SRC})_([\\d.]+)$`);
 
 // ---------- Custom buy/sell prompts ----------
 
-bot.action(/^custombuy_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
+bot.action(custombuyRe, async (ctx) => {
   await ctx.answerCbQuery();
   pending.set(ctx.from.id, { type: 'custom_buy', tokenAddress: ctx.match[1] });
   await ctx.editMessageText('Send the USD amount to spend, e.g. `100`:', { parse_mode: 'Markdown' });
 });
 
-bot.action(/^customsell_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
+bot.action(customsellRe, async (ctx) => {
   await ctx.answerCbQuery();
   pending.set(ctx.from.id, { type: 'custom_sell', tokenAddress: ctx.match[1] });
   await ctx.editMessageText('Send the percentage to sell, e.g. `40` for 40%');
@@ -30,7 +47,7 @@ bot.action(/^customsell_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
 
 // ---------- Auto TP/SL ----------
 
-bot.action(/^tpsl_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
+bot.action(tpslRe, async (ctx) => {
   await ctx.answerCbQuery();
   pending.set(ctx.from.id, { type: 'tpsl_input', tokenAddress: ctx.match[1] });
   await ctx.editMessageText(
@@ -44,7 +61,7 @@ bot.action(/^tpsl_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
 
 // ---------- Limit orders ----------
 
-bot.action(/^limitbuy_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
+bot.action(limitbuyRe, async (ctx) => {
   await ctx.answerCbQuery();
   pending.set(ctx.from.id, { type: 'limitbuy_mcap', tokenAddress: ctx.match[1] });
   await ctx.editMessageText(
@@ -54,7 +71,7 @@ bot.action(/^limitbuy_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
   );
 });
 
-bot.action(/^limitsell_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
+bot.action(limitsellRe, async (ctx) => {
   await ctx.answerCbQuery();
   pending.set(ctx.from.id, { type: 'limitsell_mcap', tokenAddress: ctx.match[1] });
   await ctx.editMessageText(
@@ -111,11 +128,10 @@ bot.action(/^limitordercancel_(.+)$/, async (ctx) => {
 });
 
 // ---------- Balance ----------
-// Leads with the unified total across every chain (Phase 3 of
-// CROSSCHAIN_BUILD_PLAN.md), then keeps the existing active-chain
-// native+stablecoin breakdown below it — the per-chain view stays because
-// it's what a user needs when actually funding a trade on a specific chain,
-// same reasoning as README's "don't just delete the per-chain view" note.
+// Shows the unified total across every chain only — the per-chain
+// active-chain breakdown that used to follow it was removed on request as
+// unnecessary clutter (the token card still shows the active-chain balance
+// where it's actually relevant, i.e. right before you'd trade on it).
 
 bot.action('menu_balance', async (ctx) => {
   await ctx.answerCbQuery();
@@ -123,28 +139,22 @@ bot.action('menu_balance', async (ctx) => {
   const uid = ctx.from.id;
   const w = getActiveWallet(uid);
   if (!w) return ctx.editMessageText('No active wallet. Add one first.', walletsMenu(uid));
-  const chainKey = getActiveChain(uid);
-  const chain = getChain(chainKey);
 
-  const [unified, activeChainBal] = await Promise.all([
-    getUnifiedUsdBalance(w).catch(() => null),
-    chainBalanceLines(w, chainKey).catch(() => 'unavailable'),
-  ]);
+  const unified = await getUnifiedUsdBalance(w).catch(() => null);
 
-  const unifiedBlock = unified
+  const text = unified
     ? `💰 *${w.name}*\n\n${formatUnifiedBalanceLines(unified)}`
-    : `💰 *${w.name}*\n\nUnified balance unavailable right now.`;
+    : `💰 *${w.name}*\n\nBalance unavailable right now.`;
 
-  await ctx.editMessageText(
-    `${unifiedBlock}\n\n` +
-    `*Active chain (${chain.name}):*\n\`${chainKey === 'solana' ? w.solAddress : w.address}\`\n${activeChainBal}`,
-    { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_main')]]) }
-  );
+  await ctx.editMessageText(text, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_main')]]),
+  });
 });
 
 // ---------- Token card: refresh ----------
 
-bot.action(/^refresh_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
+bot.action(refreshRe, async (ctx) => {
   await ctx.answerCbQuery('Refreshed');
   const tokenAddress = ctx.match[1];
   const uid = ctx.from.id;
@@ -158,7 +168,7 @@ bot.action(/^refresh_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
 
 // ---------- Buy ----------
 
-bot.action(/^buy_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
+bot.action(buyRe, async (ctx) => {
   await ctx.answerCbQuery();
   if (isRateLimited(ctx.from.id)) return ctx.reply('⏳ Slow down a bit — too many actions in the last minute.');
   const [, tokenAddress, usdcAmountStr] = ctx.match;
@@ -170,7 +180,7 @@ bot.action(/^buy_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
   }
   if (confirmTrades) {
     const chainKey = getActiveChain(uid);
-    const gasLine = await gasEstimateLine(chainKey, uid, FALLBACK_GAS_LIMIT_BUY);
+    const gasLine = await gasEstimateLine(chainKey, uid, FALLBACK_GAS_LIMIT_BUY).catch(() => '');
     await ctx.editMessageText(`Confirm: buy *${fmtUsd(usdcAmount)}* worth of this token on ${getChain(chainKey).name}?${gasLine}`, {
       parse_mode: 'Markdown',
       ...confirmMenu('buy', tokenAddress, usdcAmountStr),
@@ -182,7 +192,7 @@ bot.action(/^buy_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
 
 // ---------- Sell ----------
 
-bot.action(/^sell_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
+bot.action(sellRe, async (ctx) => {
   await ctx.answerCbQuery();
   if (isRateLimited(ctx.from.id)) return ctx.reply('⏳ Slow down a bit — too many actions in the last minute.');
   const [, tokenAddress, pctStr] = ctx.match;
@@ -190,7 +200,7 @@ bot.action(/^sell_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
   const { confirmTrades } = getSettings(uid);
   if (confirmTrades) {
     const chainKey = getActiveChain(uid);
-    const gasLine = await gasEstimateLine(chainKey, uid, FALLBACK_GAS_LIMIT_SELL);
+    const gasLine = await gasEstimateLine(chainKey, uid, FALLBACK_GAS_LIMIT_SELL).catch(() => '');
     await ctx.editMessageText(`Confirm: sell *${pctStr}%* of your position?${gasLine}`, {
       parse_mode: 'Markdown',
       ...confirmMenu('sell', tokenAddress, pctStr),
@@ -200,13 +210,13 @@ bot.action(/^sell_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
   }
 });
 
-bot.action(/^confirm_buy_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
+bot.action(confirmBuyRe, async (ctx) => {
   await ctx.answerCbQuery();
   if (isRateLimited(ctx.from.id)) return ctx.reply('⏳ Slow down a bit — too many actions in the last minute.');
   await executeBuy(ctx, ctx.from.id, ctx.match[1], Number(ctx.match[2]));
 });
 
-bot.action(/^confirm_sell_(0x[a-fA-F0-9]{40})_([\d.]+)$/, async (ctx) => {
+bot.action(confirmSellRe, async (ctx) => {
   await ctx.answerCbQuery();
   if (isRateLimited(ctx.from.id)) return ctx.reply('⏳ Slow down a bit — too many actions in the last minute.');
   await executeSell(ctx, ctx.from.id, ctx.match[1], Number(ctx.match[2]));
