@@ -39,6 +39,7 @@ export const QUOTE_STALE_MS = 15_000;
 export const AUTO_TRADE_POLL_INTERVAL_MS = 30_000;
 export const LIMIT_ORDER_POLL_INTERVAL_MS = 30_000;
 export const LOW_BALANCE_POLL_INTERVAL_MS = 5 * 60_000;
+export const BRIDGE_RESUME_POLL_INTERVAL_MS = 60_000;
 
 export const MAX_BATCH_FUND_NEW_WALLETS = 20;
 
@@ -57,6 +58,26 @@ export const MIN_GAS_ETH_RESERVE = 0.003;
 export const GAS_TOPUP_USDC_AMOUNT = 5;
 export const MIN_SOL_GAS_RESERVE = 0.01; // ~enough for dozens of swaps + rent-exempt token accounts
 
+// ---------------------------------------------------------------------------
+// Cross-chain auto-bridge (CROSSCHAIN_BUILD_PLAN.md Phase 4).
+//
+// MIN_BRIDGE_USD: floor below which a shortfall isn't worth auto-bridging.
+// A dust bridge can cost more in LI.FI's 25bps fee + source/dest gas than
+// the amount itself is worth. $5 comfortably clears typical bridge fees
+// (a few cents to ~$1 on most EVM<->EVM routes) with room to spare. If a
+// buy's shortfall is under this, performBuyCore fails with a clear message
+// telling the user to fund the target chain directly instead of silently
+// eating a bad-value bridge.
+// ---------------------------------------------------------------------------
+export const MIN_BRIDGE_USD = 5;
+
+// Buffer applied on top of a bridge shortfall to absorb LI.FI's fee +
+// destination-side slippage, so the destination chain ends up with AT LEAST
+// the shortfall amount once the bridge lands (not less, which would abort
+// the trade after already paying to bridge). 2% covers LI.FI's ~25bps
+// integrator fee plus typical bridge-tool spread with room to spare.
+export const BRIDGE_SHORTFALL_BUFFER_PCT = 2;
+
 export const TERMS_TEXT =
   '⚠️ *Before you trade*\n\n' +
   'This bot lets you swap tokens — including low-cap memecoins — directly with your own funds, on any supported chain, entirely in that chain\'s dollar-pegged settlement stablecoin (USDC, or USDG on Robinhood Chain). ' +
@@ -72,13 +93,13 @@ export const HELP_TEXT =
   '*How do I use this bot?*\n' +
   'Create or import a wallet under 💼 Wallets, pick a chain under 🔗 Chain, deposit that chain\'s stablecoin, then paste any token contract address (or Solana mint) to pull up its price and trade it.\n\n' +
   '*Do I need to bridge?*\n' +
-  'No. Your wallet works on every supported chain already (same address on all EVM chains; a separate Solana address for Solana). Just deposit the stablecoin directly on whichever chain you want to trade on — no bridging step, ever.\n\n' +
+  'No, not manually. Your wallet works on every supported chain already (same address on all EVM chains; a separate Solana address for Solana). Deposit on whichever chain you like — if you buy a token on a chain where you\'re short of funds, the bot automatically bridges the shortfall in from another chain where you have a balance, then completes the trade. Small shortfalls (under $5) aren\'t auto-bridged since bridging fees wouldn\'t be worth it — just fund the target chain directly for a top-up that small.\n\n' +
   '*Which chains are supported?*\n' +
   'Ethereum, Base, Arbitrum, BNB Chain, Robinhood Chain, and Solana. Deposit USDC on every chain except Robinhood Chain, where the settlement stablecoin is USDG (Robinhood does not have a native USDC deployment — check your active chain under 🔗 Chain to see which one applies).\n\n' +
   '*Where\'s my referral link?*\n' +
   'Open 🎟 Rewards from the main menu.\n\n' +
   '*What are the fees?*\n' +
-  `A ${(Number(process.env.AFFILIATE_FEE_BPS || 0) / 100).toFixed(2)}% fee applies on swaps, taken from the trade itself. No subscription, no feature is paywalled.\n\n` +
+  `A ${(Number(process.env.AFFILIATE_FEE_BPS || 0) / 100).toFixed(2)}% fee applies on swaps, taken from the trade itself. If a trade needs auto-bridging, LI.FI's own bridge fee (typically well under 1%) also applies on that leg. No subscription, no feature is paywalled.\n\n` +
   '*Do I need to hold the native gas token?*\n' +
   'On EVM chains, no — the bot automatically converts a small amount of your chain stablecoin into the native gas token behind the scenes. On Solana, you\'ll want a small SOL balance (a few cents worth) since gas there is a flat, tiny fee.\n\n' +
   '*Security tips*\n' +
@@ -88,8 +109,8 @@ export const HELP_TEXT =
   '• Anyone who private-messages you offering "support" and asks for your private key or seed phrase is trying to steal your funds\n\n' +
   '*Common trade failures*\n' +
   '• *Slippage exceeded* — raise your slippage tolerance in Settings, or trade a smaller size\n' +
-  '• *Insufficient balance* — you need enough of the chain\'s stablecoin to cover the trade; add funds or reduce the amount\n' +
-  '• *Timed out* — the network was congested; the bot automatically resubmits with higher gas (EVM) or resends (Solana), but if it still fails, try again in a moment\n\n' +
+  '• *Insufficient balance* — you need enough of the chain\'s stablecoin (or bridgeable balance on another chain) to cover the trade; add funds or reduce the amount\n' +
+  '• *Timed out* — the network was congested; the bot automatically resubmits with higher gas (EVM) or resends (Solana), but if it still fails, try again in a moment. A bridge leg that times out is usually still safe — the bot resumes it automatically once LI.FI confirms\n\n' +
   '*Why does my PnL look off?*\n' +
   'PnL is based on your running average cost basis (in that chain\'s stablecoin) and the live price, so it can shift with volatility between refreshes.\n\n' +
   '*Auto TP/SL*\n' +
@@ -103,6 +124,6 @@ export const HELP_TEXT =
 
 export const WELCOME_TEXT =
   '🌴 *RobinPanchi Trading Bot*\n' +
-  'Trade any chain, entirely in that chain\'s stablecoin — no bridging, ever 🍃\n\n' +
+  'Trade any chain, entirely in that chain\'s stablecoin — deposit anywhere, we auto-bridge the rest 🍃\n\n' +
   'Paste a token contract address (or Solana mint) to trade it, or pick a chain first under 🔗 Chain.\n\n' +
   '_Support: panchi.eth@gmail.com_';

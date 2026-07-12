@@ -2,7 +2,8 @@ import { bot } from './bot-instance.js';
 import { sendAdminAlert } from './alerts.js';
 import { stopAllAutoRefreshes } from './state.js';
 import {
-  checkStuckTrades, startLowBalancePoller, startAutoTradePoller, startLimitOrderPoller,
+  checkStuckTrades, resumeStuckBridges, startLowBalancePoller, startAutoTradePoller,
+  startLimitOrderPoller, startBridgeResumePoller,
 } from './pollers.js';
 
 // Each of these registers its bot.command/bot.action/bot.on handlers as a
@@ -32,16 +33,18 @@ process.on('uncaughtException', (err) => {
 
 bot.launch()
   .then(() => checkStuckTrades(bot))
+  .then(() => resumeStuckBridges(bot)) // one-shot attempt right at startup, before the periodic poller kicks in
   .then(() => startLowBalancePoller(bot))
   .then(() => startAutoTradePoller(bot))
   .then(() => startLimitOrderPoller(bot))
+  .then(() => startBridgeResumePoller(bot))
   .then(() => sendAdminAlert(bot.telegram, '✅ Bot started.'))
   .catch((err) => {
     console.error('Failed to launch bot:', err);
     process.exit(1);
   });
 
-console.log('Panchi trading bot running — multichain (EVM + Solana), native USDC, no bridging.');
+console.log('Panchi trading bot running — multichain (EVM + Solana), native stablecoins, auto-bridging shortfalls.');
 
 process.once('SIGINT', () => { stopAllAutoRefreshes(); bot.stop('SIGINT'); });
 process.once('SIGTERM', () => { stopAllAutoRefreshes(); bot.stop('SIGTERM'); });

@@ -168,8 +168,14 @@ async function executeSolanaLeg(quote, keypair) {
  * LI.FI's /status endpoint until the bridge (and any destination-side swap)
  * completes, fails, or the timeout is hit. This is deliberately awaitable
  * end-to-end — bridges can take seconds to several minutes, and the caller
- * (trade-core.js in Phase 4) needs to know definitively before proceeding
- * to the swap leg on the destination chain.
+ * (trade-core.js) needs to know definitively before proceeding to the swap
+ * leg on the destination chain.
+ *
+ * `onSourceTxSent(sourceTxHash)`, if provided, fires immediately after the
+ * source-chain tx is sent — BEFORE polling for completion. This lets a
+ * caller persist the tx hash right away (e.g. storage.js's
+ * markPendingTradeBridging) so a crash during the (possibly minutes-long)
+ * poll loop doesn't lose track of a bridge that already left the wallet.
  *
  * Returns { ok, sourceTxHash, destTxHash, status, receivedAmount } — or
  * throws on outright failure (source tx reverted, or LI.FI reports FAILED).
@@ -177,12 +183,16 @@ async function executeSolanaLeg(quote, keypair) {
  * happen if LI.FI's route re-routed mid-flight; always trust the returned
  * receivedAmount over what the quote estimated.
  */
-export async function executeBridge(quote, signerOrKeypair, { pollIntervalMs = 5000, timeoutMs = 8 * 60_000 } = {}) {
+export async function executeBridge(quote, signerOrKeypair, { pollIntervalMs = 5000, timeoutMs = 8 * 60_000, onSourceTxSent } = {}) {
   const isSolanaSource = isSolanaChain(quote.fromChainKey);
 
   const { txHash: sourceTxHash } = isSolanaSource
     ? await executeSolanaLeg(quote, signerOrKeypair)
     : await executeEvmLeg(quote, signerOrKeypair);
+
+  if (typeof onSourceTxSent === 'function') {
+    try { await onSourceTxSent(sourceTxHash); } catch (err) { console.error('onSourceTxSent callback failed:', err.message); }
+  }
 
   const deadline = Date.now() + timeoutMs;
   const bridgeTool = quote.tool;
@@ -228,15 +238,15 @@ export async function executeBridge(quote, signerOrKeypair, { pollIntervalMs = 5
   // Timed out waiting for LI.FI to confirm completion. The source tx DID
   // land (we have sourceTxHash) — funds are very likely fine and just
   // slow — but we can't confirm the destination leg from here. Caller
-  // (Phase 2's pending_trades 'bridging' status) should treat this as a
-  // recoverable stuck state, not a failure, and re-poll /status later
-  // rather than re-sending anything.
+  // (pending_trades 'bridging' status) should treat this as a recoverable
+  // stuck state, not a failure, and re-poll /status later rather than
+  // re-sending anything.
   return { ok: false, sourceTxHash, destTxHash: null, status: 'TIMEOUT', receivedAmount: null };
 }
 
 /**
  * One-off status check, for resuming a bridge that was mid-flight across a
- * bot restart (Phase 2 / pollers.js territory) without re-executing anything.
+ * bot restart (pollers.js territory) without re-executing anything.
  */
 export async function checkBridgeStatus({ sourceTxHash, bridgeTool, fromChainKey, toChainKey }) {
   const res = await axios.get(`${LIFI_BASE_URL}/status`, {

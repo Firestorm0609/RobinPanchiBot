@@ -1,6 +1,8 @@
 import { ethers } from 'ethers';
 import { getTokenMarketData } from './price.js';
 import { sendAdminAlert } from './alerts.js';
+import { checkBridgeStatus } from './bridge.js';
+import { performSwapBuy, performSellCore, performBuyCore } from './trade-core.js';
 import {
   getStuckPendingTradesByKind,
   getAllActiveWallets,
@@ -12,14 +14,17 @@ import {
   markAutoRuleTriggered,
   getOpenLimitOrders,
   markLimitOrderDone,
+  markPendingTradeBridged,
+  markPendingTradeSwapping,
+  markPendingTradeDone,
 } from './storage.js';
 import { getChain, getEvmProvider, isSolanaChain, explorerTxUrl } from './chains.js';
 import { getSolBalance } from './solana.js';
 import {
   AUTO_TRADE_POLL_INTERVAL_MS, LIMIT_ORDER_POLL_INTERVAL_MS, LOW_BALANCE_POLL_INTERVAL_MS,
+  BRIDGE_RESUME_POLL_INTERVAL_MS,
 } from './config.js';
 import { tradesInFlight } from './state.js';
-import { performSellCore, performBuyCore } from './trade-core.js';
 
 // ---------- Startup: crash recovery check ----------
 
@@ -30,14 +35,8 @@ import { performSellCore, performBuyCore } from './trade-core.js';
  *
  *   - bridgeStuck ('bridging' | 'bridged'): a LI.FI bridge leg was in
  *     flight or had already landed when the bot died. Funds are very
- *     likely fine — they're either still in transit (LI.FI itself is
- *     tracking the route independently of this bot's uptime) or already
- *     sitting on the destination chain waiting for the swap leg that
- *     never got to run. This is a RESUMABLE state, not a failure: once
- *     Phase 4 wires trade-core.js to actually resume from here, this is
- *     where that resume logic will look. For now (Phase 2), this poller
- *     only flags it distinctly so the admin doesn't waste time chasing it
- *     as if funds were lost.
+ *     likely fine — resumeStuckBridges() (below) actually acts on this
+ *     bucket now, this alert is just the heads-up that it's working on it.
  *   - swapStuck (everything else unresolved): the same "something broke
  *     mid-swap, go look at the chain/logs" bucket that existed before
  *     bridging existed at all — unchanged behavior for same-chain trades.
@@ -49,7 +48,7 @@ export async function checkStuckTrades(bot) {
   const lines = [];
 
   if (bridgeStuck.length > 0) {
-    lines.push(`🌉 ${bridgeStuck.length} trade(s) stuck mid-bridge (likely recoverable, funds probably safe):`);
+    lines.push(`🌉 ${bridgeStuck.length} trade(s) stuck mid-bridge — will attempt auto-resume:`);
     for (const t of bridgeStuck) {
       lines.push(
         `  • [${t.chain}] ${t.side} ${t.amount} on ${t.token_address} (user ${t.uid}, status: ${t.status}` +
@@ -74,6 +73,116 @@ export async function checkStuckTrades(bot) {
   console.warn(
     `${bridgeStuck.length} bridge-stuck + ${swapStuck.length} swap-stuck trade(s) unresolved from before restart. See admin alert / pending_trades table.`
   );
+}
+
+// ---------- Bridge resume poller (Phase 4) ----------
+//
+// Finds every pending_trade stuck in 'bridging' or 'bridged' (i.e. the bot
+// died — or a bridge simply timed out on LI.FI's status endpoint — before
+// the destination-chain swap could run) and tries to finish the job:
+//
+//   'bridging' -> re-check LI.FI's /status for bridge_hash. If DONE, mark
+//                 'bridged' and fall through to the swap step below. If
+//                 still pending, leave it — retry next poll tick.
+//   'bridged'  -> bridge already confirmed landed (either by us just now,
+//                 or before the restart) but the swap leg never ran or
+//                 never got confirmed. Attempt the swap now.
+//
+// A trade is only ever resumed while its uid isn't already locked by
+// tradesInFlight — same lock performBuyCore/performSellCore use — so a
+// resume never races a trade the user initiates manually in the meantime.
+
+async function resumeOneBridgeTrade(bot, trade) {
+  const uid = trade.uid;
+  if (tradesInFlight.has(uid)) return; // something else in flight; retry next tick
+
+  const wallet = getWallet(uid, trade.wallet_id);
+  if (!wallet) {
+    markPendingTradeDone(trade.id, 'failed');
+    await sendAdminAlert(bot.telegram, `Bridge-resume: wallet ${trade.wallet_id} not found for stuck trade ${trade.id} (uid ${uid}) — marked failed.`);
+    return;
+  }
+
+  if (trade.status === 'bridging') {
+    if (!trade.bridge_hash || !trade.bridge_from_chain) return; // nothing to check yet
+    let status;
+    try {
+      status = await checkBridgeStatus({
+        sourceTxHash: trade.bridge_hash,
+        fromChainKey: trade.bridge_from_chain,
+        toChainKey: trade.chain,
+      });
+    } catch (err) {
+      console.warn(`Bridge-resume: status check failed for trade ${trade.id}:`, err.message);
+      return;
+    }
+
+    if (status.status === 'FAILED') {
+      markPendingTradeDone(trade.id, 'failed');
+      await bot.telegram.sendMessage(
+        uid,
+        `❌ A bridge transfer for your pending buy failed (${status.substatusMessage || status.substatus || 'unknown reason'}). ` +
+        `Check your wallet on ${getChain(trade.bridge_from_chain).name} — funds may still be there.`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+      await sendAdminAlert(bot.telegram, `Bridge FAILED for uid ${uid}, trade ${trade.id}: ${status.substatusMessage || status.substatus}`);
+      return;
+    }
+
+    if (status.status !== 'DONE') return; // still in transit, retry next tick
+
+    markPendingTradeBridged(trade.id);
+    trade = { ...trade, status: 'bridged' };
+  }
+
+  if (trade.status !== 'bridged') return;
+
+  tradesInFlight.add(uid);
+  try {
+    markPendingTradeSwapping(trade.id);
+    const result = await performSwapBuy(uid, wallet, trade.chain, trade.token_address, trade.amount, trade.id);
+    const txLink = explorerTxUrl(trade.chain, result.txHash);
+    await bot.telegram.sendMessage(
+      uid,
+      `✅ Your bridged buy on ${getChain(trade.chain).name} just completed automatically after resuming from a bridge delay.` +
+      (txLink ? `\n[View transaction](${txLink})` : ''),
+      { parse_mode: 'Markdown' }
+    ).catch(() => {});
+  } catch (err) {
+    markPendingTradeDone(trade.id, 'failed');
+    await bot.telegram.sendMessage(
+      uid,
+      `⚠️ Your funds bridged successfully to ${getChain(trade.chain).name}, but the follow-up swap failed: ${err.message}. ` +
+      `Your ${getChain(trade.chain).stableSymbol || 'USDC'} balance is safe there — try the trade again manually.`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => {});
+    await sendAdminAlert(bot.telegram, `Bridge-resume swap failed for uid ${uid}, trade ${trade.id}: ${err.message}`);
+  } finally {
+    tradesInFlight.delete(uid);
+  }
+}
+
+export async function resumeStuckBridges(bot) {
+  let bridgeStuck;
+  try {
+    ({ bridgeStuck } = getStuckPendingTradesByKind());
+  } catch (err) {
+    console.error('Bridge-resume: failed to read stuck trades:', err.message);
+    return;
+  }
+  for (const trade of bridgeStuck) {
+    try {
+      await resumeOneBridgeTrade(bot, trade);
+    } catch (err) {
+      console.error(`Bridge-resume: unexpected error on trade ${trade.id}:`, err.message);
+    }
+  }
+}
+
+export function startBridgeResumePoller(bot) {
+  setInterval(() => {
+    resumeStuckBridges(bot).catch((err) => console.error('Bridge-resume poller tick failed:', err.message));
+  }, BRIDGE_RESUME_POLL_INTERVAL_MS);
 }
 
 // ---------- Low balance (native gas token) poller ----------
