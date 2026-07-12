@@ -248,7 +248,7 @@ export async function executeSell(ctx, uid, tokenAddress, pct) {
     const market = await getTokenMarketData(tokenAddress, chainKey).catch(() => null);
     const symbol = market?.symbol ?? shortAddr(tokenAddress);
     const cardBuffer = await generateSellPnlCard({
-      uid, symbol, pct, pnlUsdc, pnlPct,
+      uid, symbol, chainKey, pct, pnlUsdc, pnlPct,
       entryMcap: result.entryMcap ?? null, exitMcap: result.exitMcap ?? null,
     });
     await ctx.replyWithPhoto({ source: cardBuffer });

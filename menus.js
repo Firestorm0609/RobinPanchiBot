@@ -1,16 +1,17 @@
 import { Markup } from 'telegraf';
 import { shortAddr } from './wallet.js';
-import { getEthUsdPrice, getTokenMarketData, fmtUsd, getCachedEthUsdPrice, fmtTokenAmount } from './price.js';
-import { BRIDGE_DIRECTION } from './bridge.js';
+import { getTokenMarketData, fmtUsd, fmtTokenAmount } from './price.js';
+import { getChain, ALL_CHAIN_KEYS } from './chains.js';
 import {
   getUser,
   getSettings,
   getActiveWallet,
+  getActiveChain,
   getPosition,
   getActiveAutoRuleForPosition,
   getAllPositionsForUser,
 } from './storage.js';
-import { dualEthBalanceLines, gasEstimateLine } from './format.js';
+import { chainBalanceLines, allChainsBalanceSummary, gasEstimateLine } from './format.js';
 import { FALLBACK_GAS_LIMIT_BUY } from './config.js';
 
 export function mainMenu() {
@@ -18,7 +19,7 @@ export function mainMenu() {
     [Markup.button.callback('🔍 Trade Token', 'menu_trade')],
     [Markup.button.callback('📊 Positions', 'menu_positions')],
     [Markup.button.callback('💼 Wallets', 'menu_wallets'), Markup.button.callback('💰 Balance', 'menu_balance')],
-    [Markup.button.callback('🌉 Bridge', 'menu_bridge'), Markup.button.callback('⏰ Limit Orders', 'menu_limitorders')],
+    [Markup.button.callback('🔗 Chain', 'menu_chain'), Markup.button.callback('⏰ Limit Orders', 'menu_limitorders')],
     [Markup.button.callback('🎟 Rewards', 'menu_rewards'), Markup.button.callback('⚙️ Settings', 'menu_settings')],
     [Markup.button.callback('❓ Help', 'menu_help')],
     [Markup.button.url('🐦 X', 'https://x.com/robinpanchi')],
@@ -53,20 +54,25 @@ export function walletDetailMenu(walletId) {
 
 export function exportConfirmMenu(walletId) {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('⚠️ Yes, show my key', `wallet_export_confirm_${walletId}`)],
+    [Markup.button.callback('⚠️ Yes, show my keys', `wallet_export_confirm_${walletId}`)],
     [Markup.button.callback('❌ Cancel', 'menu_wallets')],
   ]);
 }
 
-/**
- * Bridging is still ETH-denominated (separate from USDC trading), so the
- * max-bridge-size settings row still needs an ETH->USD estimate. Uses the
- * short-lived cached price since this menu builder is synchronous; falls
- * back to a raw ETH label if there's no fresh cached price yet.
- */
-function bridgeAmountLabel(ethAmount) {
-  const ethUsd = getCachedEthUsdPrice();
-  return ethUsd ? `${ethAmount} ETH (${fmtUsd(ethAmount * ethUsd)})` : `${ethAmount} ETH`;
+// ---------- Chain picker ----------
+// This is the core of the "trade any chain in USDC, no bridging" feature:
+// the user picks an active chain here, and every trade/balance/position
+// call downstream reads it via getActiveChain(uid).
+
+export function chainMenu(uid) {
+  const active = getActiveChain(uid);
+  const rows = ALL_CHAIN_KEYS.map((key) => {
+    const chain = getChain(key);
+    const check = key === active ? '✅ ' : '';
+    return [Markup.button.callback(`${check}${chain.name}`, `chain_select_${key}`)];
+  });
+  rows.push([Markup.button.callback('⬅️ Back', 'menu_main')]);
+  return Markup.inlineKeyboard(rows);
 }
 
 export function settingsMenu(uid) {
@@ -76,9 +82,8 @@ export function settingsMenu(uid) {
     [Markup.button.callback(`Sell presets: ${s.sellPresetsPct.join(', ')}%`, 'settings_sell')],
     [Markup.button.callback(`Slippage: ${(s.slippageBps / 100).toFixed(2)}%`, 'settings_slippage')],
     [Markup.button.callback(`Max buy size: ${fmtUsd(s.maxBuyUsdc)}`, 'settings_maxbuy')],
-    [Markup.button.callback(`Max bridge size: ${bridgeAmountLabel(s.maxBridgeEth)}`, 'settings_maxbridge')],
     [Markup.button.callback(`Gas priority: ${s.gasTier} (tap to cycle)`, 'settings_gastier')],
-    [Markup.button.callback(`Low balance alert: ${s.lowBalanceThresholdEth} ETH`, 'settings_lowbalance')],
+    [Markup.button.callback(`Low balance alert: ${s.lowBalanceThresholdEth} (native token)`, 'settings_lowbalance')],
     [Markup.button.callback(`Confirm before trade: ${s.confirmTrades ? 'ON ✅' : 'OFF ❌'}`, 'settings_toggle_confirm')],
     [Markup.button.callback(`Flex card PnL: ${s.flexPnlMode.toUpperCase()} (tap to cycle)`, 'settings_flexpnl')],
     [Markup.button.callback('⬅️ Back', 'menu_main')],
@@ -92,36 +97,11 @@ export function rewardsMenu() {
   ]);
 }
 
-export function bridgeMenu() {
-  return Markup.inlineKeyboard([
-    [Markup.button.callback('Ethereum ➜ Robinhood', 'bridge_dir_eth_to_robinhood')],
-    [Markup.button.callback('Robinhood ➜ Ethereum', 'bridge_dir_robinhood_to_eth')],
-    [
-      Markup.button.callback('💯 Bridge All (Eth➜Robin)', 'bridgeall_eth_to_robinhood'),
-      Markup.button.callback('💯 Bridge All (Robin➜Eth)', 'bridgeall_robinhood_to_eth'),
-    ],
-    [Markup.button.callback('🕘 Recent Bridges', 'bridge_history')],
-    [Markup.button.callback('⬅️ Back', 'menu_main')],
-  ]);
-}
-
-export function bridgeConfirmMenu(direction, amount) {
-  return Markup.inlineKeyboard([
-    [
-      Markup.button.callback('✅ Confirm', `bridge_confirm_${direction}_${amount}`),
-      Markup.button.callback('❌ Cancel', 'menu_bridge'),
-    ],
-  ]);
-}
-
-export function directionLabel(direction) {
-  return direction === BRIDGE_DIRECTION.ETH_TO_ROBINHOOD ? 'Ethereum ➜ Robinhood' : 'Robinhood ➜ Ethereum';
-}
-
 /**
- * Trades are USDC-denominated directly (1 USDC ≈ $1), so buy preset amounts
- * are shown and passed through as plain USD figures — no price-feed
- * conversion needed anymore.
+ * Trades are USDC-denominated directly on whichever chain is active — no
+ * price-feed conversion needed. Buy/sell/limit/TP-SL callbacks don't encode
+ * the chain; every handler resolves it via getActiveChain(uid) at the
+ * moment it executes, same pattern as getActiveWallet(uid).
  */
 export function tokenMenu(uid, tokenAddress, hasPosition) {
   const s = getSettings(uid);
@@ -152,7 +132,6 @@ export function tokenMenu(uid, tokenAddress, hasPosition) {
   return Markup.inlineKeyboard(rows);
 }
 
-/** Multi-select wallet picker used by Batch Buy. */
 export function batchSelectMenu(uid, selected) {
   const user = getUser(uid);
   const rows = user.wallets.map((w) => {
@@ -166,7 +145,6 @@ export function batchSelectMenu(uid, selected) {
   return Markup.inlineKeyboard(rows);
 }
 
-/** Multi-select wallet picker used by Batch Sell — only wallets passed in `candidates`. */
 export function batchSellSelectMenu(candidates, selected) {
   const rows = candidates.map((w) => {
     const checked = selected.includes(w.id) ? '☑️ ' : '⬜ ';
@@ -179,7 +157,6 @@ export function batchSellSelectMenu(candidates, selected) {
   return Markup.inlineKeyboard(rows);
 }
 
-/** Multi-select wallet picker used by Batch Fund — only wallets passed in `candidates` (source excluded). */
 export function batchFundSelectMenu(candidates, selected) {
   const rows = candidates.map((w) => {
     const checked = selected.includes(w.id) ? '☑️ ' : '⬜ ';
@@ -192,7 +169,6 @@ export function batchFundSelectMenu(candidates, selected) {
   return Markup.inlineKeyboard(rows);
 }
 
-/** Multi-select wallet picker used by Batch Collect — sources feeding one chosen destination. */
 export function collectSelectMenu(candidates, selected) {
   const rows = candidates.map((w) => {
     const checked = selected.includes(w.id) ? '☑️ ' : '⬜ ';
@@ -214,7 +190,6 @@ export function confirmMenu(kind, tokenAddress, value) {
   ]);
 }
 
-/** "⬅️ Back" plus a "🔄 Refresh" button — used by the Positions view. */
 export function refreshBackMenu(refreshAction) {
   return Markup.inlineKeyboard([
     [Markup.button.callback('🔄 Refresh', refreshAction), Markup.button.callback('⬅️ Back', 'menu_main')],
@@ -223,25 +198,20 @@ export function refreshBackMenu(refreshAction) {
 
 // ---------- Limit orders: list + cancel ----------
 
-/**
- * Renders the user's open limit orders as text + one cancel button per
- * order. `market` is an optional Map<tokenAddress, marketData> the caller
- * can pre-fetch so symbols show up instead of raw addresses — falls back
- * to a shortened address if not supplied or lookup failed for that token.
- */
-export function limitOrdersText(orders, marketByToken = new Map()) {
+export function limitOrdersText(orders, marketByKey = new Map()) {
   if (orders.length === 0) {
     return '⏰ *Limit Orders*\n\nNo open limit orders.';
   }
   const lines = orders.map((o) => {
-    const market = marketByToken.get(o.token_address);
+    const market = marketByKey.get(`${o.chain}:${o.token_address}`);
     const label = market?.symbol ?? shortAddr(o.token_address);
+    const chainName = getChain(o.chain).name;
     const mcapLabel = o.target_mcap != null
       ? fmtUsd(o.target_mcap)
       : `$${Number(o.trigger_price).toPrecision(4)} (price)`;
     const amountLabel = o.side === 'buy' ? fmtUsd(o.amount) : `${fmtTokenAmount(Number(o.amount))} tokens`;
     const dir = o.side === 'buy' ? '≤' : '≥';
-    return `*${label}* — ${o.side.toUpperCase()} ${amountLabel} @ mcap ${dir} ${mcapLabel}`;
+    return `*${label}* _(${chainName})_ — ${o.side.toUpperCase()} ${amountLabel} @ mcap ${dir} ${mcapLabel}`;
   });
   return `⏰ *Limit Orders*\n\n${lines.join('\n')}`;
 }
@@ -256,24 +226,28 @@ export function limitOrdersMenu(orders) {
 }
 
 // ---------- Token info + PnL rendering ----------
+// Always operates on the user's currently active chain (getActiveChain).
 
 export async function renderTokenCard(uid, tokenAddress) {
   const w = getActiveWallet(uid);
   if (!w) return { text: 'No active wallet. Add one first.', markup: walletsMenu(uid) };
 
-  const market = await getTokenMarketData(tokenAddress).catch(() => null);
+  const chainKey = getActiveChain(uid);
+  const chain = getChain(chainKey);
+  const market = await getTokenMarketData(tokenAddress, chainKey).catch(() => null);
 
   if (!market) {
     return {
-      text: `No market data found for:\n\`${tokenAddress}\`\n\nPool may not exist yet, or DexScreener hasn't indexed it.`,
+      text: `No market data found on *${chain.name}* for:\n\`${tokenAddress}\`\n\nPool may not exist on this chain yet, or DexScreener hasn't indexed it. Try a different chain under 🔗 Chain.`,
       markup: Markup.inlineKeyboard([
         [Markup.button.callback('🔄 Refresh', `refresh_${tokenAddress}`)],
+        [Markup.button.callback('🔗 Switch Chain', 'menu_chain')],
         [Markup.button.callback('⬅️ Back', 'menu_main')],
       ]),
     };
   }
 
-  const pos = getPosition(uid, w.id, tokenAddress);
+  const pos = getPosition(uid, w.id, chainKey, tokenAddress);
   let pnlLine = '';
   if (pos && pos.tokenAmount > 0) {
     const currentValueUsd = pos.tokenAmount * market.priceUsd;
@@ -290,7 +264,7 @@ export async function renderTokenCard(uid, tokenAddress) {
         pnlLine += ` → Now: ${fmtUsd(market.marketCap)} (${mcapEmoji} ${mcapChangePct >= 0 ? '+' : ''}${mcapChangePct.toFixed(1)}%)`;
       }
     }
-    const rule = getActiveAutoRuleForPosition(uid, w.id, tokenAddress);
+    const rule = getActiveAutoRuleForPosition(uid, w.id, chainKey, tokenAddress);
     if (rule) {
       const parts = [];
       if (rule.tp_pct != null) parts.push(`TP +${rule.tp_pct}%`);
@@ -300,18 +274,15 @@ export async function renderTokenCard(uid, tokenAddress) {
   }
 
   const changeLine = market.priceChange24h !== null ? ` (${market.priceChange24h >= 0 ? '+' : ''}${market.priceChange24h.toFixed(1)}%)` : '';
-  const walletBalance = await dualEthBalanceLines(w.address).catch(() => 'unavailable');
-  // Est. network fee for a trade on this token — same estimate shown on the
-  // buy/sell confirm screens, surfaced here too so it's visible before the
-  // user even taps Buy/Sell.
-  const gasLine = await gasEstimateLine(uid, FALLBACK_GAS_LIMIT_BUY).catch(() => '');
+  const walletBalance = await chainBalanceLines(w, chainKey).catch(() => 'unavailable');
+  const gasLine = await gasEstimateLine(chainKey, uid, FALLBACK_GAS_LIMIT_BUY).catch(() => '');
 
   const text =
-    `*${market.symbol}*\n\`${tokenAddress}\`\n\n` +
+    `*${market.symbol}* _(${chain.name})_\n\`${tokenAddress}\`\n\n` +
     `Price: $${market.priceUsd.toPrecision(4)}${changeLine}\n` +
     `Market Cap: ${fmtUsd(market.marketCap)}\n` +
     `Liquidity: ${fmtUsd(market.liquidityUsd)}\n` +
-    `Your balance:\n${walletBalance}` +
+    `Your balance on ${chain.name}:\n${walletBalance}` +
     gasLine +
     pnlLine;
 
@@ -319,7 +290,7 @@ export async function renderTokenCard(uid, tokenAddress) {
 }
 
 // ---------- Positions list rendering ----------
-// Covers every open position across ALL of the user's wallets.
+// Covers every open position across ALL wallets AND ALL chains.
 
 export async function renderPositionsView(uid) {
   const positions = getAllPositionsForUser(uid);
@@ -336,8 +307,9 @@ export async function renderPositionsView(uid) {
   let anyPriceUnavailable = false;
 
   for (const pos of positions) {
-    const market = await getTokenMarketData(pos.tokenAddress).catch(() => null);
+    const market = await getTokenMarketData(pos.tokenAddress, pos.chain).catch(() => null);
     const symbol = market?.symbol ?? shortAddr(pos.tokenAddress);
+    const chainName = getChain(pos.chain).name;
     if (market) {
       const valueUsd = pos.tokenAmount * market.priceUsd;
       const costUsd = pos.costUsdc;
@@ -346,12 +318,12 @@ export async function renderPositionsView(uid) {
       const pnlUsd = valueUsd - costUsd;
       const pnlPct = costUsd > 0 ? (pnlUsd / costUsd) * 100 : 0;
       const emoji = pnlUsd >= 0 ? '🟢' : '🔴';
-      let line = `*${symbol}* (${pos.walletName}): ${fmtTokenAmount(pos.tokenAmount)} — ${fmtUsd(valueUsd)} (${emoji} ${pnlPct.toFixed(1)}%)`;
+      let line = `*${symbol}* (${pos.walletName} — ${chainName}): ${fmtTokenAmount(pos.tokenAmount)} — ${fmtUsd(valueUsd)} (${emoji} ${pnlPct.toFixed(1)}%)`;
       if (pos.entryMcap != null) line += `\n  Entry mcap: ${fmtUsd(pos.entryMcap)}`;
       lines.push(line);
     } else {
       anyPriceUnavailable = true;
-      lines.push(`*${symbol}* (${pos.walletName}): ${fmtTokenAmount(pos.tokenAmount)} — price unavailable`);
+      lines.push(`*${symbol}* (${pos.walletName} — ${chainName}): ${fmtTokenAmount(pos.tokenAmount)} — price unavailable`);
     }
   }
 
@@ -361,7 +333,7 @@ export async function renderPositionsView(uid) {
   const disclaimer = anyPriceUnavailable ? '\n_Totals exclude positions with unavailable pricing._' : '';
 
   const text =
-    `📊 *Positions* — all wallets\n\n` +
+    `📊 *Positions* — all wallets, all chains\n\n` +
     `Total value: ${fmtUsd(totalValueUsd)}\n` +
     `Total cost: ${fmtUsd(totalCostUsd)}\n` +
     `Total PnL: ${totalEmoji} ${fmtUsd(totalPnlUsd)} (${totalPnlPct.toFixed(1)}%)${disclaimer}\n\n` +

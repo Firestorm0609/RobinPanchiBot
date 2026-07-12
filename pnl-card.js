@@ -3,13 +3,13 @@ import path from 'path';
 import crypto from 'crypto';
 import { getActiveWallet, getPosition, getRealizedPnl, getSettings } from './storage.js';
 import { getTokenMarketData, fmtUsd, fmtTokenAmount } from './price.js';
+import { getChain } from './chains.js';
 import { shortAddr } from './wallet.js';
 
 const NFT_DIR = path.join(process.cwd(), 'assets', 'nft-cards');
 const NFT_COUNT = 100;
 const CARD_SIZE = 800;
 
-/** Random NFT pick per card generation (was deterministic per-uid before — that's why it always showed #70). */
 function pickNftIndex() {
   return (crypto.randomBytes(4).readUInt32BE(0) % NFT_COUNT) + 1;
 }
@@ -18,15 +18,6 @@ function escapeXml(str) {
   return String(str).replace(/[<>&'"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' }[c]));
 }
 
-/**
- * Builds the PnL VALUE label string (USD amount) according to the user's
- * flexPnlMode setting: 'usdc' | 'hidden'. Returns null if the mode is
- * 'hidden' or the figure isn't available.
- * NOTE: this only controls the value shown top-right — the PnL percentage
- * stat at the bottom of the card is shown regardless of mode, since
- * "hidden" only means "don't show my exact USD amount", not "don't show
- * my % return".
- */
 function formatPnlLabel(mode, pnlUsdc) {
   if (mode === 'hidden') return null;
   if (pnlUsdc == null) return null;
@@ -73,10 +64,6 @@ function buildOverlaySvg({ symbol, subtitle, pnlLabel, isWin, stats, footerLeft,
   </svg>`;
 }
 
-/**
- * Composites the overlay onto a randomly-picked NFT background.
- * `stats` is up to 3 { label, value, color? } columns shown along the bottom.
- */
 async function renderCard({ symbol, subtitle, pnlLabel, isWin, stats }) {
   const idx = pickNftIndex();
   const imgPath = path.join(NFT_DIR, `${idx}.jpg`);
@@ -94,16 +81,12 @@ async function renderCard({ symbol, subtitle, pnlLabel, isWin, stats }) {
     .toBuffer();
 }
 
-/**
- * Realized-PnL card for a completed sell. Pass everything already computed
- * by the caller (trade-core.js) — this module doesn't re-fetch trade data.
- * Respects the user's flexPnlMode setting: 'usdc' | 'hidden'. 'hidden' only
- * suppresses the exact USD PnL value — the % return stat still shows either way.
- */
-export async function generateSellPnlCard({ uid, symbol, pct, pnlUsdc, pnlPct, entryMcap, exitMcap }) {
+/** Realized-PnL card for a completed sell on a specific chain. */
+export async function generateSellPnlCard({ uid, symbol, chainKey, pct, pnlUsdc, pnlPct, entryMcap, exitMcap }) {
   const { flexPnlMode } = getSettings(uid);
   const isWin = pnlUsdc >= 0;
   const pnlLabel = formatPnlLabel(flexPnlMode, pnlUsdc);
+  const chainName = chainKey ? getChain(chainKey).name : null;
 
   const stats = [
     { label: 'Entry mcap', value: entryMcap != null ? fmtUsd(entryMcap) : 'n/a' },
@@ -111,19 +94,19 @@ export async function generateSellPnlCard({ uid, symbol, pct, pnlUsdc, pnlPct, e
     { label: 'PnL', value: `${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`, color: isWin ? '#97C459' : '#E24B4A' },
   ];
 
-  return renderCard({ symbol, subtitle: `Sold ${pct}% of position`, pnlLabel, isWin, stats });
+  return renderCard({
+    symbol,
+    subtitle: chainName ? `Sold ${pct}% of position (${chainName})` : `Sold ${pct}% of position`,
+    pnlLabel, isWin, stats,
+  });
 }
 
-/**
- * Unrealized-PnL "flex" card for /flex on an OPEN position — looks up the
- * user's live position on the given token itself, so callers just pass
- * uid + tokenAddress.
- */
-async function generateOpenPositionFlexCard(uid, wallet, tokenAddress, pos) {
-  const market = await getTokenMarketData(tokenAddress).catch(() => null);
+async function generateOpenPositionFlexCard(uid, wallet, chainKey, tokenAddress, pos) {
+  const market = await getTokenMarketData(tokenAddress, chainKey).catch(() => null);
   if (!market) return null;
 
   const { flexPnlMode } = getSettings(uid);
+  const chainName = getChain(chainKey).name;
 
   const valueUsd = pos.tokenAmount * market.priceUsd;
   const costUsd = pos.costUsdc;
@@ -140,23 +123,19 @@ async function generateOpenPositionFlexCard(uid, wallet, tokenAddress, pos) {
 
   return renderCard({
     symbol: market.symbol,
-    subtitle: pos.entryMcap != null ? `Entry mcap ${fmtUsd(pos.entryMcap)}` : 'Open position',
+    subtitle: pos.entryMcap != null ? `Entry mcap ${fmtUsd(pos.entryMcap)} (${chainName})` : `Open position (${chainName})`,
     pnlLabel,
     isWin,
     stats,
   });
 }
 
-/**
- * Realized-PnL "flex" card for a CLOSED position — position has no live
- * tokenAmount left, so this sums the wallet's full buy/sell history for the
- * token (via getRealizedPnl) and flexes total profit/loss instead.
- */
-async function generateClosedPositionFlexCard(uid, wallet, tokenAddress) {
-  const realized = getRealizedPnl(uid, wallet.id, tokenAddress);
+async function generateClosedPositionFlexCard(uid, wallet, chainKey, tokenAddress) {
+  const realized = getRealizedPnl(uid, wallet.id, chainKey, tokenAddress);
   if (!realized || realized.totalBuyUsdc <= 0) return null;
 
   const { flexPnlMode } = getSettings(uid);
+  const chainName = getChain(chainKey).name;
 
   const { totalBuyUsdc, totalSellUsdc, entryMcap, exitMcap } = realized;
   const pnlUsdc = totalSellUsdc - totalBuyUsdc;
@@ -164,7 +143,7 @@ async function generateClosedPositionFlexCard(uid, wallet, tokenAddress) {
   const isWin = pnlUsdc >= 0;
   const pnlLabel = formatPnlLabel(flexPnlMode, pnlUsdc);
 
-  const market = await getTokenMarketData(tokenAddress).catch(() => null);
+  const market = await getTokenMarketData(tokenAddress, chainKey).catch(() => null);
   const symbol = market?.symbol ?? shortAddr(tokenAddress);
 
   const stats = [
@@ -173,24 +152,22 @@ async function generateClosedPositionFlexCard(uid, wallet, tokenAddress) {
     { label: 'PnL', value: `${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%`, color: isWin ? '#97C459' : '#E24B4A' },
   ];
 
-  return renderCard({ symbol, subtitle: 'Closed position', pnlLabel, isWin, stats });
+  return renderCard({ symbol, subtitle: `Closed position (${chainName})`, pnlLabel, isWin, stats });
 }
 
 /**
- * Entry point used by /flex. Works for BOTH an open position (live
- * unrealized PnL vs. current price) and a fully closed one (realized PnL
- * summed from trade history). Returns null if there's no active wallet, or
- * no trade history at all for this token — the caller shows a "no position"
- * message in that case.
+ * Entry point used by /flex. `chainKey` is the user's active chain — flex
+ * only looks at that chain's position/history for this token (a token
+ * address can exist on multiple EVM chains as unrelated tokens).
  */
-export async function generateFlexCard(uid, tokenAddress) {
+export async function generateFlexCard(uid, chainKey, tokenAddress) {
   const w = getActiveWallet(uid);
   if (!w) return null;
 
-  const pos = getPosition(uid, w.id, tokenAddress);
+  const pos = getPosition(uid, w.id, chainKey, tokenAddress);
   if (pos && pos.tokenAmount > 0) {
-    return generateOpenPositionFlexCard(uid, w, tokenAddress, pos);
+    return generateOpenPositionFlexCard(uid, w, chainKey, tokenAddress, pos);
   }
 
-  return generateClosedPositionFlexCard(uid, w, tokenAddress);
+  return generateClosedPositionFlexCard(uid, w, chainKey, tokenAddress);
 }

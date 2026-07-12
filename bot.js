@@ -2,21 +2,20 @@ import { bot } from './bot-instance.js';
 import { sendAdminAlert } from './alerts.js';
 import { stopAllAutoRefreshes } from './state.js';
 import {
-  checkStuckTrades, checkStuckBridges, startBridgePoller, startLowBalancePoller,
-  startAutoTradePoller, startLimitOrderPoller,
+  checkStuckTrades, startLowBalancePoller, startAutoTradePoller, startLimitOrderPoller,
 } from './pollers.js';
 
 // Each of these registers its bot.command/bot.action/bot.on handlers as a
 // side effect of being imported — order doesn't matter except that
 // bot-instance.js (above) must be created first, which it is via `bot`.
 import './handlers/menu.js';
+import './handlers/chain.js';
 import './handlers/wallets.js';
 import './handlers/positions.js';
 import './handlers/settings.js';
-import './handlers/rewards.js';
-import './handlers/bridge.js';
 import './handlers/token.js';
 import './handlers/batch.js';
+import './handlers/rewards.js';
 import './handlers/text.js'; // must be last: registers the catch-all bot.on('text', ...)
 
 process.on('unhandledRejection', (err) => {
@@ -33,8 +32,6 @@ process.on('uncaughtException', (err) => {
 
 bot.launch()
   .then(() => checkStuckTrades(bot))
-  .then(() => checkStuckBridges(bot))
-  .then(() => startBridgePoller(bot))
   .then(() => startLowBalancePoller(bot))
   .then(() => startAutoTradePoller(bot))
   .then(() => startLimitOrderPoller(bot))
@@ -44,7 +41,7 @@ bot.launch()
     process.exit(1);
   });
 
-console.log('Panchi trading bot running.');
+console.log('Panchi trading bot running — multichain (EVM + Solana), native USDC, no bridging.');
 
 process.once('SIGINT', () => { stopAllAutoRefreshes(); bot.stop('SIGINT'); });
 process.once('SIGTERM', () => { stopAllAutoRefreshes(); bot.stop('SIGTERM'); });
