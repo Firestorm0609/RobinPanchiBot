@@ -191,6 +191,29 @@ if (!columnsOf('limit_orders').includes('target_mcap')) {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-chain bridging (Phase 2 of CROSSCHAIN_BUILD_PLAN.md):
+// pending_trades.bridge_hash — a bridge-then-swap buy is TWO on-chain
+// transactions (bridge leg + swap leg), so it needs its own hash column
+// separate from `tx_hash` (which now specifically means "the swap leg's
+// tx hash" once bridging is involved — for a same-chain trade, which is
+// still the overwhelming majority of trades, tx_hash behaves exactly as
+// before and bridge_hash just stays NULL).
+//
+// Status enum is now: 'pending' -> ['bridging' -> 'bridged' ->] 'submitted'
+// -> 'confirmed' | 'failed'. The bridging/bridged stages are skipped
+// entirely for a same-chain trade — createPendingTrade() still starts at
+// 'pending' and markPendingTradeSubmitted()/markPendingTradeDone() behave
+// identically to before for those, so trade-core.js's EXISTING same-chain
+// buy/sell code needs zero changes for this migration to be safe to deploy.
+// ---------------------------------------------------------------------------
+if (!columnsOf('pending_trades').includes('bridge_hash')) {
+  db.exec('ALTER TABLE pending_trades ADD COLUMN bridge_hash TEXT');
+}
+if (!columnsOf('pending_trades').includes('bridge_from_chain')) {
+  db.exec('ALTER TABLE pending_trades ADD COLUMN bridge_from_chain TEXT');
+}
+
+// ---------------------------------------------------------------------------
 // Indexes that reference `chain` — created AFTER the migration above
 // guarantees the column exists on every table, regardless of whether this
 // is a fresh install or an upgrade from a pre-multichain database.
@@ -471,17 +494,46 @@ export function updateSettings(uid, patch) {
 }
 
 // ---------------------------------------------------------------------------
-// Pending trades (crash recovery) — now chain-scoped
+// Pending trades (crash recovery) — chain-scoped, and now bridge-aware.
+//
+// Status lifecycle:
+//   same-chain trade:  pending -> submitted -> confirmed | failed
+//   bridge-then-swap:  pending -> bridging -> bridged -> submitted -> confirmed | failed
+//                                     \-> failed (bridge itself failed/timed out)
+//
+// `tx_hash` is always the SWAP leg's hash (or the only leg's hash, for a
+// same-chain trade). `bridge_hash` is the BRIDGE leg's source-chain tx hash,
+// set only when a bridge was involved. `bridge_from_chain` records which
+// chain the funds were bridged FROM, so a restart-recovery poller can call
+// bridge.js's checkBridgeStatus() without having to guess the source chain.
 // ---------------------------------------------------------------------------
 
 export function createPendingTrade({ uid, walletId, chain, tokenAddress, side, amount }) {
   const id = `pt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const now = Date.now();
   db.prepare(`
-    INSERT INTO pending_trades (id, uid, wallet_id, chain, token_address, side, amount, status, tx_hash, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)
+    INSERT INTO pending_trades (id, uid, wallet_id, chain, token_address, side, amount, status, tx_hash, bridge_hash, bridge_from_chain, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, ?, ?)
   `).run(id, String(uid), walletId, chain, tokenAddress, side, amount, now, now);
   return id;
+}
+
+/** Call when the bridge leg's source-chain tx has just been sent (not yet confirmed by LI.FI). */
+export function markPendingTradeBridging(id, bridgeTxHash, fromChain) {
+  db.prepare('UPDATE pending_trades SET status = ?, bridge_hash = ?, bridge_from_chain = ?, updated_at = ? WHERE id = ?')
+    .run('bridging', bridgeTxHash, fromChain, Date.now(), id);
+}
+
+/** Call once LI.FI reports the bridge leg as DONE — funds have landed on the destination chain, swap leg hasn't started yet. */
+export function markPendingTradeBridged(id) {
+  db.prepare('UPDATE pending_trades SET status = ?, updated_at = ? WHERE id = ?')
+    .run('bridged', Date.now(), id);
+}
+
+/** Call when the destination-chain swap tx has just been sent (mirrors markPendingTradeSubmitted's role for a same-chain trade). */
+export function markPendingTradeSwapping(id) {
+  db.prepare('UPDATE pending_trades SET status = ?, updated_at = ? WHERE id = ?')
+    .run('swapping', Date.now(), id);
 }
 
 export function markPendingTradeSubmitted(id, txHash) {
@@ -494,8 +546,31 @@ export function markPendingTradeDone(id, status) {
     .run(status, Date.now(), id);
 }
 
+/** Every trade not yet in a terminal state ('confirmed' | 'failed'). */
 export function getStuckPendingTrades() {
-  return db.prepare(`SELECT * FROM pending_trades WHERE status IN ('pending', 'submitted') ORDER BY created_at ASC`).all();
+  return db.prepare(`
+    SELECT * FROM pending_trades
+    WHERE status IN ('pending', 'bridging', 'bridged', 'swapping', 'submitted')
+    ORDER BY created_at ASC
+  `).all();
+}
+
+/**
+ * Same as getStuckPendingTrades but split by recoverability, for
+ * checkStuckTrades()'s restart-recovery admin alert:
+ *   - bridgeStuck: status is 'bridging' or 'bridged' — the bridge leg has a
+ *     bridge_hash to re-check via bridge.js's checkBridgeStatus(); funds are
+ *     probably fine (either mid-transit or already landed), just need the
+ *     swap leg resumed once bridged.
+ *   - swapStuck: everything else unresolved ('pending', 'swapping',
+ *     'submitted' with no bridge involved) — same "verify manually" bucket
+ *     that existed before Phase 2.
+ */
+export function getStuckPendingTradesByKind() {
+  const all = getStuckPendingTrades();
+  const bridgeStuck = all.filter((t) => t.status === 'bridging' || t.status === 'bridged');
+  const swapStuck = all.filter((t) => t.status !== 'bridging' && t.status !== 'bridged');
+  return { bridgeStuck, swapStuck };
 }
 
 // ---------------------------------------------------------------------------
