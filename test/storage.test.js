@@ -18,37 +18,39 @@ after(() => {
 
 test('addWallet + getWallet round-trips a private key through encryption', () => {
   const uid = 'u1';
-  const w = storage.addWallet(uid, { name: 'Main', address: '0xabc', privateKey: '0xdeadbeef' });
+  const w = storage.addWallet(uid, { name: 'Main', evmAddress: '0xabc', evmPrivateKey: '0xdeadbeef' });
   const fetched = storage.getWallet(uid, w.id);
   assert.equal(fetched.privateKey, '0xdeadbeef');
 });
 
 test('recordTrade: buy then partial sell computes correct running cost basis', () => {
   const uid = 'u2';
-  const w = storage.addWallet(uid, { name: 'W', address: '0x1', privateKey: '0xkey' });
+  const w = storage.addWallet(uid, { name: 'W', evmAddress: '0x1', evmPrivateKey: '0xkey' });
   const token = '0xTokenAddress000000000000000000000000001';
+  const chain = 'base';
 
-  storage.recordTrade(uid, w.id, token, 'buy', 100, 1.0); // 100 tokens for 1 ETH
-  let pos = storage.getPosition(uid, w.id, token);
+  storage.recordTrade(uid, w.id, chain, token, 'buy', 100, 1.0); // 100 tokens for 1 USDC
+  let pos = storage.getPosition(uid, w.id, chain, token);
   assert.equal(pos.tokenAmount, 100);
-  assert.equal(pos.costEth, 1.0);
+  assert.equal(pos.costUsdc, 1.0);
 
-  storage.recordTrade(uid, w.id, token, 'sell', 50, 0.6); // sell half the tokens
-  pos = storage.getPosition(uid, w.id, token);
+  storage.recordTrade(uid, w.id, chain, token, 'sell', 50, 0.6); // sell half the tokens
+  pos = storage.getPosition(uid, w.id, chain, token);
   assert.equal(pos.tokenAmount, 50);
-  assert.equal(pos.costEth, 0.5); // half the cost basis removed proportionally
+  assert.equal(pos.costUsdc, 0.5); // half the cost basis removed proportionally
 });
 
 test('recordTrade: selling more than held clamps at zero, not negative', () => {
   const uid = 'u3';
-  const w = storage.addWallet(uid, { name: 'W', address: '0x2', privateKey: '0xkey' });
+  const w = storage.addWallet(uid, { name: 'W', evmAddress: '0x2', evmPrivateKey: '0xkey' });
   const token = '0xTokenAddress000000000000000000000000002';
+  const chain = 'base';
 
-  storage.recordTrade(uid, w.id, token, 'buy', 10, 1.0);
-  storage.recordTrade(uid, w.id, token, 'sell', 999, 5.0); // way more than held
-  const pos = storage.getPosition(uid, w.id, token);
+  storage.recordTrade(uid, w.id, chain, token, 'buy', 10, 1.0);
+  storage.recordTrade(uid, w.id, chain, token, 'sell', 999, 5.0); // way more than held
+  const pos = storage.getPosition(uid, w.id, chain, token);
   assert.equal(pos.tokenAmount, 0);
-  assert.equal(pos.costEth, 0);
+  assert.equal(pos.costUsdc, 0);
 });
 
 test('getOrCreateReferralCode is stable across calls and unique per user', () => {
