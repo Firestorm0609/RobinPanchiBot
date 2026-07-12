@@ -169,6 +169,20 @@ if (!userCols.includes('referral_code')) {
 }
 db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code ON users(referral_code)');
 
+// trade_log.eth_amount -> usdc_amount. Pre-multichain databases stored trade
+// size in a column called `eth_amount` (back when this bot only traded on
+// Robinhood Chain and amounts were ETH-denominated). The bot now trades in
+// each chain's settlement stablecoin, and every query in this file reads
+// `usdc_amount` — so an old db that still has `eth_amount` needs the column
+// renamed (values are carried over as-is; see note in README/changelog if
+// you need to distinguish pre-migration rows, since their numeric values
+// were ETH quantities, not USD).
+if (!columnsOf('trade_log').includes('usdc_amount') && columnsOf('trade_log').includes('eth_amount')) {
+  db.exec('ALTER TABLE trade_log RENAME COLUMN eth_amount TO usdc_amount');
+} else if (!columnsOf('trade_log').includes('usdc_amount')) {
+  db.exec('ALTER TABLE trade_log ADD COLUMN usdc_amount REAL NOT NULL DEFAULT 0');
+}
+
 if (!columnsOf('positions').includes('entry_mcap')) {
   db.exec('ALTER TABLE positions ADD COLUMN entry_mcap REAL');
 }
