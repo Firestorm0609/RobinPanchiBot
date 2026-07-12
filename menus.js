@@ -8,6 +8,7 @@ import {
   getActiveWallet,
   getPosition,
   getActiveAutoRuleForPosition,
+  getAllPositionsForUser,
 } from './storage.js';
 import { dualEthBalanceLines, gasEstimateLine } from './format.js';
 import { FALLBACK_GAS_LIMIT_BUY } from './config.js';
@@ -15,7 +16,7 @@ import { FALLBACK_GAS_LIMIT_BUY } from './config.js';
 export function mainMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('🔍 Trade Token', 'menu_trade')],
-    [Markup.button.callback('📊 Positions', 'menu_positions'), Markup.button.callback('📈 Portfolio', 'menu_portfolio')],
+    [Markup.button.callback('📊 Positions', 'menu_positions')],
     [Markup.button.callback('💼 Wallets', 'menu_wallets'), Markup.button.callback('💰 Balance', 'menu_balance')],
     [Markup.button.callback('🌉 Bridge', 'menu_bridge'), Markup.button.callback('⏰ Limit Orders', 'menu_limitorders')],
     [Markup.button.callback('🎟 Rewards', 'menu_rewards'), Markup.button.callback('⚙️ Settings', 'menu_settings')],
@@ -213,7 +214,7 @@ export function confirmMenu(kind, tokenAddress, value) {
   ]);
 }
 
-/** "⬅️ Back" plus a "🔄 Refresh" button — used by Positions and Portfolio views. */
+/** "⬅️ Back" plus a "🔄 Refresh" button — used by the Positions view. */
 export function refreshBackMenu(refreshAction) {
   return Markup.inlineKeyboard([
     [Markup.button.callback('🔄 Refresh', refreshAction), Markup.button.callback('⬅️ Back', 'menu_main')],
@@ -320,58 +321,18 @@ export async function renderTokenCard(uid, tokenAddress) {
   return { text, markup: tokenMenu(uid, tokenAddress, !!(pos && pos.tokenAmount > 0), ethUsd) };
 }
 
-// ---------- Positions list + Portfolio summary rendering ----------
-// Pulled out into standalone builders (rather than left inline in bot.js)
-// so both the manual "🔄 Refresh" button and the 30s auto-refresh timer can
-// call the exact same rendering logic and stay in sync.
+// ---------- Positions list rendering ----------
+// Covers every open position across ALL of the user's wallets. This used to
+// be split between a per-wallet "Positions" view and an all-wallet
+// "Portfolio" summary — they showed near-identical info, so Positions now
+// does both: a combined total up top, then each position labeled with the
+// wallet it's held in.
 
 export async function renderPositionsView(uid) {
-  const w = getActiveWallet(uid);
-  if (!w) return { text: 'No active wallet. Add one first.', markup: walletsMenu(uid) };
-
-  const { getAllPositions } = await import('./storage.js');
-  const positions = getAllPositions(uid, w.id);
+  const positions = getAllPositionsForUser(uid);
   if (positions.length === 0) {
     return {
       text: '📊 No positions yet. Trade a token to open one.',
-      markup: Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_main')]]),
-    };
-  }
-
-  const ethUsd = await getEthUsdPrice().catch(() => null);
-  const rows = [];
-  let text = `📊 *Positions* — ${w.name}\n`;
-
-  for (const pos of positions) {
-    const market = await getTokenMarketData(pos.tokenAddress).catch(() => null);
-    const symbol = market?.symbol ?? shortAddr(pos.tokenAddress);
-    if (market && ethUsd) {
-      const valueUsd = pos.tokenAmount * market.priceUsd;
-      const costUsd = pos.costEth * ethUsd;
-      const pnlUsd = valueUsd - costUsd;
-      const pnlPct = costUsd > 0 ? (pnlUsd / costUsd) * 100 : 0;
-      const emoji = pnlUsd >= 0 ? '🟢' : '🔴';
-      text += `\n*${symbol}*: ${fmtTokenAmount(pos.tokenAmount)} — ${fmtUsd(valueUsd)} (${emoji} ${pnlPct.toFixed(1)}%)`;
-      if (pos.entryMcap != null) {
-        text += `\n  Entry mcap: ${fmtUsd(pos.entryMcap)}`;
-      }
-    } else {
-      text += `\n*${symbol}*: ${fmtTokenAmount(pos.tokenAmount)} — price unavailable`;
-    }
-    rows.push([Markup.button.callback(`View ${symbol}`, `refresh_${pos.tokenAddress}`)]);
-  }
-
-  rows.push([Markup.button.callback('🔄 Refresh', 'menu_positions_refresh'), Markup.button.callback('⬅️ Back', 'menu_main')]);
-  return { text, markup: Markup.inlineKeyboard(rows) };
-}
-
-export async function renderPortfolioView(uid) {
-  const { getAllPositionsForUser } = await import('./storage.js');
-  const positions = getAllPositionsForUser(uid);
-
-  if (positions.length === 0) {
-    return {
-      text: '📈 No open positions across any wallet yet.',
       markup: Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu_main')]]),
     };
   }
@@ -393,12 +354,12 @@ export async function renderPortfolioView(uid) {
       const pnlUsd = valueUsd - costUsd;
       const pnlPct = costUsd > 0 ? (pnlUsd / costUsd) * 100 : 0;
       const emoji = pnlUsd >= 0 ? '🟢' : '🔴';
-      let line = `*${symbol}* (${pos.walletName}): ${fmtUsd(valueUsd)} (${emoji} ${pnlPct.toFixed(1)}%)`;
+      let line = `*${symbol}* (${pos.walletName}): ${fmtTokenAmount(pos.tokenAmount)} — ${fmtUsd(valueUsd)} (${emoji} ${pnlPct.toFixed(1)}%)`;
       if (pos.entryMcap != null) line += `\n  Entry mcap: ${fmtUsd(pos.entryMcap)}`;
       lines.push(line);
     } else {
       anyPriceUnavailable = true;
-      lines.push(`*${symbol}* (${pos.walletName}): price unavailable`);
+      lines.push(`*${symbol}* (${pos.walletName}): ${fmtTokenAmount(pos.tokenAmount)} — price unavailable`);
     }
   }
 
@@ -408,11 +369,11 @@ export async function renderPortfolioView(uid) {
   const disclaimer = anyPriceUnavailable ? '\n_Totals exclude positions with unavailable pricing._' : '';
 
   const text =
-    `📈 *Portfolio Summary* — all wallets\n\n` +
+    `📊 *Positions* — all wallets\n\n` +
     `Total value: ${fmtUsd(totalValueUsd)}\n` +
     `Total cost: ${fmtUsd(totalCostUsd)}\n` +
     `Total PnL: ${totalEmoji} ${fmtUsd(totalPnlUsd)} (${totalPnlPct.toFixed(1)}%)${disclaimer}\n\n` +
-    `*Positions:*\n${lines.join('\n')}`;
+    lines.join('\n');
 
-  return { text, markup: refreshBackMenu('menu_portfolio_refresh') };
+  return { text, markup: refreshBackMenu('menu_positions_refresh') };
 }
