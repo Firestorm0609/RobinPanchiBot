@@ -25,7 +25,7 @@ import {
   provider, ethMainnetProvider, CA_REGEX, FALLBACK_GAS_LIMIT_BUY, FALLBACK_GAS_LIMIT_SELL,
   MAX_BATCH_FUND_NEW_WALLETS, MIN_BRIDGE_ETH, TERMS_TEXT,
 } from '../config.js';
-import { pending, fundsInFlight, lowBalanceWarned, gasMultiplierFor } from '../state.js';
+import { pending, fundsInFlight, lowBalanceWarned, gasMultiplierFor, stopPositionsRefresh } from '../state.js';
 import {
   dualEthBalanceLines, gasEstimateLine, friendlyErrorMessage, parseEthOrUsdInput, parseBridgeAmountInput,
   parseMcapInput, mcapToPrice, fmtAmountLabel,
@@ -36,7 +36,6 @@ import {
 } from '../menus.js';
 import { executeBuy, executeSell, estimateTransferGasReserve, distributeEth } from '../trade-core.js';
 import { scheduleCardAutoRefresh } from '../autorefresh.js';
-import { stopPositionsRefresh, stopPortfolioRefresh } from '../state.js';
 
 bot.on('text', async (ctx) => {
   const uid = ctx.from.id;
@@ -53,7 +52,6 @@ bot.on('text', async (ctx) => {
     if (isRateLimited(uid)) return ctx.reply('⏳ Slow down a bit — too many lookups in the last minute.');
     pending.delete(uid);
     stopPositionsRefresh(uid);
-    stopPortfolioRefresh(uid);
     const { text: cardText, markup } = await renderTokenCard(uid, text);
     const sent = await ctx.reply(cardText, { parse_mode: 'Markdown', ...markup });
     scheduleCardAutoRefresh(uid, text, sent.chat.id, sent.message_id);
@@ -312,9 +310,6 @@ bot.on('text', async (ctx) => {
       }
       amt = Number(amt.toFixed(6));
 
-      // FIX: this path previously queued a limit buy of any size, bypassing
-      // the user's configured maxBuyEth cap entirely — every other buy path
-      // (buy_ callback, custom_buy, batch buy) already enforces this.
       const { maxBuyEth } = getSettings(uid);
       if (amt > maxBuyEth) {
         pending.delete(uid);
