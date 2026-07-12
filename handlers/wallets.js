@@ -73,7 +73,7 @@ bot.action(/^wallet_(?!create|import|activate|rename|remove|export)(.+)$/, async
   const bal = await allChainsBalanceSummary(w).catch(() => 'unavailable');
   const solLine = w.solAddress ? `\nSolana: \`${w.solAddress}\`` : '';
   await ctx.editMessageText(
-    `*${w.name}*\nEVM: \`${w.address}\`${solLine}\n\nBalances (USDC per chain):\n${bal}`,
+    `*${w.name}*\nEVM: \`${w.address}\`${solLine}\n\nBalances (each chain's stablecoin):\n${bal}`,
     { parse_mode: 'Markdown', ...walletDetailMenu(w.id) }
   );
 });
