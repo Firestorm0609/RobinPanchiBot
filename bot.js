@@ -9,14 +9,18 @@ import {
 // Each of these registers its bot.command/bot.action/bot.on handlers as a
 // side effect of being imported — order doesn't matter except that
 // bot-instance.js (above) must be created first, which it is via `bot`.
+//
+// handlers/chain.js and handlers/batch.js are retired: chain switching is
+// now automatic per-token (see handlers/text.js's resolveChainForCA) and
+// batch buy/sell/fund/collect were removed as unused surface area. Delete
+// those two files from the server; they're no longer imported so they no
+// longer run, but leaving the dead files around invites confusion.
 import './handlers/menu.js';
-import './handlers/chain.js';
 import './handlers/wallets.js';
 import './handlers/positions.js';
 import './handlers/settings.js';
 import './handlers/token.js';
 import './handlers/deposit.js';
-import './handlers/batch.js';
 import './handlers/rewards.js';
 import './handlers/text.js'; // must be last: registers the catch-all bot.on('text', ...)
 

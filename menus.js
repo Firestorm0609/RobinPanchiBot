@@ -11,7 +11,7 @@ import {
   getActiveAutoRuleForPosition,
   getAllPositionsForUser,
 } from './storage.js';
-import { chainBalanceLines, allChainsBalanceSummary, gasEstimateLine, getUnifiedUsdBalance } from './format.js';
+import { chainBalanceLines, gasEstimateLine, getUnifiedUsdBalance } from './format.js';
 import { FALLBACK_GAS_LIMIT_BUY } from './config.js';
 
 export function mainMenu() {
@@ -19,9 +19,9 @@ export function mainMenu() {
     [Markup.button.callback('🔍 Trade Token', 'menu_trade')],
     [Markup.button.callback('📊 Positions', 'menu_positions')],
     [Markup.button.callback('💼 Wallets', 'menu_wallets'), Markup.button.callback('💰 Balance', 'menu_balance')],
-    [Markup.button.callback('📥 Deposit', 'menu_deposit'), Markup.button.callback('🔗 Chain', 'menu_chain')],
-    [Markup.button.callback('⏰ Limit Orders', 'menu_limitorders'), Markup.button.callback('🎟 Rewards', 'menu_rewards')],
-    [Markup.button.callback('⚙️ Settings', 'menu_settings'), Markup.button.callback('❓ Help', 'menu_help')],
+    [Markup.button.callback('📥 Deposit', 'menu_deposit'), Markup.button.callback('⏰ Limit Orders', 'menu_limitorders')],
+    [Markup.button.callback('🎟 Rewards', 'menu_rewards'), Markup.button.callback('⚙️ Settings', 'menu_settings')],
+    [Markup.button.callback('❓ Help', 'menu_help')],
     [Markup.button.url('🐦 X', 'https://x.com/robinpanchi')],
   ]);
 }
@@ -33,8 +33,6 @@ export function walletsMenu(uid) {
     return [Markup.button.callback(`${active}${w.name} (${shortAddr(w.address)})`, `wallet_${w.id}`)];
   });
   rows.push([Markup.button.callback('➕ Create New', 'wallet_create')]);
-  rows.push([Markup.button.callback('📤 Batch Fund', 'batchfund_start')]);
-  rows.push([Markup.button.callback('📥 Batch Collect', 'collect_start')]);
   rows.push([Markup.button.callback('⬅️ Back', 'menu_main')]);
   return Markup.inlineKeyboard(rows);
 }
@@ -59,7 +57,10 @@ export function exportConfirmMenu(walletId) {
 // ---------- Deposit ----------
 // "Choose a network to deposit from" picker — shows the active wallet's
 // address on whichever chain the user selects. Read-only convenience view;
-// doesn't create or move anything.
+// doesn't create or move anything. This is now the ONLY place chains are
+// surfaced to the user — trading auto-detects the right chain per pasted
+// token (handlers/text.js's resolveChainForCA), so there's no separate
+// manual "Chain" tab anymore.
 
 export function depositMenu() {
   const rows = ALL_CHAIN_KEYS.map((key) => {
@@ -75,22 +76,6 @@ export function depositChainDetailMenu() {
     [Markup.button.callback('⬅️ Choose a different network', 'menu_deposit')],
     [Markup.button.callback('🏠 Main Menu', 'menu_main')],
   ]);
-}
-
-// ---------- Chain picker ----------
-// This is the core of the "trade any chain in USDC, no bridging" feature:
-// the user picks an active chain here, and every trade/balance/position
-// call downstream reads it via getActiveChain(uid).
-
-export function chainMenu(uid) {
-  const active = getActiveChain(uid);
-  const rows = ALL_CHAIN_KEYS.map((key) => {
-    const chain = getChain(key);
-    const check = key === active ? '✅ ' : '';
-    return [Markup.button.callback(`${check}${chain.name}`, `chain_select_${key}`)];
-  });
-  rows.push([Markup.button.callback('⬅️ Back', 'menu_main')]);
-  return Markup.inlineKeyboard(rows);
 }
 
 export function settingsMenu(uid) {
@@ -119,11 +104,11 @@ export function rewardsMenu() {
  * Trades are USDC-denominated directly on whichever chain is active — no
  * price-feed conversion needed. Buy/sell/limit/TP-SL callbacks don't encode
  * the chain; every handler resolves it via getActiveChain(uid) at the
- * moment it executes, same pattern as getActiveWallet(uid).
+ * moment it executes, same pattern as getActiveWallet(uid). Batch Buy/Sell
+ * removed — every trade is single-wallet now.
  */
 export function tokenMenu(uid, tokenAddress, hasPosition) {
   const s = getSettings(uid);
-  const user = getUser(uid);
   const buyLabel = (amt) => `Buy ${fmtUsd(amt)}`;
   const rows = [
     s.buyPresetsUsdc.map((amt) => Markup.button.callback(buyLabel(amt), `buy_${tokenAddress}_${amt}`)),
@@ -137,64 +122,10 @@ export function tokenMenu(uid, tokenAddress, hasPosition) {
       Markup.button.callback('⏰ Limit Sell', `limitsell_${tokenAddress}`),
     ]);
   }
-  const bottomRow = [Markup.button.callback('⏰ Limit Buy', `limitbuy_${tokenAddress}`)];
-  if (user.wallets.length > 1) bottomRow.push(Markup.button.callback('📦 Batch Buy', `batchbuy_${tokenAddress}`));
-  rows.push(bottomRow);
-  if (hasPosition && user.wallets.length > 1) {
-    rows.push([Markup.button.callback('📦 Batch Sell', `batchsell_${tokenAddress}`)]);
-  }
+  rows.push([Markup.button.callback('⏰ Limit Buy', `limitbuy_${tokenAddress}`)]);
   rows.push([
     Markup.button.callback('🔄 Refresh', `refresh_${tokenAddress}`),
     Markup.button.callback('⬅️ Back', 'menu_main'),
-  ]);
-  return Markup.inlineKeyboard(rows);
-}
-
-export function batchSelectMenu(uid, selected) {
-  const user = getUser(uid);
-  const rows = user.wallets.map((w) => {
-    const checked = selected.includes(w.id) ? '☑️ ' : '⬜ ';
-    return [Markup.button.callback(`${checked}${w.name} (${shortAddr(w.address)})`, `batchtoggle_${w.id}`)];
-  });
-  rows.push([
-    Markup.button.callback(`✅ Confirm (${selected.length} selected)`, 'batchconfirm'),
-    Markup.button.callback('❌ Cancel', 'menu_main'),
-  ]);
-  return Markup.inlineKeyboard(rows);
-}
-
-export function batchSellSelectMenu(candidates, selected) {
-  const rows = candidates.map((w) => {
-    const checked = selected.includes(w.id) ? '☑️ ' : '⬜ ';
-    return [Markup.button.callback(`${checked}${w.name} (${shortAddr(w.address)})`, `bselltoggle_${w.id}`)];
-  });
-  rows.push([
-    Markup.button.callback(`✅ Confirm (${selected.length} selected)`, 'batchsellconfirm'),
-    Markup.button.callback('❌ Cancel', 'menu_main'),
-  ]);
-  return Markup.inlineKeyboard(rows);
-}
-
-export function batchFundSelectMenu(candidates, selected) {
-  const rows = candidates.map((w) => {
-    const checked = selected.includes(w.id) ? '☑️ ' : '⬜ ';
-    return [Markup.button.callback(`${checked}${w.name} (${shortAddr(w.address)})`, `bfundtoggle_${w.id}`)];
-  });
-  rows.push([
-    Markup.button.callback(`✅ Confirm (${selected.length} selected)`, 'bfundconfirm'),
-    Markup.button.callback('❌ Cancel', 'menu_main'),
-  ]);
-  return Markup.inlineKeyboard(rows);
-}
-
-export function collectSelectMenu(candidates, selected) {
-  const rows = candidates.map((w) => {
-    const checked = selected.includes(w.id) ? '☑️ ' : '⬜ ';
-    return [Markup.button.callback(`${checked}${w.name} (${shortAddr(w.address)})`, `collecttoggle_${w.id}`)];
-  });
-  rows.push([
-    Markup.button.callback(`✅ Confirm (${selected.length} selected)`, 'collectconfirm'),
-    Markup.button.callback('❌ Cancel', 'menu_main'),
   ]);
   return Markup.inlineKeyboard(rows);
 }
@@ -244,7 +175,9 @@ export function limitOrdersMenu(orders) {
 }
 
 // ---------- Token info + PnL rendering ----------
-// Always operates on the user's currently active chain (getActiveChain).
+// Always operates on the user's currently active chain (getActiveChain),
+// which is set automatically per-token by resolveChainForCA — there's no
+// manual chain picker anymore.
 
 export async function renderTokenCard(uid, tokenAddress) {
   const w = getActiveWallet(uid);
@@ -256,10 +189,9 @@ export async function renderTokenCard(uid, tokenAddress) {
 
   if (!market) {
     return {
-      text: `No market data found on *${chain.name}* for:\n\`${tokenAddress}\`\n\nPool may not exist on this chain yet, or DexScreener hasn't indexed it. Try a different chain under 🔗 Chain.`,
+      text: `No market data found for:\n\`${tokenAddress}\`\n\nPool may not exist yet, or DexScreener hasn't indexed it. Try again in a moment.`,
       markup: Markup.inlineKeyboard([
         [Markup.button.callback('🔄 Refresh', `refresh_${tokenAddress}`)],
-        [Markup.button.callback('🔗 Switch Chain', 'menu_chain')],
         [Markup.button.callback('⬅️ Back', 'menu_main')],
       ]),
     };
@@ -297,9 +229,8 @@ export async function renderTokenCard(uid, tokenAddress) {
 
   // Unified total across every chain — best-effort, single extra line so the
   // user can see at a glance whether they have funds sitting on a different
-  // chain than the one they're about to trade on (before Phase 4 wires up
-  // actually bridging that shortfall automatically). Never blocks the card
-  // on failure — falls back to omitting the line entirely.
+  // chain than the one they're about to trade on. Never blocks the card on
+  // failure — falls back to omitting the line entirely.
   const unifiedLine = await getUnifiedUsdBalance(w)
     .then((u) => `\nUnified balance (all chains): ${fmtUsd(u.totalUsd)}${u.anyUnavailable ? ' _(partial)_' : ''}`)
     .catch(() => '');

@@ -41,8 +41,6 @@ export const LIMIT_ORDER_POLL_INTERVAL_MS = 30_000;
 export const LOW_BALANCE_POLL_INTERVAL_MS = 5 * 60_000;
 export const BRIDGE_RESUME_POLL_INTERVAL_MS = 60_000;
 
-export const MAX_BATCH_FUND_NEW_WALLETS = 20;
-
 export const GAS_TIERS = ['slow', 'normal', 'fast'];
 export const GAS_TIER_MULTIPLIERS = { slow: 0.85, normal: 1, fast: 1.35 };
 export const FALLBACK_GAS_LIMIT_BUY = 300_000n;
@@ -59,7 +57,7 @@ export const GAS_TOPUP_USDC_AMOUNT = 5;
 export const MIN_SOL_GAS_RESERVE = 0.01; // ~enough for dozens of swaps + rent-exempt token accounts
 
 // ---------------------------------------------------------------------------
-// Cross-chain auto-bridge (CROSSCHAIN_BUILD_PLAN.md Phase 4).
+// Cross-chain auto-bridge (CROSSCHAIN_BUILD_PLAN.md Phase 4, shipped).
 //
 // MIN_BRIDGE_USD: floor below which a shortfall isn't worth auto-bridging.
 // A dust bridge can cost more in LI.FI's 25bps fee + source/dest gas than
@@ -84,18 +82,18 @@ export const TERMS_TEXT =
   'By using it you accept that:\n\n' +
   '• Memecoins carry high rug-pull and total-loss risk\n' +
   '• Trades are final once confirmed on-chain\n' +
-  '• You are solely responsible for funds in wallets you create or import here\n' +
+  '• You are solely responsible for funds in wallets you create here\n' +
   '• This is not financial advice, and there are no guarantees of any kind\n\n' +
   'Tap below to confirm you understand and wish to continue.';
 
 export const HELP_TEXT =
   '❓ *Help & FAQ*\n\n' +
   '*How do I use this bot?*\n' +
-  'Create or import a wallet under 💼 Wallets, pick a chain under 🔗 Chain, deposit that chain\'s stablecoin, then paste any token contract address (or Solana mint) to pull up its price and trade it.\n\n' +
-  '*Do I need to bridge?*\n' +
-  'No, not manually. Your wallet works on every supported chain already (same address on all EVM chains; a separate Solana address for Solana). Deposit on whichever chain you like — if you buy a token on a chain where you\'re short of funds, the bot automatically bridges the shortfall in from another chain where you have a balance, then completes the trade. Small shortfalls (under $5) aren\'t auto-bridged since bridging fees wouldn\'t be worth it — just fund the target chain directly for a top-up that small.\n\n' +
+  'Create a wallet under 💼 Wallets, deposit stablecoin on any chain under 📥 Deposit, then paste any token contract address (or Solana mint) — the bot automatically finds and trades on whichever chain has the best liquidity for it.\n\n' +
+  '*Do I need to bridge or pick a chain manually?*\n' +
+  'No. Your wallet works on every supported chain already (same address on all EVM chains; a separate Solana address for Solana). Deposit on whichever chain you like — if a token you paste trades on a chain where you\'re short of funds, the bot automatically bridges the shortfall in from another chain where you have a balance, then completes the trade. Small shortfalls (under $5) aren\'t auto-bridged since bridging fees wouldn\'t be worth it — just fund that chain directly for a top-up that small.\n\n' +
   '*Which chains are supported?*\n' +
-  'Ethereum, Base, Arbitrum, BNB Chain, Robinhood Chain, and Solana. Deposit USDC on every chain except Robinhood Chain, where the settlement stablecoin is USDG (Robinhood does not have a native USDC deployment — check your active chain under 🔗 Chain to see which one applies).\n\n' +
+  'Ethereum, Base, Arbitrum, BNB Chain, Robinhood Chain, and Solana. Deposit USDC on every chain except Robinhood Chain, where the settlement stablecoin is USDG (Robinhood does not have a native USDC deployment) — check 📥 Deposit to see each chain\'s address.\n\n' +
   '*Where\'s my referral link?*\n' +
   'Open 🎟 Rewards from the main menu.\n\n' +
   '*What are the fees?*\n' +
@@ -117,13 +115,11 @@ export const HELP_TEXT =
   'On any open position, tap 🎯 Set TP/SL to have the bot automatically sell 100% of that position once it hits your target gain (take-profit) or loss (stop-loss). One active rule per position — setting a new one replaces the old.\n\n' +
   '*Limit orders*\n' +
   'Tap ⏰ Limit Buy or ⏰ Limit Sell on a token to queue a trade that fires automatically once the price crosses your target. Cancel anytime under ⏰ Limit Orders in the main menu.\n\n' +
-  '*Batch Buy / Batch Sell / Batch Fund / Batch Collect*\n' +
-  'Available under 💼 Wallets — all scoped to your currently selected chain.\n\n' +
   '*Still stuck?*\n' +
   'Contact support: panchi.eth@gmail.com';
 
 export const WELCOME_TEXT =
   '🌴 *RobinPanchi Trading Bot*\n' +
   'Trade any chain, entirely in that chain\'s stablecoin — deposit anywhere, we auto-bridge the rest 🍃\n\n' +
-  'Paste a token contract address (or Solana mint) to trade it, or pick a chain first under 🔗 Chain.\n\n' +
+  'Paste a token contract address (or Solana mint) to trade it — we\'ll automatically find and switch to whichever chain has the best liquidity for it.\n\n' +
   '_Support: panchi.eth@gmail.com_';
