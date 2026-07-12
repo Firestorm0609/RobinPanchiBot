@@ -11,7 +11,7 @@ import {
   getActiveAutoRuleForPosition,
   getAllPositionsForUser,
 } from './storage.js';
-import { chainBalanceLines, allChainsBalanceSummary, gasEstimateLine } from './format.js';
+import { chainBalanceLines, allChainsBalanceSummary, gasEstimateLine, getUnifiedUsdBalance } from './format.js';
 import { FALLBACK_GAS_LIMIT_BUY } from './config.js';
 
 export function mainMenu() {
@@ -277,6 +277,15 @@ export async function renderTokenCard(uid, tokenAddress) {
   const walletBalance = await chainBalanceLines(w, chainKey).catch(() => 'unavailable');
   const gasLine = await gasEstimateLine(chainKey, uid, FALLBACK_GAS_LIMIT_BUY).catch(() => '');
 
+  // Unified total across every chain — best-effort, single extra line so the
+  // user can see at a glance whether they have funds sitting on a different
+  // chain than the one they're about to trade on (before Phase 4 wires up
+  // actually bridging that shortfall automatically). Never blocks the card
+  // on failure — falls back to omitting the line entirely.
+  const unifiedLine = await getUnifiedUsdBalance(w)
+    .then((u) => `\nUnified balance (all chains): ${fmtUsd(u.totalUsd)}${u.anyUnavailable ? ' _(partial)_' : ''}`)
+    .catch(() => '');
+
   const text =
     `*${market.symbol}* _(${chain.name})_\n\`${tokenAddress}\`\n\n` +
     `Price: $${market.priceUsd.toPrecision(4)}${changeLine}\n` +
@@ -284,6 +293,7 @@ export async function renderTokenCard(uid, tokenAddress) {
     `Liquidity: ${fmtUsd(market.liquidityUsd)}\n` +
     `Your balance on ${chain.name}:\n${walletBalance}` +
     gasLine +
+    unifiedLine +
     pnlLine;
 
   return { text, markup: tokenMenu(uid, tokenAddress, !!(pos && pos.tokenAmount > 0)) };
