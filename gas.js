@@ -7,7 +7,16 @@ import { MIN_GAS_ETH_RESERVE, MIN_SOL_GAS_RESERVE } from './config.js';
 
 // Minimum stablecoin amount worth bothering to swap for a gas top-up — below
 // this, 0x's fee + slippage would eat too much of it to be worth attempting.
-const MIN_TOPUP_USDC_AMOUNT = 0.20;
+const MIN_TOPUP_USDC_AMOUNT = 0.05;
+
+// Rough, deliberately conservative (i.e. HIGH-side) fallback native-token USD
+// prices, used ONLY when the live CoinGecko lookup fails/times out. Being
+// high-side means the sizing math (topupUsd = neededEth * price) comes out
+// SMALLER than reality if the fallback price overestimates — i.e. it fails
+// safe toward topping up too little rather than falling back to the flat
+// MIN_TOPUP_USDC_AMOUNT floor every time the network hiccups. These don't
+// need to be exact — they just need to not be wildly stale.
+const FALLBACK_NATIVE_USD_PRICE = { ETH: 3000, BNB: 600 };
 
 // How many "typical transactions worth" of gas to top up to at once, so
 // we're not doing a top-up swap before literally every single tx. A typical
@@ -96,7 +105,13 @@ export async function ensureGasReserve(chainKey, signer, walletAddress) {
   const typicalTxCostEth = await estimateTypicalTxCostEth(provider).catch(() => null);
   let desiredTopupUsd = MIN_TOPUP_USDC_AMOUNT;
   if (typicalTxCostEth !== null) {
-    const nativeUsdPrice = await getNativeUsdPriceForGas(chain.nativeSymbol).catch(() => null);
+    let nativeUsdPrice = await getNativeUsdPriceForGas(chain.nativeSymbol).catch(() => null);
+    if (!nativeUsdPrice) {
+      nativeUsdPrice = FALLBACK_NATIVE_USD_PRICE[chain.nativeSymbol] ?? null;
+      if (nativeUsdPrice) {
+        console.log(`[gas debug] live price lookup failed for ${chain.nativeSymbol} — using fallback price $${nativeUsdPrice}`);
+      }
+    }
     if (nativeUsdPrice) {
       const neededEth = Math.max(0, typicalTxCostEth * TOPUP_TX_MULTIPLE - nativeBalanceNum);
       desiredTopupUsd = neededEth * nativeUsdPrice;
