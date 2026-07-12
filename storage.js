@@ -12,6 +12,15 @@ if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 
+// ---------------------------------------------------------------------------
+// Table creation ONLY. No indexes here that reference columns added by the
+// migrations below (e.g. `chain`) — on a fresh install those columns exist
+// from the CREATE TABLE statements themselves, but on an EXISTING db from
+// before the multichain migration, `CREATE TABLE IF NOT EXISTS` is a no-op
+// and the table still lacks `chain` until the ALTER TABLE migrations run.
+// Creating a `chain`-indexed index in this same block would then fail with
+// "no such column: chain" before the migration ever gets a chance to add it.
+// ---------------------------------------------------------------------------
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (
   uid TEXT PRIMARY KEY,
@@ -95,14 +104,12 @@ CREATE TABLE IF NOT EXISTS limit_orders (
   updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_wallets_uid ON wallets(uid);
-CREATE INDEX IF NOT EXISTS idx_positions_uid_wallet_chain ON positions(uid, wallet_id, chain);
-CREATE INDEX IF NOT EXISTS idx_trade_log_created ON trade_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_uid);
 CREATE INDEX IF NOT EXISTS idx_auto_rules_status ON auto_rules(status);
 CREATE INDEX IF NOT EXISTS idx_auto_rules_uid ON auto_rules(uid);
 CREATE INDEX IF NOT EXISTS idx_limit_orders_status ON limit_orders(status);
 CREATE INDEX IF NOT EXISTS idx_limit_orders_uid ON limit_orders(uid);
-CREATE INDEX IF NOT EXISTS idx_trade_log_uid_wallet_chain_token ON trade_log(uid, wallet_id, chain, token_address);
+CREATE INDEX IF NOT EXISTS idx_trade_log_created ON trade_log(created_at);
 `);
 
 // ---------------------------------------------------------------------------
@@ -168,6 +175,16 @@ if (!columnsOf('positions').includes('entry_mcap')) {
 if (!columnsOf('limit_orders').includes('target_mcap')) {
   db.exec('ALTER TABLE limit_orders ADD COLUMN target_mcap REAL');
 }
+
+// ---------------------------------------------------------------------------
+// Indexes that reference `chain` — created AFTER the migration above
+// guarantees the column exists on every table, regardless of whether this
+// is a fresh install or an upgrade from a pre-multichain database.
+// ---------------------------------------------------------------------------
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_positions_uid_wallet_chain ON positions(uid, wallet_id, chain);
+CREATE INDEX IF NOT EXISTS idx_trade_log_uid_wallet_chain_token ON trade_log(uid, wallet_id, chain, token_address);
+`);
 
 const DEFAULT_SETTINGS = {
   buyPresetsUsdc: [10, 50, 100],
