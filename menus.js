@@ -20,7 +20,7 @@ export function mainMenu() {
     [Markup.button.callback('🌉 Bridge', 'menu_bridge'), Markup.button.callback('⏰ Limit Orders', 'menu_limitorders')],
     [Markup.button.callback('🎟 Rewards', 'menu_rewards'), Markup.button.callback('⚙️ Settings', 'menu_settings')],
     [Markup.button.callback('❓ Help', 'menu_help')],
-    [Markup.button.url('🐦 X', 'https://x.com/robinpanchi'), Markup.button.url('🖼 OpenSea', 'https://opensea.io/collection/robinpanchi')],
+    [Markup.button.url('🐦 X', 'https://x.com/robinpanchi')],
   ]);
 }
 
