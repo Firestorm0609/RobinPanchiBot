@@ -1,14 +1,13 @@
 import { bot } from './bot-instance.js';
-import { renderTokenCard, renderPositionsView, renderPortfolioView } from './menus.js';
+import { renderTokenCard, renderPositionsView } from './menus.js';
 import {
   autoRefreshTimers, stopAutoRefresh,
   positionsRefreshTimers, stopPositionsRefresh,
-  portfolioRefreshTimers, stopPortfolioRefresh,
 } from './state.js';
 
-// Keeps the last-viewed token card / positions list / portfolio summary live
-// in place without the user having to tap Refresh. Only one of each runs per
-// user — each call clears any prior timer of that kind for that uid.
+// Keeps the last-viewed token card / positions list live in place without
+// the user having to tap Refresh. Only one of each runs per user — each
+// call clears any prior timer of that kind for that uid.
 
 const AUTO_REFRESH_INTERVAL_MS = 30_000;
 
@@ -50,22 +49,4 @@ export function schedulePositionsAutoRefresh(uid, chatId, messageId) {
     }
   }, AUTO_REFRESH_INTERVAL_MS);
   positionsRefreshTimers.set(key, timer);
-}
-
-export function schedulePortfolioAutoRefresh(uid, chatId, messageId) {
-  stopPortfolioRefresh(uid);
-  const key = String(uid);
-  const timer = setInterval(async () => {
-    try {
-      const { text, markup } = await renderPortfolioView(uid);
-      await bot.telegram.editMessageText(chatId, messageId, undefined, text, {
-        parse_mode: 'Markdown',
-        ...markup,
-      });
-    } catch (err) {
-      if (err.description?.includes('message is not modified')) return;
-      stopPortfolioRefresh(key);
-    }
-  }, AUTO_REFRESH_INTERVAL_MS);
-  portfolioRefreshTimers.set(key, timer);
 }
