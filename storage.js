@@ -183,6 +183,22 @@ if (!columnsOf('trade_log').includes('usdc_amount') && columnsOf('trade_log').in
   db.exec('ALTER TABLE trade_log ADD COLUMN usdc_amount REAL NOT NULL DEFAULT 0');
 }
 
+// ---------------------------------------------------------------------------
+// positions.cost_eth -> cost_usdc. THIS WAS MISSING — migrate-json-to-sqlite.js
+// (the one-off JSON->SQLite migration script) creates `positions` with a
+// `cost_eth` column, matching the same pre-multichain naming convention as
+// trade_log's old `eth_amount` column above. Every query in THIS file
+// (recordTrade, getPosition, getAllPositions, getAllPositionsForUser) reads
+// and writes `cost_usdc` — so any database that went through
+// migrate-json-to-sqlite.js still has the old column name and every trade
+// fails with "table positions has no column named cost_usdc" until this
+// migration runs. Mirrors the trade_log rename immediately above.
+if (!columnsOf('positions').includes('cost_usdc') && columnsOf('positions').includes('cost_eth')) {
+  db.exec('ALTER TABLE positions RENAME COLUMN cost_eth TO cost_usdc');
+} else if (!columnsOf('positions').includes('cost_usdc')) {
+  db.exec('ALTER TABLE positions ADD COLUMN cost_usdc REAL NOT NULL DEFAULT 0');
+}
+
 if (!columnsOf('positions').includes('entry_mcap')) {
   db.exec('ALTER TABLE positions ADD COLUMN entry_mcap REAL');
 }
