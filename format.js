@@ -7,6 +7,13 @@ import { getUsdcBalance } from './erc20.js';
 import { gasMultiplierFor, botIdentity } from './state.js';
 import { QUOTE_STALE_MS } from './config.js';
 
+// DEBUG: set PRICE_DEBUG=1 in .env (same flag used in price.js) to log
+// balance-lookup failures here too.
+const DEBUG = process.env.PRICE_DEBUG === '1';
+function dbg(...args) {
+  if (DEBUG) console.log('[format debug]', ...args);
+}
+
 export function fmtEth(n) {
   return Number(n).toFixed(4);
 }
@@ -30,9 +37,10 @@ export async function chainBalanceLines(wallet, chainKey) {
 
   if (isSolanaChain(chainKey)) {
     const [sol, usdc] = await Promise.all([
-      getSolBalance(wallet.solAddress).catch(() => null),
-      getSolanaUsdcBalance(wallet.solAddress).catch(() => null),
+      getSolBalance(wallet.solAddress).catch((err) => { dbg('getSolBalance failed', { solAddress: wallet.solAddress, message: err.message, stack: err.stack }); return null; }),
+      getSolanaUsdcBalance(wallet.solAddress).catch((err) => { dbg('getSolanaUsdcBalance failed', { solAddress: wallet.solAddress, message: err.message, stack: err.stack }); return null; }),
     ]);
+    dbg('Solana balance result', { solAddress: wallet.solAddress, sol, usdc, rpcUrl: process.env.SOLANA_RPC_URL ? '(set)' : '(NOT SET — using public fallback)' });
     const solLine = sol === null ? 'SOL: unavailable' : `SOL: ${sol.toFixed(4)}`;
     const usdcLine = usdc === null ? `${symbol}: unavailable` : `${symbol}: ${fmtUsd(usdc)}`;
     return `${solLine}\n${usdcLine}`;
