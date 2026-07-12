@@ -12,6 +12,43 @@ import { getActiveWallet } from './storage.js';
 import { getTokenMarketData, fmtUsd } from './price.js';
 import { generateSellPnlCard } from './pnl-card.js';
 
+// ---------- Sell amount resolution (raw on-chain, no float round-tripping) ----------
+//
+// Previously the sell amount was computed as `pos.tokenAmount * (pct/100)`
+// (a JS float from our own locally-tracked cost-basis bookkeeping), then
+// `.toFixed(decimals)` truncated it before parseUnits converted it to the
+// raw smallest-unit amount. Two problems with that:
+//   1. Floats can't exactly represent most on-chain balances, so toFixed()
+//      routinely rounds DOWN, leaving a small remainder unsold even on a
+//      "100%" sell.
+//   2. The locally tracked pos.tokenAmount can drift from the wallet's real
+//      balance (fee-on-transfer tokens, missed trades, manual transfers),
+//      so "100%" only ever meant "100% of what our DB thinks we have".
+//
+// Fix: read the wallet's actual on-chain balance (raw bigint, smallest
+// unit) right before selling, and derive the sell amount from THAT via
+// integer math only — never round-tripping through a float. A 100% sell now
+// always sells the wallet's exact live balance, leaving zero dust.
+async function resolveSellAmountRaw(tokenAddress, walletAddress, pct) {
+  const decimals = await getDecimals(provider, tokenAddress).catch(() => 18);
+  const rawBalance = await getTokenBalance(provider, tokenAddress, walletAddress);
+
+  if (rawBalance <= 0n) {
+    return { rawAmount: 0n, decimals, humanAmount: 0 };
+  }
+
+  // Integer-only percentage math: pct may have up to 2 decimal places
+  // (e.g. 33.33), so scale by 10000 and floor-divide — avoids any float
+  // multiplication of the raw balance.
+  const pctBps = BigInt(Math.round(pct * 100)); // e.g. 100% -> 10000, 33.33% -> 3333
+  const rawAmount = pctBps >= 10000n
+    ? rawBalance // 100%+ (or rounding over) always means "sell the whole live balance"
+    : (rawBalance * pctBps) / 10000n;
+
+  const humanAmount = Number(ethers.formatUnits(rawAmount, decimals));
+  return { rawAmount, decimals, humanAmount };
+}
+
 // ---------- Shared trade execution (interactive, ctx-based) ----------
 
 export async function executeBuy(ctx, uid, tokenAddress, ethAmount) {
@@ -80,24 +117,29 @@ export async function executeSell(ctx, uid, tokenAddress, pct) {
   }
   tradesInFlight.add(uid);
 
-  const tokenAmount = pos.tokenAmount * (pct / 100);
   const entryMcap = pos.entryMcap;
-  // Proportional cost basis for the slice being sold — used both for the
-  // text PnL block and for the realized-PnL flex card below.
+  // Proportional cost basis for the slice being sold, from our tracked cost
+  // basis (still float-based — fine here since it's just PnL display, not
+  // an on-chain amount). The actual sell amount is resolved separately from
+  // the live on-chain balance below.
   const costBasisSold = pos.costEth * (pct / 100);
   let pendingTradeId;
   try {
     await ctx.reply(`Selling ${pct}%... fetching quote.`);
 
-    const decimals = await getDecimals(provider, tokenAddress).catch(() => 18);
-    const sellAmount = ethers.parseUnits(tokenAmount.toFixed(Math.min(decimals, 18)), decimals).toString();
+    const { rawAmount, decimals, humanAmount: tokenAmount } = await resolveSellAmountRaw(tokenAddress, w.address, pct);
+    if (rawAmount <= 0n) {
+      tradesInFlight.delete(uid);
+      return ctx.reply('No on-chain token balance found to sell.', mainMenu());
+    }
+    const sellAmount = rawAmount.toString();
 
     const { slippageBps } = getSettings(uid);
     const signer = new ethers.Wallet(w.privateKey, provider);
 
     pendingTradeId = createPendingTrade({ uid, walletId: w.id, tokenAddress, side: 'sell', amount: tokenAmount });
 
-    const approvalReceipt = await ensureAllowance(signer, tokenAddress, BigInt(sellAmount));
+    const approvalReceipt = await ensureAllowance(signer, tokenAddress, rawAmount);
     if (approvalReceipt) await ctx.reply('Approved token for trading (one-time step). Continuing...');
 
     const quoteParams = { sellToken: tokenAddress, buyToken: 'ETH', sellAmount, taker: w.address, slippageBps };
@@ -234,16 +276,18 @@ export async function performSellCore(uid, wallet, tokenAddress, pct) {
     const pos = getPosition(uid, wallet.id, tokenAddress);
     if (!pos || pos.tokenAmount <= 0) return { ok: false, error: 'No position to sell.', walletName: wallet.name };
 
-    const tokenAmount = pos.tokenAmount * (pct / 100);
-    const decimals = await getDecimals(provider, tokenAddress).catch(() => 18);
-    const sellAmount = ethers.parseUnits(tokenAmount.toFixed(Math.min(decimals, 18)), decimals).toString();
+    const { rawAmount, humanAmount: tokenAmount } = await resolveSellAmountRaw(tokenAddress, wallet.address, pct);
+    if (rawAmount <= 0n) {
+      return { ok: false, error: 'No on-chain token balance found to sell.', walletName: wallet.name };
+    }
+    const sellAmount = rawAmount.toString();
 
     const { slippageBps } = getSettings(uid);
     const signer = new ethers.Wallet(wallet.privateKey, provider);
 
     pendingTradeId = createPendingTrade({ uid, walletId: wallet.id, tokenAddress, side: 'sell', amount: tokenAmount });
 
-    await ensureAllowance(signer, tokenAddress, BigInt(sellAmount));
+    await ensureAllowance(signer, tokenAddress, rawAmount);
 
     const quoteParams = { sellToken: tokenAddress, buyToken: 'ETH', sellAmount, taker: wallet.address, slippageBps };
     let quote = await getQuote(quoteParams);
