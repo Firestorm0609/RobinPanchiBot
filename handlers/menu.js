@@ -103,7 +103,8 @@ bot.command('admin_stats', async (ctx) => {
     `Total referrals: ${s.totalReferrals}\n` +
     `Total bridges: ${s.totalBridges} (completed volume: ${s.totalBridgeVolumeEth.toFixed(4)} ETH)\n` +
     `Active TP/SL rules: ${s.activeAutoRules}\n` +
-    `Open limit orders: ${s.openLimitOrders}\n\n` +
+    `Open limit orders: ${s.openLimitOrders}\n` +
+    `Active momentum triggers: ${s.activeMomentumTriggers}\n\n` +
     `Last 24h:\n` +
     `Active users: ${s.activeUsers24h}\n` +
     `Volume: ${s.volume24hEth.toFixed(4)} ETH`,

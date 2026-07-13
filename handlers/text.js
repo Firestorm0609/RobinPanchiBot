@@ -20,6 +20,7 @@ import {
   cancelAutoRule,
   getActiveAutoRuleForPosition,
   createLimitOrder,
+  createMomentumTrigger,
 } from '../storage.js';
 import {
   provider, ethMainnetProvider, CA_REGEX, FALLBACK_GAS_LIMIT_BUY, FALLBACK_GAS_LIMIT_SELL,
@@ -41,6 +42,44 @@ bot.on('text', async (ctx) => {
   const uid = ctx.from.id;
   const state = pending.get(uid);
   const text = ctx.message.text.trim();
+
+  // ---- Momentum Trigger: Alpha/Beta CA capture ----
+  // These two steps intercept BEFORE the generic CA_REGEX branch below,
+  // because that branch unconditionally treats any pasted address as "look
+  // up this token's card" — without this bypass, pasting the Alpha or Beta
+  // address here would just render a token card instead of advancing the
+  // trigger setup.
+  if (state?.type === 'momentum_alpha') {
+    if (!CA_REGEX.test(text)) {
+      return ctx.reply('That doesn\'t look like a valid contract address. Paste the Alpha token\'s 0x... address.');
+    }
+    const market = await getTokenMarketData(text).catch(() => null);
+    if (!market || !market.priceUsd) {
+      return ctx.reply('Could not fetch a live price for that token right now — try again in a moment.');
+    }
+    pending.set(uid, { type: 'momentum_beta', alphaToken: text, baselinePrice: market.priceUsd });
+    await ctx.reply(
+      `Baseline price locked: $${market.priceUsd.toPrecision(4)}\n\n` +
+      'Now paste the *Beta* token contract address — the one that gets auto-bought once Alpha moves:',
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
+  if (state?.type === 'momentum_beta') {
+    if (!CA_REGEX.test(text)) {
+      return ctx.reply('That doesn\'t look like a valid contract address. Paste the Beta token\'s 0x... address.');
+    }
+    if (text.toLowerCase() === state.alphaToken.toLowerCase()) {
+      return ctx.reply('Beta token must be different from Alpha. Paste a different address.');
+    }
+    pending.set(uid, { type: 'momentum_pct', alphaToken: state.alphaToken, baselinePrice: state.baselinePrice, betaToken: text });
+    await ctx.reply(
+      'Send the trigger percentage — once Alpha is up this much from the baseline price, Beta gets bought. e.g. `20` for +20%:',
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
 
   if (CA_REGEX.test(text)) {
     if (!hasAgreedTerms(uid)) {
@@ -365,6 +404,49 @@ bot.on('text', async (ctx) => {
       await ctx.reply(
         `✅ Limit sell queued: ${clamped.toFixed(4)} tokens when mcap ≥ ${fmtUsd(state.targetMcap)}. I'll DM you when it fills.`,
         mainMenu()
+      );
+      return;
+    }
+
+    // ---- Momentum Trigger: % then amount, then create ----
+    if (state.type === 'momentum_pct') {
+      const pct = parseFloat(text);
+      if (isNaN(pct) || pct <= 0) return ctx.reply('Send a valid positive percentage, e.g. `20`');
+      pending.set(uid, { ...state, type: 'momentum_amount', triggerPct: pct });
+      await ctx.reply(
+        'Send the amount to auto-buy of Beta when triggered — USD like `50`, or ETH like `0.02 eth`:',
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+
+    if (state.type === 'momentum_amount') {
+      let amt, usdInput;
+      try {
+        ({ amountEth: amt, usdInput } = await parseEthOrUsdInput(text));
+      } catch (err) {
+        return ctx.reply(err.message, { parse_mode: 'Markdown' });
+      }
+      amt = Number(amt.toFixed(6));
+
+      const w = getActiveWallet(uid);
+      if (!w) return ctx.reply('No active wallet.', walletsMenu(uid));
+
+      pending.delete(uid);
+      createMomentumTrigger({
+        uid,
+        walletId: w.id,
+        alphaToken: state.alphaToken,
+        betaToken: state.betaToken,
+        triggerPct: state.triggerPct,
+        baselinePrice: state.baselinePrice,
+        buyAmountEth: amt,
+      });
+      await ctx.reply(
+        `✅ Momentum Trigger set on *${w.name}*:\n` +
+        `Alpha \`${state.alphaToken}\` +${state.triggerPct}% → auto-buy ${fmtAmountLabel(amt, usdInput)} of Beta \`${state.betaToken}\`\n\n` +
+        `I'll DM you when it fires.`,
+        { parse_mode: 'Markdown', ...mainMenu() }
       );
       return;
     }

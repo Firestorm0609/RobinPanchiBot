@@ -1,7 +1,8 @@
 import { bot } from '../bot-instance.js';
-import { renderPositionsView } from '../menus.js';
-import { stopAutoRefresh, stopPositionsRefresh } from '../state.js';
-import { schedulePositionsAutoRefresh } from '../autorefresh.js';
+import { renderPositionsView, renderTokenCard } from '../menus.js';
+import { stopAutoRefresh, stopPositionsRefresh, stopAllViewRefreshes } from '../state.js';
+import { schedulePositionsAutoRefresh, scheduleCardAutoRefresh } from '../autorefresh.js';
+import { setActiveWallet } from '../storage.js';
 
 // ---------- Positions ----------
 // Shows every open position for the user's active wallet, across all
@@ -29,5 +30,26 @@ bot.action('menu_positions_refresh', async (ctx) => {
   });
   if (ctx.callbackQuery?.message?.message_id) {
     schedulePositionsAutoRefresh(uid, ctx.chat.id, ctx.callbackQuery.message.message_id);
+  }
+});
+
+// ---------- Open a position straight into its token card ----------
+// A position can be held in any of the user's wallets, but trading always
+// runs against the currently active wallet — so tapping "Open" first
+// switches the active wallet to the one holding this position, then
+// renders the normal token card (same buy/sell menu as pasting the CA).
+bot.action(/^openpos~(.+)~(0x[a-fA-F0-9]{40})$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  const [, walletId, tokenAddress] = ctx.match;
+
+  setActiveWallet(uid, walletId);
+  stopAllViewRefreshes(uid);
+
+  const { text, markup } = await renderTokenCard(uid, tokenAddress);
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...markup });
+
+  if (ctx.callbackQuery?.message?.message_id) {
+    scheduleCardAutoRefresh(uid, tokenAddress, ctx.chat.id, ctx.callbackQuery.message.message_id);
   }
 });
