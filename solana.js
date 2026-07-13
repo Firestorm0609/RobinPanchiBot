@@ -100,35 +100,45 @@ export async function transferSol(signerKeypair, toAddress, lamports) {
  * Raw balance (bigint) + decimals for ANY SPL token mint — used to resolve
  * exact sell amounts, mirroring erc20.js's getTokenBalance/getDecimals for EVM.
  *
- * RETRY NOTE: right after a buy (esp. a pump.fun bonding-curve buy, which
- * doesn't go through Jupiter's own confirmation plumbing), the RPC endpoint
- * serving this read can be a different node/replica than the one that just
- * confirmed the buy tx, and can lag behind it by a block or two — even
- * though we awaited 'confirmed' on the buy. That previously showed up as
- * "No on-chain token balance found to sell" on a sell attempted immediately
- * after a successful buy, even though the tokens were actually there.
- * This retries a few times with a short backoff before returning 0n, so a
- * transient read-your-own-write lag doesn't get reported as "no balance."
+ * IMPORTANT — Token-2022 support: this deliberately does NOT derive the
+ * associated token account address itself (i.e. no getAssociatedTokenAddress
+ * call). Doing so requires knowing which token program (legacy SPL Token vs
+ * Token-2022 / TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb) the mint actually
+ * uses, since the ATA is a PDA derived partly from that program id — guess
+ * wrong and you silently compute a DIFFERENT address than where the tokens
+ * actually live, which reads back as a real (but wrong) "0 balance" instead
+ * of an error. That was the exact bug behind "No on-chain token balance
+ * found to sell" on a token that had graduated off pump.fun's bonding curve
+ * and was bought via Jupiter (which handles Token-2022 fine on its own).
+ *
+ * getParsedTokenAccountsByOwner with a mint filter sidesteps all of that —
+ * it returns whatever account(s) actually hold this mint for this owner,
+ * regardless of which token program the mint belongs to.
+ *
+ * RETRY NOTE: right after a buy, the RPC endpoint serving this read can lag
+ * a block or two behind the one that confirmed the buy tx even at
+ * 'confirmed' commitment. Retries a few times with backoff before
+ * returning 0n so that transient lag isn't reported as "no balance."
  */
 export async function getSplTokenBalanceRaw(mintAddress, ownerAddress, { retries = 4, retryDelayMs = 500 } = {}) {
   const connection = getSolanaConnection();
   const owner = new PublicKey(ownerAddress);
   const mint = new PublicKey(mintAddress);
-  const ata = await getAssociatedTokenAddress(mint, owner);
 
   for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      const account = await getAccount(connection, ata);
-      return account.amount; // bigint
-    } catch (err) {
-      if (err instanceof TokenAccountNotFoundError) {
-        if (attempt < retries) {
-          await new Promise((r) => setTimeout(r, retryDelayMs));
-          continue;
-        }
-        return 0n;
+    const resp = await connection.getParsedTokenAccountsByOwner(owner, { mint });
+    if (resp.value.length > 0) {
+      // Sum across accounts in the (rare) case there's more than one for
+      // this mint+owner — normally there's exactly one.
+      let total = 0n;
+      for (const { account } of resp.value) {
+        const amountStr = account.data.parsed?.info?.tokenAmount?.amount;
+        if (amountStr) total += BigInt(amountStr);
       }
-      throw err;
+      if (total > 0n) return total;
+    }
+    if (attempt < retries) {
+      await new Promise((r) => setTimeout(r, retryDelayMs));
     }
   }
   return 0n;
