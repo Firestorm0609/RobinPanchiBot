@@ -2,6 +2,15 @@ import { getSettings } from './storage.js';
 import { GAS_TIER_MULTIPLIERS } from './config.js';
 
 export const pending = new Map(); // uid -> { type, ...context }
+
+// uid -> array of { walletId, tokenAddress }, rebuilt every time the
+// Positions view renders. Telegram's callback_data has a hard 64-byte cap,
+// which a raw "openpos~<walletId>~<tokenAddress>" button blows past (wallet
+// id + a full 0x address routinely runs ~70+ bytes) — Telegram then silently
+// drops/ignores the button tap. Buttons reference an entry here by short
+// index instead ("openpos~3"), so callback_data always stays tiny.
+export const positionRefs = new Map();
+
 export const tradesInFlight = new Set(); // uid -> a buy/sell (interactive OR headless) is currently signing/sending
 export const bridgesInFlight = new Set();
 export const fundsInFlight = new Set(); // uid -> locked while a batch-fund/collect distribution is executing
