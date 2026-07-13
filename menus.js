@@ -258,8 +258,12 @@ export function limitOrdersMenu(orders) {
 }
 
 // ---------- Momentum Trigger: list + cancel ----------
+// `marketByToken` is an optional Map<tokenAddress, marketData> the caller
+// pre-fetches (same pattern as limitOrdersText/limitOrdersMenu above) so
+// Alpha/Beta show up as actual token symbols instead of shortened
+// addresses. Falls back to shortAddr if not supplied or lookup failed.
 
-export function momentumListText(triggers) {
+export function momentumListText(triggers, marketByToken = new Map()) {
   if (triggers.length === 0) {
     return (
       '⚡ *Momentum Trigger*\n\n' +
@@ -267,16 +271,18 @@ export function momentumListText(triggers) {
       'Set an Alpha token to watch and a Beta token to auto-buy — once Alpha rises by your chosen % from now, the bot buys Beta for you automatically.'
     );
   }
+  const label = (addr) => marketByToken.get(addr)?.symbol ?? shortAddr(addr);
   const lines = triggers.map((t) =>
-    `*${shortAddr(t.alpha_token)}* +${t.trigger_pct}% → auto-buy ${t.buy_amount_eth} ETH of *${shortAddr(t.beta_token)}*\n` +
+    `*${label(t.alpha_token)}* +${t.trigger_pct}% → auto-buy ${t.buy_amount_eth} ETH of *${label(t.beta_token)}*\n` +
     `  baseline: $${Number(t.baseline_price).toPrecision(4)}`
   );
   return `⚡ *Momentum Trigger*\n\n${lines.join('\n\n')}`;
 }
 
-export function momentumMenu(triggers) {
+export function momentumMenu(triggers, marketByToken = new Map()) {
+  const label = (addr) => marketByToken.get(addr)?.symbol ?? shortAddr(addr);
   const rows = triggers.map((t) => [
-    Markup.button.callback(`❌ Cancel ${shortAddr(t.alpha_token)} → ${shortAddr(t.beta_token)}`, `momentumcancel_${t.id}`),
+    Markup.button.callback(`❌ Cancel ${label(t.alpha_token)} → ${label(t.beta_token)}`, `momentumcancel_${t.id}`),
   ]);
   rows.push([Markup.button.callback('➕ New Trigger', 'momentum_new')]);
   rows.push([Markup.button.callback('⬅️ Back', 'menu_main')]);
@@ -424,4 +430,4 @@ export async function renderPositionsView(uid) {
   ]);
 
   return { text, markup };
-}
+         }
