@@ -120,7 +120,7 @@ export async function transferSol(signerKeypair, toAddress, lamports) {
  * 'confirmed' commitment. Retries a few times with backoff before
  * returning 0n so that transient lag isn't reported as "no balance."
  */
-export async function getSplTokenBalanceRaw(mintAddress, ownerAddress, { retries = 4, retryDelayMs = 500 } = {}) {
+export async function getSplTokenBalanceRaw(mintAddress, ownerAddress, { retries = 1, retryDelayMs = 500 } = {}) {
   const connection = getSolanaConnection();
   const owner = new PublicKey(ownerAddress);
   const mint = new PublicKey(mintAddress);
