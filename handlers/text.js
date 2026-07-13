@@ -35,6 +35,7 @@ import {
   mainMenu, walletsMenu, bridgeConfirmMenu, directionLabel, batchSelectMenu, batchSellSelectMenu, confirmMenu,
   renderTokenCard,
 } from '../menus.js';
+import { shortAddr } from '../wallet.js';
 import { executeBuy, executeSell, estimateTransferGasReserve, distributeEth } from '../trade-core.js';
 import { scheduleCardAutoRefresh } from '../autorefresh.js';
 
@@ -57,7 +58,7 @@ bot.on('text', async (ctx) => {
     if (!market || !market.priceUsd) {
       return ctx.reply('Could not fetch a live price for that token right now — try again in a moment.');
     }
-    pending.set(uid, { type: 'momentum_beta', alphaToken: text, baselinePrice: market.priceUsd });
+    pending.set(uid, { type: 'momentum_beta', alphaToken: text, alphaSymbol: market.symbol, baselinePrice: market.priceUsd });
     await ctx.reply(
       `Baseline price locked: $${market.priceUsd.toPrecision(4)}\n\n` +
       'Now paste the *Beta* token contract address — the one that gets auto-bought once Alpha moves:',
@@ -73,7 +74,15 @@ bot.on('text', async (ctx) => {
     if (text.toLowerCase() === state.alphaToken.toLowerCase()) {
       return ctx.reply('Beta token must be different from Alpha. Paste a different address.');
     }
-    pending.set(uid, { type: 'momentum_pct', alphaToken: state.alphaToken, baselinePrice: state.baselinePrice, betaToken: text });
+    const betaMarket = await getTokenMarketData(text).catch(() => null);
+    pending.set(uid, {
+      type: 'momentum_pct',
+      alphaToken: state.alphaToken,
+      alphaSymbol: state.alphaSymbol,
+      baselinePrice: state.baselinePrice,
+      betaToken: text,
+      betaSymbol: betaMarket?.symbol ?? shortAddr(text),
+    });
     await ctx.reply(
       'Send the trigger percentage — once Alpha is up this much from the baseline price, Beta gets bought. e.g. `20` for +20%:',
       { parse_mode: 'Markdown' }
@@ -442,9 +451,13 @@ bot.on('text', async (ctx) => {
         baselinePrice: state.baselinePrice,
         buyAmountEth: amt,
       });
+
+      const alphaLabel = state.alphaSymbol || shortAddr(state.alphaToken);
+      const betaLabel = state.betaSymbol || shortAddr(state.betaToken);
+
       await ctx.reply(
         `✅ Momentum Trigger set on *${w.name}*:\n` +
-        `Alpha \`${state.alphaToken}\` +${state.triggerPct}% → auto-buy ${fmtAmountLabel(amt, usdInput)} of Beta \`${state.betaToken}\`\n\n` +
+        `Alpha *${alphaLabel}* +${state.triggerPct}% → auto-buy ${fmtAmountLabel(amt, usdInput)} of Beta *${betaLabel}*\n\n` +
         `I'll DM you when it fires.`,
         { parse_mode: 'Markdown', ...mainMenu() }
       );
