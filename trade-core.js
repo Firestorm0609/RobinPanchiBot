@@ -15,7 +15,7 @@ import {
   getChain, getEvmProvider, isSolanaChain, explorerTxUrl, getStableDecimals, ALL_CHAIN_KEYS,
 } from './chains.js';
 import {
-  keypairFromPrivateKey, getSplTokenBalanceRaw, getSplTokenDecimals,
+  keypairFromPrivateKey, getSplTokenBalanceRaw, getSplTokenDecimals, getSolanaConnection,
 } from './solana.js';
 import { getBondingCurveState, executePumpFunBuy, executePumpFunSell } from './pumpfun.js';
 import { gasMultiplierFor, tradesInFlight } from './state.js';
@@ -38,13 +38,62 @@ async function toRawUsdc(chainKey, usdcAmount) {
   return ethers.parseUnits(usdcAmount.toString(), decimals).toString();
 }
 
+// ---------------------------------------------------------------------------
+// DIAGNOSTIC: resolveSellAmountRaw — Solana branch now logs everything
+// needed to root-cause "No on-chain token balance found to sell" instead of
+// silently returning 0. Set SELL_DEBUG=1 in .env (or just leave this in,
+// it's console.log-level, not noisy) to see:
+//   - which RPC endpoint the connection is actually using
+//   - the exact ATA address being queried
+//   - the raw getSplTokenBalanceRaw() result
+//   - the wallet address / mint being checked
+// Next failure, check the bot's process logs (not just the Telegram admin
+// alert) for a "[sell debug]" line — that will show whether the ATA is
+// genuinely empty, or whether we're querying the wrong address/RPC.
+// ---------------------------------------------------------------------------
+
 async function resolveSellAmountRaw(chainKey, tokenAddress, walletAddress, pct) {
   if (isSolanaChain(chainKey)) {
+    const connection = getSolanaConnection();
+    console.log(
+      `[sell debug] chain=solana mint=${tokenAddress} owner=${walletAddress} pct=${pct} ` +
+      `rpcEndpoint=${connection.rpcEndpoint}`
+    );
+
     const [rawBalance, decimals] = await Promise.all([
       getSplTokenBalanceRaw(tokenAddress, walletAddress),
-      getSplTokenDecimals(tokenAddress).catch(() => 6),
+      getSplTokenDecimals(tokenAddress).catch((err) => {
+        console.log(`[sell debug] getSplTokenDecimals failed: ${err.message} — defaulting to 6`);
+        return 6;
+      }),
     ]);
-    if (rawBalance <= 0n) return { rawAmount: 0n, decimals, humanAmount: 0 };
+
+    console.log(`[sell debug] rawBalance=${rawBalance.toString()} decimals=${decimals}`);
+
+    if (rawBalance <= 0n) {
+      // Extra diagnostic: directly fetch all token accounts owned by this
+      // wallet for this specific mint, bypassing the ATA-derivation path
+      // entirely, in case the tokens landed in a non-standard/non-ATA
+      // token account (e.g. a different program id, like Token-2022).
+      try {
+        const { PublicKey } = await import('@solana/web3.js');
+        const owner = new PublicKey(walletAddress);
+        const mint = new PublicKey(tokenAddress);
+        const resp = await connection.getParsedTokenAccountsByOwner(owner, { mint });
+        console.log(
+          `[sell debug] getParsedTokenAccountsByOwner found ${resp.value.length} account(s) for this mint: ` +
+          JSON.stringify(resp.value.map((a) => ({
+            address: a.pubkey.toBase58(),
+            amount: a.account.data.parsed?.info?.tokenAmount?.amount,
+            programOwner: a.account.owner.toBase58(),
+          })))
+        );
+      } catch (err) {
+        console.log(`[sell debug] fallback getParsedTokenAccountsByOwner failed: ${err.message}`);
+      }
+      return { rawAmount: 0n, decimals, humanAmount: 0 };
+    }
+
     const pctBps = BigInt(Math.round(pct * 100));
     const rawAmount = pctBps >= 10000n ? rawBalance : (rawBalance * pctBps) / 10000n;
     const humanAmount = Number(rawAmount) / 10 ** decimals;
@@ -187,6 +236,7 @@ async function performPumpFunBuy(uid, wallet, tokenAddress, usdcAmount, pendingT
 
   const { slippageBps } = getSettings(uid);
   const { signature, tokensOut } = await executePumpFunBuy(keypair, tokenAddress, solInLamports, slippageBps);
+  console.log(`[sell debug] pump.fun buy completed: signature=${signature} tokensOut(raw)=${tokensOut.toString()}`);
   markPendingTradeSubmitted(pendingTradeId, signature);
   markPendingTradeDone(pendingTradeId, 'confirmed');
 
