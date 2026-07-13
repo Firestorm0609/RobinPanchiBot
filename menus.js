@@ -12,6 +12,7 @@ import {
 } from './storage.js';
 import { dualEthBalanceLines, gasEstimateLine } from './format.js';
 import { FALLBACK_GAS_LIMIT_BUY } from './config.js';
+import { positionRefs } from './state.js';
 
 export function mainMenu() {
   return Markup.inlineKeyboard([
@@ -369,6 +370,7 @@ export async function renderPositionsView(uid) {
   const ethUsd = await getEthUsdPrice().catch(() => null);
   const lines = [];
   const openButtonRows = [];
+  const refs = []; // index -> { walletId, tokenAddress }, stashed in state.positionRefs below
   let totalValueUsd = 0;
   let totalCostUsd = 0;
   let anyPriceUnavailable = false;
@@ -391,10 +393,18 @@ export async function renderPositionsView(uid) {
       anyPriceUnavailable = true;
       lines.push(`*${symbol}* (${pos.walletName}): ${fmtTokenAmount(pos.tokenAmount)} — price unavailable`);
     }
+    // NOTE: callback_data has a hard 64-byte cap in Telegram's Bot API.
+    // "openpos~<walletId>~<0xaddress>" routinely runs 70+ bytes and gets
+    // silently dropped/ignored on tap — so we reference this position by a
+    // short index instead, resolved against positionRefs at click time.
+    const idx = refs.length;
+    refs.push({ walletId: pos.walletId, tokenAddress: pos.tokenAddress });
     openButtonRows.push([
-      Markup.button.callback(`🔓 Open ${symbol} (${pos.walletName})`, `openpos~${pos.walletId}~${pos.tokenAddress}`),
+      Markup.button.callback(`🔓 Open ${symbol} (${pos.walletName})`, `openpos~${idx}`),
     ]);
   }
+
+  positionRefs.set(String(uid), refs);
 
   const totalPnlUsd = totalValueUsd - totalCostUsd;
   const totalPnlPct = totalCostUsd > 0 ? (totalPnlUsd / totalCostUsd) * 100 : 0;
