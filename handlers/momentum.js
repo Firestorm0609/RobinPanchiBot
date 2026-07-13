@@ -5,6 +5,7 @@ import {
   cancelMomentumTrigger,
   getActiveWallet,
 } from '../storage.js';
+import { getTokenMarketData } from '../price.js';
 import { momentumMenu, momentumListText, walletsMenu } from '../menus.js';
 
 // ---------- Momentum Trigger: menu + cancel ----------
@@ -13,12 +14,33 @@ import { momentumMenu, momentumListText, walletsMenu } from '../menus.js';
 // same pattern as limit orders / TP-SL. This file only owns the menu,
 // entry point, and cancel action.
 
+// Pre-fetches market data (symbol) for every Alpha/Beta token across the
+// user's active triggers, same pattern as the limit-orders list in
+// handlers/token.js, so the list shows real token symbols instead of
+// shortened contract addresses.
+async function buildMarketMap(triggers) {
+  const marketByToken = new Map();
+  for (const t of triggers) {
+    for (const addr of [t.alpha_token, t.beta_token]) {
+      if (!marketByToken.has(addr)) {
+        const market = await getTokenMarketData(addr).catch(() => null);
+        marketByToken.set(addr, market);
+      }
+    }
+  }
+  return marketByToken;
+}
+
 bot.action('menu_momentum', async (ctx) => {
   await ctx.answerCbQuery();
   stopAllViewRefreshes(ctx.from.id);
   const uid = ctx.from.id;
   const triggers = getActiveMomentumTriggersForUser(uid);
-  await ctx.editMessageText(momentumListText(triggers), { parse_mode: 'Markdown', ...momentumMenu(triggers) });
+  const marketByToken = await buildMarketMap(triggers);
+  await ctx.editMessageText(momentumListText(triggers, marketByToken), {
+    parse_mode: 'Markdown',
+    ...momentumMenu(triggers, marketByToken),
+  });
 });
 
 bot.action('momentum_new', async (ctx) => {
@@ -41,5 +63,9 @@ bot.action(/^momentumcancel_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery(cancelled ? 'Trigger cancelled' : 'Could not cancel (already fired?)');
 
   const triggers = getActiveMomentumTriggersForUser(uid);
-  await ctx.editMessageText(momentumListText(triggers), { parse_mode: 'Markdown', ...momentumMenu(triggers) }).catch(() => {});
+  const marketByToken = await buildMarketMap(triggers);
+  await ctx.editMessageText(momentumListText(triggers, marketByToken), {
+    parse_mode: 'Markdown',
+    ...momentumMenu(triggers, marketByToken),
+  }).catch(() => {});
 });
