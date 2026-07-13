@@ -3,7 +3,7 @@ import { sendAdminAlert } from './alerts.js';
 import { stopAllAutoRefreshes } from './state.js';
 import {
   checkStuckTrades, checkStuckBridges, startBridgePoller, startLowBalancePoller,
-  startAutoTradePoller, startLimitOrderPoller,
+  startAutoTradePoller, startLimitOrderPoller, startMomentumTriggerPoller,
 } from './pollers.js';
 
 // Each of these registers its bot.command/bot.action/bot.on handlers as a
@@ -17,6 +17,7 @@ import './handlers/rewards.js';
 import './handlers/bridge.js';
 import './handlers/token.js';
 import './handlers/batch.js';
+import './handlers/momentum.js';
 import './handlers/text.js'; // must be last: registers the catch-all bot.on('text', ...)
 
 process.on('unhandledRejection', (err) => {
@@ -38,6 +39,7 @@ bot.launch()
   .then(() => startLowBalancePoller(bot))
   .then(() => startAutoTradePoller(bot))
   .then(() => startLimitOrderPoller(bot))
+  .then(() => startMomentumTriggerPoller(bot))
   .then(() => sendAdminAlert(bot.telegram, '✅ Bot started.'))
   .catch((err) => {
     console.error('Failed to launch bot:', err);

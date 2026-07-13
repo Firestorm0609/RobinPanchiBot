@@ -15,6 +15,8 @@ import {
   markAutoRuleTriggered,
   getOpenLimitOrders,
   markLimitOrderDone,
+  getActiveMomentumTriggers,
+  markMomentumTriggerDone,
 } from './storage.js';
 import {
   provider,
@@ -22,6 +24,7 @@ import {
   LOW_BALANCE_POLL_INTERVAL_MS,
   AUTO_TRADE_POLL_INTERVAL_MS,
   LIMIT_ORDER_POLL_INTERVAL_MS,
+  MOMENTUM_POLL_INTERVAL_MS,
 } from './config.js';
 import { tradesInFlight } from './state.js';
 import { explorerTxUrl, explorerTxUrlForChain } from './format.js';
@@ -287,4 +290,63 @@ export function startLimitOrderPoller(bot) {
       }
     }
   }, LIMIT_ORDER_POLL_INTERVAL_MS);
+}
+
+// ---------- Momentum Trigger poller ----------
+// One-shot: watches alpha_token's live USD price vs. the baseline_price
+// captured when the trigger was created. Once alpha is up by trigger_pct%
+// or more, buys buy_amount_eth worth of beta_token on the trigger's wallet,
+// then retires the trigger (status -> 'triggered'). Shares the same
+// tradesInFlight lock as every other trade path so it can't race a manual
+// trade, TP/SL, or limit order on the same wallet.
+
+export function startMomentumTriggerPoller(bot) {
+  setInterval(async () => {
+    let triggers;
+    try {
+      triggers = getActiveMomentumTriggers();
+    } catch (err) {
+      console.error('Momentum poller: failed to read active triggers:', err.message);
+      return;
+    }
+
+    for (const trig of triggers) {
+      try {
+        const wallet = getWallet(trig.uid, trig.wallet_id);
+        if (!wallet) { markMomentumTriggerDone(trig.id, 'cancelled'); continue; }
+
+        const market = await getTokenMarketData(trig.alpha_token).catch(() => null);
+        if (!market || !market.priceUsd) continue;
+
+        const changePct = ((market.priceUsd - trig.baseline_price) / trig.baseline_price) * 100;
+        if (changePct < trig.trigger_pct) continue;
+
+        // Wallet is mid-trade elsewhere — skip this cycle and retry next
+        // tick rather than retiring the trigger prematurely.
+        if (tradesInFlight.has(trig.uid)) continue;
+
+        markMomentumTriggerDone(trig.id, 'triggered');
+
+        const result = await performBuyCore(trig.uid, wallet, trig.beta_token, trig.buy_amount_eth);
+        if (result.ok) {
+          const txLink = explorerTxUrl(result.txHash);
+          await bot.telegram.sendMessage(
+            trig.uid,
+            `⚡ Momentum Trigger fired on *${wallet.name}*! Alpha moved +${changePct.toFixed(1)}% (threshold +${trig.trigger_pct}%) — bought ${trig.buy_amount_eth} ETH of Beta.` +
+            (txLink ? `\n[View transaction](${txLink})` : ''),
+            { parse_mode: 'Markdown' }
+          ).catch((err) => console.error(`Failed to notify uid ${trig.uid} of momentum trigger:`, err.message));
+        } else {
+          await bot.telegram.sendMessage(
+            trig.uid,
+            `⚠️ Momentum Trigger fired on *${wallet.name}* but the buy failed: ${result.error}\nSet a new trigger if you'd like to try again.`,
+            { parse_mode: 'Markdown' }
+          ).catch(() => {});
+          await sendAdminAlert(bot.telegram, `Momentum trigger buy failed for uid ${trig.uid} (alpha ${trig.alpha_token} -> beta ${trig.beta_token}): ${result.error}`);
+        }
+      } catch (err) {
+        console.error(`Momentum poller: trigger ${trig.id} failed:`, err.message);
+      }
+    }
+  }, MOMENTUM_POLL_INTERVAL_MS);
 }

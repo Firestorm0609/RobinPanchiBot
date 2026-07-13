@@ -47,6 +47,7 @@ export const BRIDGE_POLL_INTERVAL_MS = 30_000;
 export const LOW_BALANCE_POLL_INTERVAL_MS = 5 * 60_000;
 export const AUTO_TRADE_POLL_INTERVAL_MS = 30_000;
 export const LIMIT_ORDER_POLL_INTERVAL_MS = 30_000;
+export const MOMENTUM_POLL_INTERVAL_MS = 30_000;
 
 export const MAX_BATCH_FUND_NEW_WALLETS = 20; // sane upper bound on wallets-created-in-one-go
 
@@ -104,6 +105,8 @@ export const HELP_TEXT =
   'On any open position, tap 🎯 Set TP/SL to have the bot automatically sell 100% of that position once it hits your target gain (take-profit) or loss (stop-loss). One active rule per position — setting a new one replaces the old.\n\n' +
   '*Limit orders*\n' +
   'Tap ⏰ Limit Buy or ⏰ Limit Sell on a token to queue a trade that fires automatically once the price crosses your target. Cancel anytime under ⏰ Limit Orders in the main menu.\n\n' +
+  '*Momentum Trigger*\n' +
+  'Open ⚡ Momentum Trigger to set up an Alpha/Beta pair: paste the Alpha token you want to watch, then the Beta token to auto-buy, then your trigger % and buy amount. Once Alpha rises by that % from when you set it up, the bot automatically buys Beta for you and DMs you. One-shot per trigger — set a new one to re-arm.\n\n' +
   '*Batch Buy*\n' +
   'Tap 📦 Batch Buy on a token to buy the same ETH or USD amount across multiple wallets in one go — useful for spreading a position.\n\n' +
   '*Batch Sell*\n' +

@@ -19,6 +19,7 @@ export function mainMenu() {
     [Markup.button.callback('📊 Positions', 'menu_positions')],
     [Markup.button.callback('💼 Wallets', 'menu_wallets'), Markup.button.callback('💰 Balance', 'menu_balance')],
     [Markup.button.callback('🌉 Bridge', 'menu_bridge'), Markup.button.callback('⏰ Limit Orders', 'menu_limitorders')],
+    [Markup.button.callback('⚡ Momentum Trigger', 'menu_momentum')],
     [Markup.button.callback('🎟 Rewards', 'menu_rewards'), Markup.button.callback('⚙️ Settings', 'menu_settings')],
     [Markup.button.callback('❓ Help', 'menu_help')],
     [Markup.button.url('🐦 X', 'https://x.com/robinpanchi')],
@@ -255,6 +256,32 @@ export function limitOrdersMenu(orders) {
   return Markup.inlineKeyboard(rows);
 }
 
+// ---------- Momentum Trigger: list + cancel ----------
+
+export function momentumListText(triggers) {
+  if (triggers.length === 0) {
+    return (
+      '⚡ *Momentum Trigger*\n\n' +
+      'No active triggers.\n\n' +
+      'Set an Alpha token to watch and a Beta token to auto-buy — once Alpha rises by your chosen % from now, the bot buys Beta for you automatically.'
+    );
+  }
+  const lines = triggers.map((t) =>
+    `*${shortAddr(t.alpha_token)}* +${t.trigger_pct}% → auto-buy ${t.buy_amount_eth} ETH of *${shortAddr(t.beta_token)}*\n` +
+    `  baseline: $${Number(t.baseline_price).toPrecision(4)}`
+  );
+  return `⚡ *Momentum Trigger*\n\n${lines.join('\n\n')}`;
+}
+
+export function momentumMenu(triggers) {
+  const rows = triggers.map((t) => [
+    Markup.button.callback(`❌ Cancel ${shortAddr(t.alpha_token)} → ${shortAddr(t.beta_token)}`, `momentumcancel_${t.id}`),
+  ]);
+  rows.push([Markup.button.callback('➕ New Trigger', 'momentum_new')]);
+  rows.push([Markup.button.callback('⬅️ Back', 'menu_main')]);
+  return Markup.inlineKeyboard(rows);
+}
+
 // ---------- Token info + PnL rendering ----------
 
 export async function renderTokenCard(uid, tokenAddress) {
@@ -326,7 +353,9 @@ export async function renderTokenCard(uid, tokenAddress) {
 // be split between a per-wallet "Positions" view and an all-wallet
 // "Portfolio" summary — they showed near-identical info, so Positions now
 // does both: a combined total up top, then each position labeled with the
-// wallet it's held in.
+// wallet it's held in. Each position also gets an "Open" button so it can
+// be tapped straight into its token card (switches active wallet to the
+// wallet that holds it, since a trade must run from the active wallet).
 
 export async function renderPositionsView(uid) {
   const positions = getAllPositionsForUser(uid);
@@ -339,6 +368,7 @@ export async function renderPositionsView(uid) {
 
   const ethUsd = await getEthUsdPrice().catch(() => null);
   const lines = [];
+  const openButtonRows = [];
   let totalValueUsd = 0;
   let totalCostUsd = 0;
   let anyPriceUnavailable = false;
@@ -361,6 +391,9 @@ export async function renderPositionsView(uid) {
       anyPriceUnavailable = true;
       lines.push(`*${symbol}* (${pos.walletName}): ${fmtTokenAmount(pos.tokenAmount)} — price unavailable`);
     }
+    openButtonRows.push([
+      Markup.button.callback(`🔓 Open ${symbol} (${pos.walletName})`, `openpos~${pos.walletId}~${pos.tokenAddress}`),
+    ]);
   }
 
   const totalPnlUsd = totalValueUsd - totalCostUsd;
@@ -375,5 +408,10 @@ export async function renderPositionsView(uid) {
     `Total PnL: ${totalEmoji} ${fmtUsd(totalPnlUsd)} (${totalPnlPct.toFixed(1)}%)${disclaimer}\n\n` +
     lines.join('\n');
 
-  return { text, markup: refreshBackMenu('menu_positions_refresh') };
+  const markup = Markup.inlineKeyboard([
+    ...openButtonRows,
+    [Markup.button.callback('🔄 Refresh', 'menu_positions_refresh'), Markup.button.callback('⬅️ Back', 'menu_main')],
+  ]);
+
+  return { text, markup };
 }

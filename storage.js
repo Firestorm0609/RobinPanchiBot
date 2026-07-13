@@ -101,6 +101,19 @@ CREATE TABLE IF NOT EXISTS limit_orders (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS momentum_triggers (
+  id TEXT PRIMARY KEY,
+  uid TEXT NOT NULL,
+  wallet_id TEXT NOT NULL,
+  alpha_token TEXT NOT NULL, -- watched token; poller checks its price
+  beta_token TEXT NOT NULL,  -- token that gets auto-bought when alpha fires
+  trigger_pct REAL NOT NULL, -- alpha must move up at least this % from baseline_price
+  baseline_price REAL NOT NULL, -- alpha's USD price at the moment the trigger was created
+  buy_amount_eth REAL NOT NULL, -- ETH spent on beta when it fires
+  status TEXT NOT NULL, -- 'active' | 'triggered' | 'cancelled' | 'failed'
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_wallets_uid ON wallets(uid);
 CREATE INDEX IF NOT EXISTS idx_positions_uid_wallet ON positions(uid, wallet_id);
 CREATE INDEX IF NOT EXISTS idx_trade_log_created ON trade_log(created_at);
@@ -112,6 +125,8 @@ CREATE INDEX IF NOT EXISTS idx_auto_rules_uid ON auto_rules(uid);
 CREATE INDEX IF NOT EXISTS idx_limit_orders_status ON limit_orders(status);
 CREATE INDEX IF NOT EXISTS idx_limit_orders_uid ON limit_orders(uid);
 CREATE INDEX IF NOT EXISTS idx_trade_log_uid_wallet_token ON trade_log(uid, wallet_id, token_address);
+CREATE INDEX IF NOT EXISTS idx_momentum_status ON momentum_triggers(status);
+CREATE INDEX IF NOT EXISTS idx_momentum_uid ON momentum_triggers(uid);
 `);
 
 // Migration: move referral_code from settings JSON (old location) to an indexed column.
@@ -579,6 +594,44 @@ export function getLimitOrder(uid, id) {
   return db.prepare(`SELECT * FROM limit_orders WHERE id = ? AND uid = ?`).get(id, String(uid));
 }
 
+// ---------- Momentum Trigger ----------
+// Watches alpha_token's price; once it's up by trigger_pct% from the price
+// captured at creation (baseline_price), auto-buys buy_amount_eth worth of
+// beta_token on the wallet the trigger was created under. One-shot: fires
+// once then moves to 'triggered' status (create a new one to re-arm).
+
+export function createMomentumTrigger({ uid, walletId, alphaToken, betaToken, triggerPct, baselinePrice, buyAmountEth }) {
+  const id = `mt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const now = Date.now();
+  db.prepare(`
+    INSERT INTO momentum_triggers
+      (id, uid, wallet_id, alpha_token, beta_token, trigger_pct, baseline_price, buy_amount_eth, status, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+  `).run(id, String(uid), walletId, alphaToken.toLowerCase(), betaToken.toLowerCase(), triggerPct, baselinePrice, buyAmountEth, now, now);
+  return id;
+}
+
+/** All active triggers across all users — polled periodically by pollers.js. */
+export function getActiveMomentumTriggers() {
+  return db.prepare(`SELECT * FROM momentum_triggers WHERE status = 'active'`).all();
+}
+
+export function getActiveMomentumTriggersForUser(uid) {
+  return db.prepare(`SELECT * FROM momentum_triggers WHERE uid = ? AND status = 'active' ORDER BY created_at DESC`)
+    .all(String(uid));
+}
+
+export function markMomentumTriggerDone(id, status) {
+  // status: 'triggered' | 'cancelled' | 'failed'
+  db.prepare(`UPDATE momentum_triggers SET status = ?, updated_at = ? WHERE id = ?`).run(status, Date.now(), id);
+}
+
+export function cancelMomentumTrigger(uid, id) {
+  const result = db.prepare(`UPDATE momentum_triggers SET status = 'cancelled', updated_at = ? WHERE id = ? AND uid = ? AND status = 'active'`)
+    .run(Date.now(), id, String(uid));
+  return result.changes > 0;
+}
+
 // ---------- Admin stats ----------
 
 export function getStats() {
@@ -595,9 +648,11 @@ export function getStats() {
   const totalBridgeVolumeEth = db.prepare("SELECT COALESCE(SUM(amount_eth), 0) v FROM pending_bridges WHERE status = 'done'").get().v;
   const activeAutoRules = db.prepare(`SELECT COUNT(*) c FROM auto_rules WHERE status = 'active'`).get().c;
   const openLimitOrders = db.prepare(`SELECT COUNT(*) c FROM limit_orders WHERE status = 'open'`).get().c;
+  const activeMomentumTriggers = db.prepare(`SELECT COUNT(*) c FROM momentum_triggers WHERE status = 'active'`).get().c;
   return {
     totalUsers, totalWallets, totalTrades, totalVolumeEth, activeUsers24h, volume24hEth,
     openPositions, totalReferrals, totalBridges, totalBridgeVolumeEth, activeAutoRules, openLimitOrders,
+    activeMomentumTriggers,
   };
 }
 
